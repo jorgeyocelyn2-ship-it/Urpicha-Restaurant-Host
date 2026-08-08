@@ -1,0 +1,7 @@
+1. Ejecute INICIAR.bat
+2. Entre a http://localhost:8080/admin
+3. Contraseña: cambiar123
+4. Publique el menú del día
+5. Copie el enlace de Empresa Demo
+6. Ábralo en otra pestaña y registre un pedido
+7. Vuelva al panel para verlo, exportarlo o imprimir el cupón

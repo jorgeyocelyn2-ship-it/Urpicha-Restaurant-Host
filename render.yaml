@@ -1,0 +1,26 @@
+services:
+  - type: web
+    name: pedidos-almuerzos
+    runtime: docker
+    plan: starter
+    region: oregon
+    dockerfilePath: ./Dockerfile
+    dockerContext: .
+    healthCheckPath: /health
+    envVars:
+      - key: RESTAURANT_NAME
+        sync: false
+      - key: ADMIN_PASSWORD
+        sync: false
+      - key: SECRET_KEY
+        generateValue: true
+      - key: ORDER_DEADLINE
+        value: "10:30"
+      - key: DATA_DIR
+        value: /opt/render/project/src/datos
+      - key: INTERNAL_ORDERS_PORT
+        value: "18081"
+    disk:
+      name: pedidos-data
+      mountPath: /opt/render/project/src/datos
+      sizeGB: 1
