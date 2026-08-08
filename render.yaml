@@ -1,0 +1,26 @@
+services:
+  - type: web
+    name: pedidos-almuerzos
+    runtime: python
+    plan: starter
+    region: oregon
+    buildCommand: "python --version"
+    startCommand: "python app.py"
+    healthCheckPath: /health
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.13.5
+      - key: RESTAURANT_NAME
+        sync: false
+      - key: ADMIN_PASSWORD
+        sync: false
+      - key: SECRET_KEY
+        generateValue: true
+      - key: ORDER_DEADLINE
+        value: "10:30"
+      - key: DATA_DIR
+        value: /opt/render/project/src/datos
+    disk:
+      name: pedidos-data
+      mountPath: /opt/render/project/src/datos
+      sizeGB: 1
