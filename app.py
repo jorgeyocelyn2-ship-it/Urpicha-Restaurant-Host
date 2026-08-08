@@ -1,920 +1,1362 @@
-#!/usr/bin/env python3
-"""
-Sistema sencillo de pedidos de almuerzos para empresas.
-No requiere librerías externas: usa solo Python + SQLite.
-"""
-from __future__ import annotations
-
-import csv
-import hashlib
-import hmac
-import html
-import io
-import json
-import os
-import re
-import secrets
-import sqlite3
-import sys
-import threading
-import time
-import unicodedata
-from datetime import date, datetime
-from zoneinfo import ZoneInfo
-from http import cookies
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from flask import Flask, render_template, request, send_file, jsonify, redirect, url_for
 from pathlib import Path
-from urllib.parse import parse_qs, quote, urlencode, urlparse
+from datetime import datetime
+from PIL import Image, ImageOps, ImageEnhance
+from reportlab.pdfgen import canvas
+from reportlab.lib.pagesizes import A4
+from reportlab.lib.units import mm
+from openpyxl import Workbook, load_workbook
+from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
+from openpyxl.utils import get_column_letter
+from collections import Counter
+import subprocess, tempfile, csv, io, json, re, uuid, statistics, shutil, os, traceback, unicodedata
 
-BASE_DIR = Path(__file__).resolve().parent
-DATA_DIR = Path(os.environ.get("DATA_DIR", str(BASE_DIR / "datos"))).expanduser().resolve()
-DB_PATH = DATA_DIR / "pedidos.db"
-CONFIG_PATH = BASE_DIR / "config.json"
-HOST = "0.0.0.0"
-try:
-    PORT = int(os.environ.get("PORT", "8080"))
-except ValueError:
-    PORT = 8080
+app = Flask(__name__)
+app.secret_key = "cuponera-v19-dual"
+ROOT = Path(__file__).resolve().parent
+UPLOADS = ROOT / "uploads"
+OUTPUTS = ROOT / "outputs"
 
-DATA_DIR.mkdir(exist_ok=True)
+UPLOADS.mkdir(parents=True, exist_ok=True)
+OUTPUTS.mkdir(parents=True, exist_ok=True)
 
-DEFAULT_CONFIG = {
-    "restaurant_name": "Mi Restaurante",
-    "admin_password": "cambiar123",
-    "secret_key": secrets.token_hex(32),
-    "order_deadline": "10:30",
+# ---------------------------------------------------------------------------
+# Configuración por sistema
+# ---------------------------------------------------------------------------
+SISTEMAS = {
+    "talma": {
+        "titulo": "TALMA",
+        "subtitulo": "Carga la captura del Excel de pedidos TALMA. Antes de leerla podrás ajustar las columnas.",
+        "ayuda": "Sistema TALMA: código, nombre, área (RAMPA, PAX, CARGA, OMA), entrada, segundo y observación.",
+        "data_file": ROOT / "datos_talma.json",
+        "cols": ["registro", "fecha", "sede", "codigo", "nombre", "area", "entrada", "segundo", "observacion"],
+        "areas": ["RAMPA", "PAX", "CARGA", "OMA"],
+        "label_entrada": "ENTRADA",
+        "label_segundo": "SEGUNDO",
+        "label_observacion": "OBSERVACIÓN",
+        "default_entry": 0.455,
+        "default_second": 0.545,
+        "default_observation": 0.685,
+        "excel_headers": ["Registro", "Fecha", "Sede", "Código", "Nombre", "Área", "Entrada", "Segundo", "Observación"],
+        "excel_widths": [24, 15, 12, 14, 30, 12, 28, 34, 50],
+        "pdf_prefix": "talma",
+        "header_label": None,  # usa área
+    },
+    "policia": {
+        "titulo": "POLICÍA",
+        "subtitulo": "Carga la captura de la planilla PNP. Ajusta las barras de Entrada, Plato de fondo y Sugerencias.",
+        "ayuda": "Sistema POLICÍA: N°, nombre y apellido, entrada, plato de fondo y sugerencias. Sin columna de área.",
+        "data_file": ROOT / "datos_policia.json",
+        "cols": ["numero", "nombre", "entrada", "segundo", "observacion"],
+        "areas": [],
+        "label_entrada": "ENTRADA",
+        "label_segundo": "PLATO DE FONDO",
+        "label_observacion": "SUGERENCIAS",
+        # Formato PNP de la captura de Excel: C empieza ~33%, D ~56.6%, E ~79.8%.
+        "default_entry": 0.330,
+        "default_second": 0.566,
+        "default_observation": 0.798,
+        "excel_headers": ["N°", "Nombre y apellido", "Entrada", "Plato de fondo", "Sugerencias"],
+        "excel_widths": [8, 42, 28, 34, 28],
+        "pdf_prefix": "policia",
+        "header_label": "POLICÍA",
+    },
 }
 
-# Empresas que siempre deben existir en el sistema.
-# El token privado se genera solo la primera vez y se conserva en la base de datos.
-DEFAULT_COMPANIES = [
-    ("Liderman", "liderman"),
-    ("Aeropuerto", "aeropuerto"),
-    ("Talma", "talma"),
-    ("Policía", "policia"),
-]
-
-
-def load_config() -> dict:
-    if not CONFIG_PATH.exists():
-        CONFIG_PATH.write_text(json.dumps(DEFAULT_CONFIG, indent=2, ensure_ascii=False), encoding="utf-8")
+# Compatibilidad: migrar datos antiguos si existen
+_legacy = ROOT / "datos_actuales.json"
+_talma_data = SISTEMAS["talma"]["data_file"]
+if _legacy.exists() and not _talma_data.exists():
     try:
-        cfg = json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
-    except (json.JSONDecodeError, OSError):
-        cfg = DEFAULT_CONFIG.copy()
-    changed = False
-    for key, value in DEFAULT_CONFIG.items():
-        if key not in cfg:
-            cfg[key] = value
-            changed = True
-    if changed:
-        CONFIG_PATH.write_text(json.dumps(cfg, indent=2, ensure_ascii=False), encoding="utf-8")
+        shutil.copy(_legacy, _talma_data)
+    except OSError:
+        pass
 
-    # En producción, las variables de entorno tienen prioridad sobre config.json.
-    env_overrides = {
-        "restaurant_name": "RESTAURANT_NAME",
-        "admin_password": "ADMIN_PASSWORD",
-        "secret_key": "SECRET_KEY",
-        "order_deadline": "ORDER_DEADLINE",
+
+def cfg(sistema: str) -> dict:
+    key = (sistema or "").strip().lower()
+    if key not in SISTEMAS:
+        raise RuntimeError(f"Sistema desconocido: {sistema}")
+    return SISTEMAS[key]
+
+
+def repair_mojibake(value: str) -> str:
+    """Repara texto UTF-8 interpretado por error como Windows-1252/Latin-1."""
+    value = value or ""
+    markers = ("Ã", "Â", "â€", "â€™", "â€œ", "â€\u009d", "ðŸ", "�")
+    for _ in range(3):
+        if not any(marker in value for marker in markers):
+            break
+        repaired = None
+        for encoding in ("cp1252", "latin-1"):
+            try:
+                candidate = value.encode(encoding).decode("utf-8")
+            except (UnicodeEncodeError, UnicodeDecodeError):
+                continue
+            if candidate != value:
+                repaired = candidate
+                break
+        if repaired is None:
+            break
+        value = repaired
+    return value
+
+
+def remove_vowel_accents(value: str) -> str:
+    """Quita tildes y diéresis, pero conserva correctamente la letra ñ."""
+    protected = value.replace("ñ", "__ENYE_LOWER__").replace("Ñ", "__ENYE_UPPER__")
+    decomposed = unicodedata.normalize("NFD", protected)
+    without_marks = "".join(char for char in decomposed if unicodedata.category(char) != "Mn")
+    return without_marks.replace("__ENYE_LOWER__", "ñ").replace("__ENYE_UPPER__", "Ñ")
+
+
+def clean_text(text: str, preserve_accents: bool = False) -> str:
+    """Limpia OCR/codificación. Por compatibilidad TALMA quita tildes salvo que se pidan."""
+    value = str(text or "")
+    for stray in ("™", "®", "©", "�"):
+        value = value.replace(stray, "")
+    value = repair_mojibake(value)
+    value = unicodedata.normalize("NFC", value)
+
+    replacements = {
+        "\u00a0": " ",
+        "\u200b": "",
+        "\ufeff": "",
+        "|": " ",
+        "™": "",
+        "®": "",
+        "©": "",
+        "�": "",
+        "â€”": "-",
+        "â€“": "-",
+        "â€™": "'",
+        "â€œ": '"',
+        "â€\u009d": '"',
+        "Ã": "",
+        "Â": "",
+        "â": "",
     }
-    for config_key, env_key in env_overrides.items():
-        env_value = os.environ.get(env_key)
-        if env_value:
-            cfg[config_key] = env_value
-    return cfg
+    for bad, good in replacements.items():
+        value = value.replace(bad, good)
+
+    allowed_punctuation = set(" .,:;!?¿¡'\"()/-+&°#%")
+    chars = []
+    for char in value:
+        category = unicodedata.category(char)
+        if char.isspace() or char in allowed_punctuation or category[0] in ("L", "N"):
+            chars.append(char)
+    value = "".join(chars)
+    value = re.sub(r"\s+", " ", value).strip()
+    if not preserve_accents:
+        value = remove_vowel_accents(value)
+    return value
 
 
-CONFIG = load_config()
+def clean_text_unicode(text: str) -> str:
+    """Limpia el texto conservando tildes, diéresis, ñ y signos españoles válidos."""
+    return clean_text(text, preserve_accents=True)
 
 
-def db() -> sqlite3.Connection:
-    conn = sqlite3.connect(DB_PATH, timeout=15)
-    conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA foreign_keys = ON")
-    return conn
+def pdf_text(text: str, preserve_accents: bool = False) -> str:
+    """Texto seguro para las fuentes PDF incorporadas, conservando acentos cuando corresponde."""
+    value = clean_text(text, preserve_accents=preserve_accents)
+    return value.encode("cp1252", "ignore").decode("cp1252")
 
 
-def init_db() -> None:
-    with db() as conn:
-        conn.executescript(
-            """
-            CREATE TABLE IF NOT EXISTS companies (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                name TEXT NOT NULL,
-                slug TEXT NOT NULL UNIQUE,
-                token TEXT NOT NULL UNIQUE,
-                active INTEGER NOT NULL DEFAULT 1,
-                created_at TEXT NOT NULL
-            );
-
-            CREATE TABLE IF NOT EXISTS menu_items (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                menu_date TEXT NOT NULL,
-                category TEXT NOT NULL CHECK(category IN ('entrada','fondo')),
-                name TEXT NOT NULL,
-                active INTEGER NOT NULL DEFAULT 1,
-                UNIQUE(menu_date, category, name)
-            );
-
-            CREATE TABLE IF NOT EXISTS orders (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                company_id INTEGER NOT NULL,
-                order_date TEXT NOT NULL,
-                employee_name TEXT NOT NULL,
-                employee_key TEXT NOT NULL,
-                area TEXT NOT NULL DEFAULT '',
-                entry_item TEXT NOT NULL,
-                main_item TEXT NOT NULL,
-                notes TEXT NOT NULL DEFAULT '',
-                delivery_type TEXT NOT NULL DEFAULT 'Empresa',
-                created_at TEXT NOT NULL,
-                FOREIGN KEY(company_id) REFERENCES companies(id) ON DELETE CASCADE,
-                UNIQUE(company_id, order_date, employee_key)
-            );
-            """
-        )
-
-        # Elimina el enlace de demostración de versiones anteriores y garantiza
-        # los cuatro enlaces predeterminados solicitados.
-        conn.execute("DELETE FROM companies WHERE slug='empresa-demo'")
-        for company_name, company_slug in DEFAULT_COMPANIES:
-            existing = conn.execute(
-                "SELECT id FROM companies WHERE slug=?",
-                (company_slug,),
-            ).fetchone()
-            if existing:
-                conn.execute(
-                    "UPDATE companies SET name=?, active=1 WHERE id=?",
-                    (company_name, existing["id"]),
-                )
-            else:
-                conn.execute(
-                    "INSERT INTO companies(name, slug, token, created_at) VALUES (?, ?, ?, ?)",
-                    (company_name, company_slug, secrets.token_urlsafe(18), now_iso()),
-                )
-
-        today = today_iso()
-        menu_count = conn.execute("SELECT COUNT(*) FROM menu_items WHERE menu_date=?", (today,)).fetchone()[0]
-        if menu_count == 0:
-            demo = [
-                (today, "entrada", "Sopa del día"),
-                (today, "entrada", "Ensalada fresca"),
-                (today, "fondo", "Pollo al horno con arroz"),
-                (today, "fondo", "Lomo saltado"),
-            ]
-            conn.executemany("INSERT INTO menu_items(menu_date, category, name) VALUES (?, ?, ?)", demo)
+def find_tesseract():
+    candidates = [
+        shutil.which("tesseract"),
+        r"C:\Program Files\Tesseract-OCR\tesseract.exe",
+        r"C:\Program Files (x86)\Tesseract-OCR\tesseract.exe",
+        os.path.expandvars(r"%LOCALAPPDATA%\Programs\Tesseract-OCR\tesseract.exe"),
+    ]
+    for candidate in candidates:
+        if candidate and Path(candidate).exists():
+            return str(candidate)
+    return None
 
 
-LOCAL_TZ = ZoneInfo("America/Lima")
-
-
-def local_now() -> datetime:
-    return datetime.now(LOCAL_TZ)
-
-
-def today_iso() -> str:
-    return local_now().date().isoformat()
-
-
-def now_iso() -> str:
-    return local_now().replace(tzinfo=None, microsecond=0).isoformat(sep=" ")
-
-
-def normalize_key(text: str) -> str:
-    text = unicodedata.normalize("NFKD", text).encode("ascii", "ignore").decode("ascii")
-    return re.sub(r"[^a-z0-9]+", " ", text.lower()).strip()
-
-
-def slugify(text: str) -> str:
-    slug = normalize_key(text).replace(" ", "-")
-    return slug or f"empresa-{secrets.token_hex(3)}"
-
-
-def esc(value: object) -> str:
-    return html.escape(str(value), quote=True)
-
-
-def page(title: str, body: str, extra_head: str = "") -> str:
-    restaurant = esc(CONFIG.get("restaurant_name", "Mi Restaurante"))
-    return f"""<!doctype html>
-<html lang="es">
-<head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<title>{esc(title)} · {restaurant}</title>
-<style>
-:root{{--bg:#f4f6f8;--card:#fff;--text:#18212b;--muted:#667085;--brand:#175cd3;--brand2:#0b4bab;--danger:#b42318;--ok:#067647;--line:#e4e7ec}}
-*{{box-sizing:border-box}} body{{margin:0;font-family:Inter,Segoe UI,Arial,sans-serif;background:var(--bg);color:var(--text)}}
-a{{color:var(--brand);text-decoration:none}} .topbar{{background:#101828;color:#fff;padding:14px 20px;display:flex;justify-content:space-between;align-items:center;gap:15px}}
-.topbar strong{{font-size:18px}} .topbar a{{color:#fff}} .wrap{{max-width:1180px;margin:24px auto;padding:0 16px}} .narrow{{max-width:720px}}
-.card{{background:var(--card);border:1px solid var(--line);border-radius:14px;padding:20px;margin-bottom:18px;box-shadow:0 2px 10px rgba(16,24,40,.04)}}
-h1,h2,h3{{margin-top:0}} h1{{font-size:28px}} h2{{font-size:21px}} .muted{{color:var(--muted)}} .grid{{display:grid;gap:16px}} .grid2{{grid-template-columns:repeat(2,minmax(0,1fr))}} .grid3{{grid-template-columns:repeat(3,minmax(0,1fr))}}
-label{{display:block;font-weight:600;margin:12px 0 6px}} input,select,textarea{{width:100%;padding:11px 12px;border:1px solid #d0d5dd;border-radius:9px;font:inherit;background:#fff}} textarea{{min-height:96px;resize:vertical}}
-button,.btn{{display:inline-block;border:0;border-radius:9px;padding:11px 15px;background:var(--brand);color:#fff;font-weight:700;cursor:pointer}} button:hover,.btn:hover{{background:var(--brand2)}} .btn.secondary{{background:#475467}} .btn.danger{{background:var(--danger)}} .btn.small{{padding:7px 10px;font-size:13px}}
-.notice{{padding:12px 14px;border-radius:9px;margin:12px 0}} .notice.ok{{background:#ecfdf3;color:var(--ok);border:1px solid #abefc6}} .notice.error{{background:#fef3f2;color:var(--danger);border:1px solid #fecdca}}
-table{{width:100%;border-collapse:collapse;font-size:14px}} th,td{{border-bottom:1px solid var(--line);padding:10px 8px;text-align:left;vertical-align:top}} th{{background:#f9fafb}} .table-wrap{{overflow:auto}} .actions{{display:flex;gap:8px;flex-wrap:wrap;align-items:center}}
-.stat{{padding:16px;border:1px solid var(--line);border-radius:12px;background:#fff}} .stat b{{display:block;font-size:26px;margin-top:5px}}
-.menu-choice{{border:1px solid var(--line);border-radius:10px;padding:12px;margin:8px 0}} .menu-choice input{{width:auto;margin-right:8px}} .ticket{{border:2px dashed #333;padding:12px;margin:0 0 12px;break-inside:avoid;background:#fff}} .ticket h3{{margin-bottom:8px}}
-.registered-orders{{margin:0;padding-left:22px}} .registered-orders li{{padding:8px 0;border-bottom:1px solid var(--line)}} .registered-orders li:last-child{{border-bottom:0}}
-footer{{text-align:center;color:var(--muted);padding:25px}}
-@media(max-width:760px){{.grid2,.grid3{{grid-template-columns:1fr}} .topbar{{align-items:flex-start;flex-direction:column}}}}
-@media print{{.no-print,.topbar,footer{{display:none!important}} body{{background:#fff}} .wrap{{max-width:none;margin:0;padding:0}} .card{{border:0;box-shadow:none;padding:0}} .ticket{{page-break-inside:avoid}}}}
-</style>
-{extra_head}
-</head>
-<body>
-<div class="topbar"><strong>{restaurant}</strong><span><a href="/">Inicio</a></span></div>
-{body}
-<footer>Sistema de pedidos de almuerzos</footer>
-</body></html>"""
-
-
-def get_company(slug: str, token: str | None = None):
-    with db() as conn:
-        if token is None:
-            return conn.execute("SELECT * FROM companies WHERE slug=? AND active=1", (slug,)).fetchone()
-        return conn.execute("SELECT * FROM companies WHERE slug=? AND token=? AND active=1", (slug, token)).fetchone()
-
-
-def get_menu(menu_date: str):
-    with db() as conn:
-        rows = conn.execute(
-            "SELECT * FROM menu_items WHERE menu_date=? AND active=1 ORDER BY category, id", (menu_date,)
-        ).fetchall()
-    return {
-        "entrada": [r for r in rows if r["category"] == "entrada"],
-        "fondo": [r for r in rows if r["category"] == "fondo"],
-    }
-
-
-def session_value() -> str:
-    expires = str(int(time.time()) + 8 * 3600)
-    payload = f"admin:{expires}"
-    sig = hmac.new(CONFIG["secret_key"].encode(), payload.encode(), hashlib.sha256).hexdigest()
-    return f"{payload}:{sig}"
-
-
-def valid_session(value: str | None) -> bool:
-    if not value:
-        return False
+def available_languages(exe):
     try:
-        user, expires, sig = value.split(":", 2)
-        if user != "admin" or int(expires) < time.time():
-            return False
-        payload = f"{user}:{expires}"
-        expected = hmac.new(CONFIG["secret_key"].encode(), payload.encode(), hashlib.sha256).hexdigest()
-        return hmac.compare_digest(sig, expected)
-    except (ValueError, TypeError):
-        return False
-
-
-class AppHandler(BaseHTTPRequestHandler):
-    server_version = "Almuerzos/1.0"
-
-    def log_message(self, fmt: str, *args) -> None:
-        sys.stdout.write("[%s] %s\n" % (self.log_date_time_string(), fmt % args))
-
-    def parse_cookies(self) -> cookies.SimpleCookie:
-        jar = cookies.SimpleCookie()
-        if self.headers.get("Cookie"):
-            jar.load(self.headers["Cookie"])
-        return jar
-
-    def is_admin(self) -> bool:
-        jar = self.parse_cookies()
-        value = jar.get("admin_session")
-        return valid_session(value.value if value else None)
-
-    def read_form(self) -> dict[str, str]:
-        try:
-            length = int(self.headers.get("Content-Length", "0"))
-        except ValueError:
-            length = 0
-        raw = self.rfile.read(min(length, 2_000_000)).decode("utf-8", "replace")
-        parsed = parse_qs(raw, keep_blank_values=True)
-        return {k: v[0] if v else "" for k, v in parsed.items()}
-
-    def send_html(self, content: str, status: int = 200, headers: dict | None = None) -> None:
-        data = content.encode("utf-8")
-        self.send_response(status)
-        self.send_header("Content-Type", "text/html; charset=utf-8")
-        self.send_header("Content-Length", str(len(data)))
-        self.send_header("X-Content-Type-Options", "nosniff")
-        self.send_header("X-Frame-Options", "SAMEORIGIN")
-        self.send_header("Referrer-Policy", "same-origin")
-        if headers:
-            for key, value in headers.items():
-                self.send_header(key, value)
-        self.end_headers()
-        self.wfile.write(data)
-
-    def send_text(self, text: str, status: int = 200) -> None:
-        data = text.encode("utf-8")
-        self.send_response(status)
-        self.send_header("Content-Type", "text/plain; charset=utf-8")
-        self.send_header("Content-Length", str(len(data)))
-        self.end_headers()
-        self.wfile.write(data)
-
-    def send_bytes(self, data: bytes, content_type: str, filename: str) -> None:
-        self.send_response(200)
-        self.send_header("Content-Type", content_type)
-        self.send_header("Content-Disposition", f'attachment; filename="{filename}"')
-        self.send_header("Content-Length", str(len(data)))
-        self.end_headers()
-        self.wfile.write(data)
-
-    def redirect(self, location: str, cookie_header: str | None = None) -> None:
-        self.send_response(303)
-        self.send_header("Location", location)
-        if cookie_header:
-            self.send_header("Set-Cookie", cookie_header)
-        self.end_headers()
-
-    def require_admin(self) -> bool:
-        if not self.is_admin():
-            self.redirect("/admin")
-            return False
-        return True
-
-    def do_GET(self) -> None:
-        parsed = urlparse(self.path)
-        path = parsed.path.rstrip("/") or "/"
-        query = {k: v[0] for k, v in parse_qs(parsed.query).items()}
-
-        if path == "/":
-            self.home()
-        elif path == "/health":
-            self.send_text("ok")
-        elif path == "/admin":
-            self.admin_login(query.get("error"))
-        elif path == "/admin/logout":
-            self.redirect("/admin", "admin_session=; Path=/; Max-Age=0; HttpOnly; SameSite=Lax")
-        elif path == "/admin/dashboard":
-            if self.require_admin():
-                self.admin_dashboard(query)
-        elif path == "/admin/export.csv":
-            if self.require_admin():
-                self.export_csv(query)
-        elif path == "/admin/cupones":
-            if self.require_admin():
-                self.coupons(query)
-        elif path.startswith("/empresa/"):
-            self.employee_form(path.split("/", 2)[2], query)
-        else:
-            self.send_html(page("No encontrado", '<main class="wrap narrow"><div class="card"><h1>404</h1><p>Página no encontrada.</p></div></main>'), 404)
-
-    def do_POST(self) -> None:
-        parsed = urlparse(self.path)
-        path = parsed.path.rstrip("/") or "/"
-        if path == "/admin/login":
-            self.login()
-        elif path == "/admin/menu":
-            if self.require_admin():
-                self.save_menu()
-        elif path == "/admin/empresa":
-            if self.require_admin():
-                self.create_company()
-        elif path == "/admin/empresa/toggle":
-            if self.require_admin():
-                self.toggle_company()
-        elif path == "/admin/pedido/eliminar":
-            if self.require_admin():
-                self.delete_order()
-        elif path.startswith("/pedido/"):
-            self.submit_order(path.split("/", 2)[2])
-        else:
-            self.send_html(page("No encontrado", '<main class="wrap narrow"><div class="card"><h1>404</h1></div></main>'), 404)
-
-    def home(self) -> None:
-        body = f"""
-<main class="wrap narrow">
-<div class="card">
-<h1>Pedidos de almuerzo</h1>
-<p>Los trabajadores deben ingresar mediante el enlace privado de su empresa.</p>
-<p class="muted">Administrador del restaurante: use el panel para publicar el menú y revisar pedidos.</p>
-<a class="btn" href="/admin">Ingresar al panel administrador</a>
-</div>
-</main>"""
-        self.send_html(page("Inicio", body))
-
-    def employee_form(self, slug: str, query: dict[str, str]) -> None:
-        token = query.get("token", "")
-        company = get_company(slug, token)
-        if not company:
-            self.send_html(page("Enlace inválido", '<main class="wrap narrow"><div class="card"><h1>Enlace inválido</h1><p>Solicite a su empresa un enlace actualizado.</p></div></main>'), 403)
-            return
-        requested_date = query.get("fecha", today_iso())
-        try:
-            datetime.strptime(requested_date, "%Y-%m-%d")
-        except ValueError:
-            requested_date = today_iso()
-        menu = get_menu(requested_date)
-        with db() as conn:
-            public_orders = conn.execute(
-                """SELECT employee_name, created_at FROM orders
-                   WHERE company_id=? AND order_date=?
-                   ORDER BY created_at DESC, id DESC""",
-                (company["id"], requested_date),
-            ).fetchall()
-        notice = ""
-        if query.get("ok") == "1":
-            notice = '<div class="notice ok">Pedido registrado correctamente.</div>'
-        elif query.get("error"):
-            notice = f'<div class="notice error">{esc(query["error"])}</div>'
-
-        if not menu["entrada"] or not menu["fondo"]:
-            menu_html = '<div class="notice error">Todavía no se ha publicado un menú completo para esta fecha.</div>'
-            submit = ""
-        else:
-            entries = "".join(
-                f'<label class="menu-choice"><input required type="radio" name="entrada" value="{esc(item["name"])}"> {esc(item["name"])}</label>'
-                for item in menu["entrada"]
-            )
-            mains = "".join(
-                f'<label class="menu-choice"><input required type="radio" name="fondo" value="{esc(item["name"])}"> {esc(item["name"])}</label>'
-                for item in menu["fondo"]
-            )
-            menu_html = f"""
-<div class="grid grid2">
-<div><h3>Entrada</h3>{entries}</div>
-<div><h3>Plato de fondo</h3>{mains}</div>
-</div>"""
-            submit = '<button type="submit">Enviar mi pedido</button>'
-
-        if public_orders:
-            public_order_rows = "".join(
-                f'<li><b>{esc(o["employee_name"])}</b> — pedido registrado a las <b>{esc(o["created_at"][11:16])}</b></li>'
-                for o in public_orders
-            )
-            public_orders_html = f"""
-<div class="card">
-<h2>Pedidos registrados</h2>
-<p class="muted">Registros de {esc(company['name'])} para hoy.</p>
-<ul class="registered-orders">{public_order_rows}</ul>
-</div>"""
-        else:
-            public_orders_html = """
-<div class="card">
-<h2>Pedidos registrados</h2>
-<p class="muted">Todavía no hay pedidos registrados para esta fecha.</p>
-</div>"""
-
-        body = f"""
-<main class="wrap narrow">
-<div class="card">
-<h1>Menú de {esc(company['name'])}</h1>
-<p class="muted">Fecha del pedido: {esc(requested_date)} · Hora límite referencial: {esc(CONFIG.get('order_deadline',''))}</p>
-{notice}
-<form method="post" action="/pedido/{esc(slug)}">
-<input type="hidden" name="token" value="{esc(token)}">
-<input type="hidden" name="fecha" value="{esc(requested_date)}">
-<label>Nombre y apellido</label>
-<input name="nombre" required maxlength="100" placeholder="Ejemplo: Juan Pérez">
-<label>Área o sede (opcional)</label>
-<input name="area" maxlength="80" placeholder="Ejemplo: Contabilidad">
-{menu_html}
-<label>Observación (opcional)</label>
-<textarea name="observaciones" maxlength="300" placeholder="Ejemplo: sin cebolla, poco arroz..."></textarea>
-{submit}
-</form>
-</div>
-{public_orders_html}
-</main>"""
-        self.send_html(page("Realizar pedido", body))
-
-    def submit_order(self, slug: str) -> None:
-        form = self.read_form()
-        token = form.get("token", "")
-        company = get_company(slug, token)
-        if not company:
-            self.send_html(page("No autorizado", '<main class="wrap narrow"><div class="card"><h1>No autorizado</h1></div></main>'), 403)
-            return
-        order_date = form.get("fecha", today_iso())
-        name = form.get("nombre", "").strip()
-        area = form.get("area", "").strip()
-        entry = form.get("entrada", "").strip()
-        main = form.get("fondo", "").strip()
-        notes = form.get("observaciones", "").strip()
-        delivery = "Entrega en empresa"
-        error = None
-        try:
-            datetime.strptime(order_date, "%Y-%m-%d")
-        except ValueError:
-            error = "Fecha inválida."
-        if len(name) < 3:
-            error = "Ingrese su nombre y apellido."
-        menu = get_menu(order_date)
-        valid_entries = {r["name"] for r in menu["entrada"]}
-        valid_mains = {r["name"] for r in menu["fondo"]}
-        if entry not in valid_entries or main not in valid_mains:
-            error = "Seleccione platos válidos del menú publicado."
-        if error:
-            params = urlencode({"token": token, "fecha": order_date, "error": error})
-            self.redirect(f"/empresa/{quote(slug)}?{params}")
-            return
-        try:
-            with db() as conn:
-                conn.execute(
-                    """INSERT INTO orders(company_id, order_date, employee_name, employee_key, area, entry_item, main_item, notes, delivery_type, created_at)
-                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-                    (company["id"], order_date, name, normalize_key(name), area, entry, main, notes, delivery, now_iso()),
-                )
-        except sqlite3.IntegrityError:
-            params = urlencode({"token": token, "fecha": order_date, "error": "Ya existe un pedido con ese nombre para esta fecha."})
-            self.redirect(f"/empresa/{quote(slug)}?{params}")
-            return
-        self.redirect(f"/empresa/{quote(slug)}?{urlencode({'token':token,'fecha':order_date,'ok':'1'})}")
-
-    def admin_login(self, error: str | None) -> None:
-        if self.is_admin():
-            self.redirect("/admin/dashboard")
-            return
-        notice = '<div class="notice error">Contraseña incorrecta.</div>' if error else ""
-        body = f"""
-<main class="wrap narrow"><div class="card">
-<h1>Panel administrador</h1>
-{notice}
-<form method="post" action="/admin/login">
-<label>Contraseña</label><input type="password" name="password" required autofocus>
-<button type="submit">Ingresar</button>
-</form>
-<p class="muted">La contraseña inicial está en el archivo <b>config.json</b>.</p>
-</div></main>"""
-        self.send_html(page("Administrador", body))
-
-    def login(self) -> None:
-        form = self.read_form()
-        if hmac.compare_digest(form.get("password", ""), str(CONFIG.get("admin_password", ""))):
-            value = session_value()
-            secure = "; Secure" if self.headers.get("X-Forwarded-Proto") == "https" else ""
-            self.redirect("/admin/dashboard", f"admin_session={value}; Path=/; Max-Age=28800; HttpOnly; SameSite=Lax{secure}")
-        else:
-            self.redirect("/admin?error=1")
-
-    def admin_dashboard(self, query: dict[str, str]) -> None:
-        selected_date = query.get("fecha", today_iso())
-        try:
-            datetime.strptime(selected_date, "%Y-%m-%d")
-        except ValueError:
-            selected_date = today_iso()
-        selected_company = query.get("empresa", "")
-        with db() as conn:
-            companies = conn.execute(
-                """SELECT * FROM companies
-                   ORDER BY CASE slug
-                       WHEN 'liderman' THEN 1
-                       WHEN 'aeropuerto' THEN 2
-                       WHEN 'talma' THEN 3
-                       WHEN 'policia' THEN 4
-                       ELSE 5
-                   END, name"""
-            ).fetchall()
-            filters = ["o.order_date=?"]
-            args: list[object] = [selected_date]
-            if selected_company.isdigit():
-                filters.append("o.company_id=?")
-                args.append(int(selected_company))
-            orders = conn.execute(
-                f"""SELECT o.*, c.name AS company_name FROM orders o
-                    JOIN companies c ON c.id=o.company_id
-                    WHERE {' AND '.join(filters)} ORDER BY c.name, o.created_at""",
-                args,
-            ).fetchall()
-            total_today = conn.execute("SELECT COUNT(*) FROM orders WHERE order_date=?", (selected_date,)).fetchone()[0]
-            company_total = conn.execute("SELECT COUNT(*) FROM companies WHERE active=1").fetchone()[0]
-            entry_summary = conn.execute(
-                "SELECT entry_item, COUNT(*) qty FROM orders WHERE order_date=? GROUP BY entry_item ORDER BY qty DESC, entry_item",
-                (selected_date,),
-            ).fetchall()
-            main_summary = conn.execute(
-                "SELECT main_item, COUNT(*) qty FROM orders WHERE order_date=? GROUP BY main_item ORDER BY qty DESC, main_item",
-                (selected_date,),
-            ).fetchall()
-        menu = get_menu(selected_date)
-        entries_text = "\n".join(r["name"] for r in menu["entrada"])
-        mains_text = "\n".join(r["name"] for r in menu["fondo"])
-        host = self.headers.get("Host", f"localhost:{PORT}")
-        scheme = "https" if self.headers.get("X-Forwarded-Proto") == "https" else "http"
-
-        company_options = '<option value="">Todas</option>' + "".join(
-            f'<option value="{c["id"]}" {"selected" if str(c["id"])==selected_company else ""}>{esc(c["name"])}</option>' for c in companies
+        result = subprocess.run(
+            [exe, "--list-langs"],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=15,
+            creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0,
         )
-        company_rows = "".join(
-            f"""<tr><td>{esc(c['name'])}</td><td><code>{esc(scheme)}://{esc(host)}/empresa/{esc(c['slug'])}?token={esc(c['token'])}</code></td>
-<td>{'Activa' if c['active'] else 'Inactiva'}</td><td><form method="post" action="/admin/empresa/toggle"><input type="hidden" name="id" value="{c['id']}"><button class="btn small secondary">{'Desactivar' if c['active'] else 'Activar'}</button></form></td></tr>"""
-            for c in companies
-        ) or '<tr><td colspan="4">No hay empresas.</td></tr>'
-        order_rows = "".join(
-            f"""<tr><td>{esc(o['company_name'])}</td><td>{esc(o['employee_name'])}</td><td>{esc(o['area'])}</td><td>{esc(o['entry_item'])}</td><td>{esc(o['main_item'])}</td><td>{esc(o['delivery_type'])}</td><td>{esc(o['notes'])}</td><td>{esc(o['created_at'][11:16])}</td>
-<td><form method="post" action="/admin/pedido/eliminar" onsubmit="return confirm('¿Eliminar pedido?')"><input type="hidden" name="id" value="{o['id']}"><input type="hidden" name="fecha" value="{esc(selected_date)}"><button class="btn small danger">Eliminar</button></form></td></tr>"""
-            for o in orders
-        ) or '<tr><td colspan="9">No hay pedidos para el filtro seleccionado.</td></tr>'
-        entry_rows = "".join(f"<li>{esc(r['entry_item'])}: <b>{r['qty']}</b></li>" for r in entry_summary) or "<li>Sin pedidos</li>"
-        main_rows = "".join(f"<li>{esc(r['main_item'])}: <b>{r['qty']}</b></li>" for r in main_summary) or "<li>Sin pedidos</li>"
-        export_params = urlencode({"fecha": selected_date, "empresa": selected_company})
-        if query.get("ok"):
-            notice = '<div class="notice ok">Cambios guardados.</div>'
-        elif query.get("menu_error"):
-            notice = f'<div class="notice error">{esc(query["menu_error"])}</div>'
-        else:
-            notice = ""
-
-        body = f"""
-<main class="wrap">
-<div class="actions no-print" style="justify-content:space-between;margin-bottom:16px"><h1 style="margin:0">Panel administrador</h1><a href="/admin/logout">Cerrar sesión</a></div>
-{notice}
-<div class="grid grid3">
-<div class="stat">Pedidos del día<b>{total_today}</b></div><div class="stat">Empresas activas<b>{company_total}</b></div><div class="stat">Fecha seleccionada<b style="font-size:18px">{esc(selected_date)}</b></div>
-</div>
-
-<div class="card no-print">
-<h2>1. Publicar menú diario</h2>
-<form method="post" action="/admin/menu">
-<div class="grid grid2"><div><label>Fecha</label><input type="date" name="fecha" value="{esc(selected_date)}" required></div><div><p class="muted">Escriba un plato por línea. Al guardar, reemplaza el menú de esa fecha.</p></div></div>
-<div class="grid grid2"><div><label>Entradas</label><textarea name="entradas" required>{esc(entries_text)}</textarea></div><div><label>Platos de fondo</label><textarea name="fondos" required>{esc(mains_text)}</textarea></div></div>
-<button>Guardar menú</button>
-</form>
-</div>
-
-<div class="card no-print">
-<h2>2. Empresas y enlaces privados</h2>
-<form method="post" action="/admin/empresa" class="actions"><input name="nombre" required placeholder="Nombre de la nueva empresa" style="max-width:420px"><button>Crear empresa</button></form>
-<div class="table-wrap"><table><thead><tr><th>Empresa</th><th>Enlace para empleados</th><th>Estado</th><th></th></tr></thead><tbody>{company_rows}</tbody></table></div>
-</div>
-
-<div class="card">
-<h2>3. Pedidos y resumen</h2>
-<form method="get" action="/admin/dashboard" class="grid grid3 no-print">
-<div><label>Fecha</label><input type="date" name="fecha" value="{esc(selected_date)}"></div><div><label>Empresa</label><select name="empresa">{company_options}</select></div><div style="align-self:end"><button>Aplicar filtro</button></div>
-</form>
-<div class="grid grid2"><div><h3>Entradas</h3><ul>{entry_rows}</ul></div><div><h3>Fondos</h3><ul>{main_rows}</ul></div></div>
-<div class="actions no-print" style="margin-bottom:14px"><a class="btn secondary" href="/admin/export.csv?{export_params}">Descargar CSV/Excel</a><a class="btn" target="_blank" href="/admin/cupones?{export_params}">Generar cupones</a></div>
-<div class="table-wrap"><table><thead><tr><th>Empresa</th><th>Empleado</th><th>Área</th><th>Entrada</th><th>Fondo</th><th>Modalidad</th><th>Observación</th><th>Hora</th><th></th></tr></thead><tbody>{order_rows}</tbody></table></div>
-</div>
-</main>"""
-        self.send_html(page("Panel administrador", body))
-
-    def save_menu(self) -> None:
-        form = self.read_form()
-        menu_date = form.get("fecha", "").strip()
-
-        try:
-            datetime.strptime(menu_date, "%Y-%m-%d")
-        except ValueError:
-            self.redirect("/admin/dashboard")
-            return
-
-        def unique_dishes(raw_text: str) -> list[str]:
-            """Limpia platos vacíos y elimina duplicados sin distinguir mayúsculas."""
-            result: list[str] = []
-            seen: set[str] = set()
-
-            for line in raw_text.splitlines():
-                dish = re.sub(r"\\s+", " ", line).strip()
-                if not dish:
-                    continue
-
-                dish = dish[:120]
-                key = normalize_key(dish)
-
-                if key and key not in seen:
-                    seen.add(key)
-                    result.append(dish)
-
-            return result
-
-        entries = unique_dishes(form.get("entradas", ""))
-        mains = unique_dishes(form.get("fondos", ""))
-
-        if not entries or not mains:
-            params = urlencode({
-                "fecha": menu_date,
-                "menu_error": "Debe ingresar al menos una entrada y un plato de fondo."
-            })
-            self.redirect(f"/admin/dashboard?{params}")
-            return
-
-        try:
-            with db() as conn:
-                # La operación completa se ejecuta como una sola transacción.
-                conn.execute("BEGIN")
-
-                # Reemplaza por completo el menú de la fecha seleccionada.
-                conn.execute(
-                    "DELETE FROM menu_items WHERE menu_date=?",
-                    (menu_date,),
-                )
-
-                conn.executemany(
-                    """INSERT INTO menu_items(menu_date, category, name)
-                       VALUES (?, 'entrada', ?)""",
-                    [(menu_date, dish) for dish in entries],
-                )
-
-                conn.executemany(
-                    """INSERT INTO menu_items(menu_date, category, name)
-                       VALUES (?, 'fondo', ?)""",
-                    [(menu_date, dish) for dish in mains],
-                )
-
-                conn.commit()
-
-        except sqlite3.Error as error:
-            print(f"Error al guardar el menú de {menu_date}: {error}", file=sys.stderr)
-            params = urlencode({
-                "fecha": menu_date,
-                "menu_error": "No se pudo guardar el menú. Revise los platos e inténtelo nuevamente."
-            })
-            self.redirect(f"/admin/dashboard?{params}")
-            return
-
-        self.redirect(
-            f"/admin/dashboard?{urlencode({'fecha': menu_date, 'ok': '1'})}"
-        )
-
-    def create_company(self) -> None:
-        form = self.read_form()
-        name = form.get("nombre", "").strip()
-        if not name:
-            self.redirect("/admin/dashboard")
-            return
-        base = slugify(name)
-        slug = base
-        with db() as conn:
-            n = 2
-            while conn.execute("SELECT 1 FROM companies WHERE slug=?", (slug,)).fetchone():
-                slug = f"{base}-{n}"
-                n += 1
-            conn.execute(
-                "INSERT INTO companies(name, slug, token, created_at) VALUES (?, ?, ?, ?)",
-                (name[:120], slug, secrets.token_urlsafe(18), now_iso()),
-            )
-        self.redirect("/admin/dashboard?ok=1")
-
-    def toggle_company(self) -> None:
-        form = self.read_form()
-        if form.get("id", "").isdigit():
-            with db() as conn:
-                conn.execute("UPDATE companies SET active=CASE active WHEN 1 THEN 0 ELSE 1 END WHERE id=?", (int(form["id"]),))
-        self.redirect("/admin/dashboard?ok=1")
-
-    def delete_order(self) -> None:
-        form = self.read_form()
-        if form.get("id", "").isdigit():
-            with db() as conn:
-                conn.execute("DELETE FROM orders WHERE id=?", (int(form["id"]),))
-        self.redirect(f"/admin/dashboard?{urlencode({'fecha':form.get('fecha',today_iso()),'ok':'1'})}")
-
-    def filtered_orders(self, query: dict[str, str]):
-        selected_date = query.get("fecha", today_iso())
-        company = query.get("empresa", "")
-        filters = ["o.order_date=?"]
-        args: list[object] = [selected_date]
-        if company.isdigit():
-            filters.append("o.company_id=?")
-            args.append(int(company))
-        with db() as conn:
-            rows = conn.execute(
-                f"""SELECT o.*, c.name company_name FROM orders o JOIN companies c ON c.id=o.company_id
-                    WHERE {' AND '.join(filters)} ORDER BY c.name, o.employee_name""",
-                args,
-            ).fetchall()
-        return selected_date, rows
-
-    def export_csv(self, query: dict[str, str]) -> None:
-        selected_date, rows = self.filtered_orders(query)
-        output = io.StringIO(newline="")
-        writer = csv.writer(output, delimiter=";")
-        writer.writerow(["Empresa", "Empleado", "Área", "Entrada", "Plato de fondo", "Modalidad", "Observación", "Fecha", "Hora"])
-        for r in rows:
-            writer.writerow([r["company_name"], r["employee_name"], r["area"], r["entry_item"], r["main_item"], r["delivery_type"], r["notes"], r["order_date"], r["created_at"][11:16]])
-        data = ("\ufeff" + output.getvalue()).encode("utf-8")
-        self.send_bytes(data, "text/csv; charset=utf-8", f"pedidos-{selected_date}.csv")
-
-    def coupons(self, query: dict[str, str]) -> None:
-        selected_date, rows = self.filtered_orders(query)
-
-        def dish_style(value: str, kind: str = "entry") -> str:
-            # Ajusta automáticamente el tamaño para que ambos platos se vean grandes,
-            # centrados y sin cortarse, respetando tildes y textos largos.
-            length = len(value.strip())
-            if kind == "entry":
-                if length > 34:
-                    return "font-size:22px;line-height:1.04"
-                if length > 24:
-                    return "font-size:27px;line-height:1.04"
-                return "font-size:33px;line-height:1.02"
-            if length > 42:
-                return "font-size:18px;line-height:1.06"
-            if length > 30:
-                return "font-size:21px;line-height:1.06"
-            return "font-size:25px;line-height:1.04"
-
-        ticket_cards = []
-        for idx, r in enumerate(rows, start=1):
-            ticket_cards.append(
-                f"""<section class="ticket">
-<div class="ticket-top"><div class="ticket-number">TICKET {idx:03d}</div></div>
-<div class="ticket-head">
-  <div class="ticket-area">{esc((r['area'] or 'Sin área').upper())}</div>
-  <div class="ticket-person">{esc((r['employee_name'] or '').upper())}</div>
-</div>
-<div class="dish-entry" style="{dish_style(r['entry_item'], 'entry')}">{esc(r['entry_item'])}</div>
-<div class="dish-main" style="{dish_style(r['main_item'], 'main')}">{esc(r['main_item'])}</div>
-<div class="ticket-notes-title">OBSERVACIÓN</div>
-<div class="ticket-notes">{esc(r['notes'] or '—')}</div>
-</section>"""
-            )
-
-        pages = []
-        for i in range(0, len(ticket_cards), 8):
-            pages.append(f'<div class="ticket-page">{"".join(ticket_cards[i:i+8])}</div>')
-        tickets = "".join(pages) or '<div class="notice error">No hay pedidos para imprimir.</div>'
-
-        coupon_css = """
-<style>
-.coupon-wrap{max-width:1180px;margin:18px auto;padding:0 14px}
-.coupon-card{background:#fff;border:1px solid var(--line);border-radius:14px;padding:16px;box-shadow:0 2px 10px rgba(16,24,40,.04)}
-.ticket-page{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));grid-template-rows:repeat(4,1fr);gap:0;margin:12px auto 24px;max-width:190mm;min-height:273mm;background:#fff;border:1px solid #222}
-.ticket{margin:0!important;border:1px solid #222!important;padding:4.5mm 4.5mm 4mm!important;min-width:0;min-height:0;display:flex;flex-direction:column;justify-content:flex-start;text-align:left;overflow:hidden;background:#fff}
-.ticket-top{display:flex;justify-content:flex-start;align-items:flex-start;min-height:16px}
-.ticket-number{font-size:10px;font-weight:900;letter-spacing:.3px}
-.ticket-head{text-align:center;margin-top:0;margin-bottom:10px}
-.ticket-area{font-size:19px;line-height:1.02;font-weight:1000;white-space:normal;overflow-wrap:anywhere}
-.ticket-person{font-size:19px;line-height:1.02;font-weight:1000;white-space:normal;overflow-wrap:anywhere;margin-top:1px}
-.dish-entry,.dish-main{font-weight:1000;text-align:center;overflow-wrap:anywhere;word-break:normal;margin:0 auto}
-.dish-entry{margin-top:4px;margin-bottom:22px}
-.dish-main{margin-bottom:22px}
-.ticket-notes-title{font-size:10px;line-height:1.05;font-weight:1000;margin-top:auto;margin-bottom:2px}
-.ticket-notes{font-size:10px;line-height:1.15;font-weight:700;white-space:normal;overflow-wrap:anywhere}
-@media(max-width:760px){.ticket-page{grid-template-columns:1fr;grid-template-rows:none;min-height:0}.ticket{min-height:250px}}
-@page{size:A4 portrait;margin:8mm}
-@media print{
-  html,body{margin:0!important;padding:0!important;background:#fff!important}
-  .coupon-wrap{max-width:none!important;margin:0!important;padding:0!important}
-  .coupon-card{border:0!important;border-radius:0!important;box-shadow:none!important;padding:0!important;margin:0!important}
-  .ticket-page{
-    display:grid!important;
-    width:194mm!important;
-    max-width:194mm!important;
-    height:281mm!important;
-    min-height:281mm!important;
-    box-sizing:border-box!important;
-    grid-template-columns:repeat(2,minmax(0,1fr))!important;
-    grid-template-rows:repeat(4,minmax(0,1fr))!important;
-    grid-auto-rows:calc(281mm / 4)!important;
-    gap:0!important;
-    margin:0!important;
-    page-break-after:always;
-    break-after:page;
-  }
-  .ticket-page:last-child{page-break-after:auto;break-after:auto}
-  .ticket{
-    width:auto!important;
-    height:auto!important;
-    min-height:0!important;
-    max-height:none!important;
-    box-sizing:border-box!important;
-    break-inside:avoid;
-    page-break-inside:avoid;
-  }
-}
-</style>
-"""
-        body = f"""
-<main class="coupon-wrap"><div class="coupon-card">
-<div class="actions no-print" style="margin-bottom:10px"><button onclick="window.print()">Imprimir / Guardar PDF</button><a class="btn secondary" href="/admin/dashboard?fecha={esc(selected_date)}">Volver</a></div>
-<h1 class="no-print">Cupones — 8 por hoja</h1>
-<p class="muted no-print" style="margin-top:-6px">Diseño ajustado al modelo solicitado, sin fecha y sin las etiquetas “Entrada” ni “Plato de fondo”.</p>
-{tickets}
-</div></main>"""
-        self.send_html(page("Cupones", body, coupon_css))
+        return [line.strip() for line in result.stdout.splitlines()[1:] if line.strip()]
+    except Exception:
+        return []
 
 
-def run() -> None:
-    global PORT
-    if len(sys.argv) > 1:
-        try:
-            PORT = int(sys.argv[1])
-        except ValueError:
-            print("Puerto inválido; usando 8080.")
-            PORT = 8080
-    init_db()
-    server = ThreadingHTTPServer((HOST, PORT), AppHandler)
-    print("=" * 62)
-    print(f"Sistema iniciado: http://localhost:{PORT}")
-    print(f"Panel administrador: http://localhost:{PORT}/admin")
-    print(f"Contraseña inicial: {CONFIG.get('admin_password')}")
-    print("Presione Ctrl+C para detener.")
-    print("=" * 62)
+def run_tesseract_tsv(image):
+    exe = find_tesseract()
+    if not exe:
+        raise RuntimeError("Tesseract OCR no está instalado. Ejecuta instalar_ocr.bat.")
+
+    languages = available_languages(exe)
+    language = "spa" if "spa" in languages else ("eng" if "eng" in languages else None)
+
+    image = ImageOps.grayscale(image)
+    if image.width < 1800:
+        ratio = 1800 / image.width
+        image = image.resize((1800, int(image.height * ratio)))
+    image = ImageEnhance.Contrast(image).enhance(1.55)
+
+    with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as temp:
+        image.save(temp.name)
+        temp_path = temp.name
+
     try:
-        server.serve_forever()
-    except KeyboardInterrupt:
-        print("\nServidor detenido.")
+        cmd = [exe, temp_path, "stdout"]
+        if language:
+            cmd.extend(["-l", language])
+        cmd.extend(["--oem", "3", "--psm", "6", "--dpi", "300", "-c", "preserve_interword_spaces=1", "tsv"])
+
+        result = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=90,
+            creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0,
+        )
+        if result.returncode != 0:
+            raise RuntimeError(result.stderr.strip() or "Tesseract no pudo leer la imagen.")
+        return result.stdout, image.size
     finally:
-        server.server_close()
+        try:
+            os.unlink(temp_path)
+        except OSError:
+            pass
+
+
+def run_tesseract_tsv_policia(image):
+    """OCR especial para la planilla PNP.
+
+    El formato de POLICÍA viene como captura de Excel con líneas de cuadrícula.
+    En este tipo de imagen, el preprocesado fuerte + PSM 6 mezcla las celdas;
+    PSM 3 sobre la captura casi original conserva mucho mejor cada fila.
+    """
+    exe = find_tesseract()
+    if not exe:
+        raise RuntimeError("Tesseract OCR no está instalado. Ejecuta instalar_ocr.bat.")
+
+    languages = available_languages(exe)
+    language = "spa" if "spa" in languages else ("eng" if "eng" in languages else None)
+
+    # Mantener la cuadrícula y el texto tal como aparecen en Excel. Solo se amplían
+    # capturas realmente pequeñas para que Tesseract no pierda caracteres.
+    working = image.convert("RGB")
+    if working.width < 900:
+        ratio = 900 / working.width
+        working = working.resize(
+            (900, int(working.height * ratio)),
+            Image.Resampling.LANCZOS,
+        )
+
+    with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as temp:
+        working.save(temp.name)
+        temp_path = temp.name
+
+    try:
+        cmd = [exe, temp_path, "stdout"]
+        if language:
+            cmd.extend(["-l", language])
+        cmd.extend([
+            "--oem", "3",
+            "--psm", "3",
+            "--dpi", "300",
+            "-c", "preserve_interword_spaces=1",
+            "tsv",
+        ])
+        result = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=90,
+            creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0,
+        )
+        if result.returncode != 0:
+            raise RuntimeError(result.stderr.strip() or "Tesseract no pudo leer la imagen de POLICÍA.")
+        return result.stdout, working.size
+    finally:
+        try:
+            os.unlink(temp_path)
+        except OSError:
+            pass
+
+
+def parse_words(tsv, preserve_accents=False):
+    words = []
+    reader = csv.DictReader(io.StringIO(tsv), delimiter="\t")
+    for row in reader:
+        text = clean_text(row.get("text"), preserve_accents=preserve_accents)
+        try:
+            confidence = float(row.get("conf", "-1"))
+            x = int(row.get("left", "0"))
+            y = int(row.get("top", "0"))
+            w = int(row.get("width", "0"))
+            h = int(row.get("height", "0"))
+        except (ValueError, TypeError):
+            continue
+        if not text or confidence < 0:
+            continue
+        words.append({
+            "text": text,
+            "x": x,
+            "right": x + w,
+            "cx": x + w / 2,
+            "cy": y + h / 2,
+            "conf": confidence,
+        })
+    return words
+
+
+def cluster_rows(words, image_height):
+    tolerance = max(11, image_height * 0.012)
+    rows = []
+    for word in sorted(words, key=lambda item: (item["cy"], item["x"])):
+        best = None
+        best_distance = None
+        for row in rows[-4:]:
+            distance = abs(word["cy"] - row["center"])
+            if distance <= tolerance and (best_distance is None or distance < best_distance):
+                best = row
+                best_distance = distance
+        if best is None:
+            rows.append({"center": word["cy"], "words": [word]})
+        else:
+            best["words"].append(word)
+            best["center"] = statistics.mean(item["cy"] for item in best["words"])
+    return sorted(rows, key=lambda row: row["center"])
+
+
+def area_value(text):
+    compact = re.sub(r"[^A-Z]", "", clean_text(text).upper())
+    aliases = {
+        "RAMPA": "RAMPA", "RANPA": "RAMPA", "RAMFA": "RAMPA", "RAMP": "RAMPA",
+        "PAX": "PAX", "FAX": "PAX",
+        "CARGA": "CARGA", "CARCA": "CARGA", "CARG": "CARGA",
+        "OMA": "OMA",
+    }
+    return aliases.get(compact, "")
+
+
+def identify_area_word(words, code_index):
+    for index in range(code_index + 1, len(words)):
+        value = area_value(words[index]["text"])
+        if value:
+            return index, value
+    return None, ""
+
+
+def extract_rows_talma(image_path, entry_start, second_start, observation_start):
+    image = Image.open(image_path).convert("RGB")
+    tsv, processed_size = run_tesseract_tsv(image)
+    processed_width, processed_height = processed_size
+    words = parse_words(tsv)
+    grouped = cluster_rows(words, processed_height)
+
+    if not (0.0 < entry_start < second_start < observation_start < 1.0):
+        raise RuntimeError("Las líneas de columnas no están ordenadas correctamente.")
+
+    output = []
+    for group in grouped:
+        row_words = sorted(group["words"], key=lambda item: item["x"])
+
+        code_index = None
+        code = ""
+        for index, word in enumerate(row_words):
+            digits = re.sub(r"\D", "", word["text"])
+            if 7 <= len(digits) <= 9:
+                position = word["cx"] / processed_width
+                if 0.17 <= position <= 0.38:
+                    code_index = index
+                    code = digits
+                    break
+        if code_index is None:
+            continue
+
+        area_index, area = identify_area_word(row_words, code_index)
+        if area_index is None:
+            area_index = len(row_words)
+
+        def joined(items):
+            return clean_text(" ".join(item["text"] for item in items))
+
+        code_x = row_words[code_index]["cx"] / processed_width
+        before_code = row_words[:code_index]
+        dates = [w for w in before_code if re.search(r"\d{1,2}/\d{1,2}/\d{4}", w["text"])]
+        registro_words = []
+        fecha_words = []
+        sede_words = []
+        if dates:
+            first_date_index = before_code.index(dates[0])
+            registro_words = before_code[:first_date_index + 1]
+            remaining = before_code[first_date_index + 1:]
+            if remaining and re.search(r"\d{1,2}/\d{1,2}/\d{4}", remaining[0]["text"]):
+                fecha_words = [remaining[0]]
+                sede_words = remaining[1:]
+            else:
+                fecha_words = dates[1:2]
+                if len(dates) > 1:
+                    second_idx = before_code.index(dates[1])
+                    sede_words = before_code[second_idx + 1:]
+                else:
+                    sede_words = remaining
+        else:
+            sede_words = before_code
+
+        name_words = row_words[code_index + 1:area_index]
+        after_area = row_words[area_index + 1:] if area_index < len(row_words) else []
+
+        entry_words = [
+            w for w in after_area
+            if entry_start <= w["cx"] / processed_width < second_start
+        ]
+        second_words = [
+            w for w in after_area
+            if second_start <= w["cx"] / processed_width < observation_start
+        ]
+        observation_words = [
+            w for w in after_area
+            if w["cx"] / processed_width >= observation_start
+        ]
+
+        row = {
+            "registro": joined(registro_words),
+            "fecha": joined(fecha_words),
+            "sede": joined(sede_words),
+            "codigo": code,
+            "nombre": joined(name_words),
+            "area": area,
+            "entrada": joined(entry_words),
+            "segundo": joined(second_words),
+            "observacion": joined(observation_words),
+        }
+
+        warnings = []
+        if not row["nombre"]:
+            warnings.append("Nombre vacío")
+        if not row["area"]:
+            warnings.append("Área no reconocida")
+        if not row["entrada"]:
+            warnings.append("Entrada vacía: revisa la línea roja Entrada/Segundo")
+        if not row["segundo"]:
+            warnings.append("Segundo vacío: revisa la línea roja Segundo/Observación")
+        if area_value(row["entrada"]):
+            warnings.append("Entrada contiene un área")
+        if area_value(row["segundo"]):
+            warnings.append("Segundo contiene un área")
+        row["_warnings"] = warnings
+        output.append(row)
+
+    if not output:
+        raise RuntimeError("No se detectaron filas. Verifica que la captura incluya la columna Código y que el texto sea legible.")
+    return output
+
+
+HEADER_HINTS = re.compile(
+    r"NOMBRE|APELLIDO|ENTRADA|PLATO|FONDO|SUGEREN|OBSERV|SEGUNDO|CODIGO|ÁREA|AREA|SEDE|REGISTRO|FECHA|^N[°ºoO]?$",
+    re.IGNORECASE,
+)
+
+
+def normalize_policia_name(value):
+    """Corrige errores OCR muy comunes en los grados PNP sin tocar apellidos/nombres."""
+    text = clean_text_unicode(value)
+    text = re.sub(r"(?i)^TNTE\s*[.\-]?\s*PNP\b", "TNTE PNP", text)
+    text = re.sub(r"(?i)^ST1\s*[.\-]?\s*PNP\b", "ST1 PNP", text)
+    text = re.sub(r"(?i)^ST3\s*[.\-]?\s*PNP\b", "ST3 PNP", text)
+    # En esta planilla S2 suele ser leído como 2, 52, $2, s2 o S2.PNP.
+    text = re.sub(r"(?i)^(?:S2|52|2)\s*[.\-]?\s*PNP\b", "S2 PNP", text)
+    text = re.sub(r"(?i)\bPNP\b", "PNP", text)
+    return clean_text_unicode(text)
+
+
+def _match_case(original, replacement):
+    if original.isupper():
+        return replacement.upper()
+    if original[:1].isupper():
+        return replacement[:1].upper() + replacement[1:]
+    return replacement
+
+
+def normalize_policia_menu_text(value):
+    """Conserva/restaura tildes frecuentes que OCR inglés suele perder o leer como 'e'."""
+    text = clean_text_unicode(value)
+    # Con Tesseract sin el paquete SPA, una ó pequeña suele reconocerse como 'e'.
+    # Las sustituciones se limitan a vocabulario de comida para no alterar nombres.
+    accent_fixes = {
+        "limon": "limón", "limen": "limón",
+        "lechon": "lechón", "lechen": "lechón",
+        "salpicon": "salpicón", "salpicen": "salpicón",
+        "pure": "puré",
+        "atun": "atún", "jamon": "jamón", "camaron": "camarón",
+        "chicharron": "chicharrón", "tallarin": "tallarín",
+        "brocoli": "brócoli", "platano": "plátano", "maiz": "maíz",
+        "aji": "ají", "higado": "hígado", "oregano": "orégano",
+        "albondiga": "albóndiga", "albondigas": "albóndigas",
+        "menesron": "menesrón", "menestron": "menestrón",
+        "menu": "menú", "porcion": "porción", "guarnicion": "guarnición",
+    }
+    for wrong, right in accent_fixes.items():
+        pattern = re.compile(rf"(?i)(?<![A-Za-zÁÉÍÓÚÜÑáéíóúüñ]){re.escape(wrong)}(?![A-Za-zÁÉÍÓÚÜÑáéíóúüñ])")
+        text = pattern.sub(lambda m: _match_case(m.group(0), right), text)
+    return clean_text_unicode(text)
+
+
+def extract_rows_policia(image_path, entry_start, second_start, observation_start):
+    """Extrae la planilla PNP: N° | Nombre | Entrada | Plato de fondo | Sugerencias.
+
+    A diferencia de TALMA, la captura PNP incluye los números de fila de Excel a la
+    izquierda. Se usa un OCR específico y se toma como N° el número dentro de la
+    primera columna de la tabla, ignorando el número de fila de Excel.
+    """
+    image = Image.open(image_path).convert("RGB")
+    tsv, processed_size = run_tesseract_tsv_policia(image)
+    processed_width, processed_height = processed_size
+    words = parse_words(tsv, preserve_accents=True)
+    grouped = cluster_rows(words, processed_height)
+
+    if not (0.0 < entry_start < second_start < observation_start < 1.0):
+        raise RuntimeError("Las líneas de columnas no están ordenadas correctamente.")
+
+    output = []
+    for group in grouped:
+        row_words = sorted(group["words"], key=lambda item: item["x"])
+        if not row_words:
+            continue
+
+        def joined(items):
+            return clean_text_unicode(" ".join(item["text"] for item in items))
+
+        # Todo lo anterior a ENTRADA contiene: [número de fila Excel] [N°] [nombre].
+        left_words = [w for w in row_words if w["cx"] / processed_width < entry_start]
+
+        # El N° real está dentro de la tabla. El número de fila de Excel queda mucho
+        # más pegado al borde izquierdo y se excluye con este margen. Elegimos el
+        # primer número corto de la zona N°; así tampoco confundimos "S2" con N°.
+        number_candidates = []
+        number_min_x = max(0.03, entry_start * 0.09)
+        number_max_x = min(entry_start * 0.30, entry_start - 0.02)
+        for index, word in enumerate(left_words):
+            digits = re.sub(r"\D", "", word["text"])
+            position = word["cx"] / processed_width
+            if digits and len(digits) <= 3 and number_min_x <= position <= number_max_x:
+                number_candidates.append((index, word, digits))
+
+        if not number_candidates:
+            continue
+
+        number_index, _, numero = number_candidates[0]
+        name_items = left_words[number_index + 1:]
+        nombre = normalize_policia_name(joined(name_items))
+
+        # Una fila PNP válida siempre debe tener un nombre razonable. Esto descarta
+        # encabezados, fecha, letras de columnas de Excel y filas vacías.
+        if not nombre or len(re.sub(r"[^A-Za-zÁÉÍÓÚÜÑáéíóúüñ]", "", nombre)) < 4:
+            continue
+
+        entry_words = [
+            w for w in row_words
+            if entry_start <= w["cx"] / processed_width < second_start
+        ]
+        second_words = [
+            w for w in row_words
+            if second_start <= w["cx"] / processed_width < observation_start
+        ]
+        observation_words = [
+            w for w in row_words
+            if w["cx"] / processed_width >= observation_start
+        ]
+
+        row = {
+            "numero": numero,
+            "nombre": nombre,
+            "entrada": normalize_policia_menu_text(joined(entry_words)),
+            "segundo": normalize_policia_menu_text(joined(second_words)),
+            "observacion": normalize_policia_menu_text(joined(observation_words)),
+        }
+
+        warnings = []
+        if not row["entrada"]:
+            warnings.append("Entrada vacía: revisa la línea de Entrada")
+        if not row["segundo"]:
+            warnings.append("Plato de fondo vacío: revisa la línea de Plato de fondo")
+        row["_warnings"] = warnings
+        output.append(row)
+
+    if not output:
+        raise RuntimeError(
+            "No se detectaron filas de POLICÍA. Verifica que la captura tenga el formato "
+            "N°, Nombre y apellido, Entrada, Plato de fondo y Sugerencias, y ajusta las barras."
+        )
+    return output
+
+
+def extract_rows(sistema, image_path, entry_start, second_start, observation_start):
+    if sistema == "policia":
+        return extract_rows_policia(image_path, entry_start, second_start, observation_start)
+    return extract_rows_talma(image_path, entry_start, second_start, observation_start)
+
+
+def save_rows(sistema, rows):
+    path = cfg(sistema)["data_file"]
+    path.write_text(json.dumps(rows, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def load_rows(sistema):
+    path = cfg(sistema)["data_file"]
+    if not path.exists():
+        return []
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError):
+        return []
+
+
+@app.errorhandler(Exception)
+def error_handler(error):
+    return render_template("error.html", message=str(error), detail=traceback.format_exc()), 500
+
+
+@app.get("/")
+def index():
+    return render_template("index.html")
+
+
+@app.get("/<sistema>/")
+def system_home(sistema):
+    c = cfg(sistema)
+    return render_template(
+        "subir.html",
+        sistema=sistema,
+        titulo=c["titulo"],
+        subtitulo=c["subtitulo"],
+        ayuda=c["ayuda"],
+    )
+
+
+@app.post("/<sistema>/subir")
+def upload_image(sistema):
+    cfg(sistema)  # valida
+    uploaded = request.files.get("imagen")
+    if not uploaded or not uploaded.filename:
+        raise RuntimeError("Selecciona una imagen.")
+    suffix = Path(uploaded.filename).suffix.lower()
+    if suffix not in (".png", ".jpg", ".jpeg", ".webp"):
+        raise RuntimeError("La imagen debe ser PNG, JPG, JPEG o WEBP.")
+    filename = f"{uuid.uuid4().hex}{suffix}"
+    image_path = UPLOADS / filename
+    uploaded.save(image_path)
+    return redirect(url_for("calibrate", sistema=sistema, filename=filename))
+
+
+@app.get("/<sistema>/calibrar/<filename>")
+def calibrate(sistema, filename):
+    c = cfg(sistema)
+    image_path = UPLOADS / Path(filename).name
+    if not image_path.exists():
+        raise RuntimeError("La imagen ya no existe. Vuelve a cargarla.")
+    return render_template(
+        "calibrar.html",
+        sistema=sistema,
+        titulo=c["titulo"],
+        filename=image_path.name,
+        entry_start=c["default_entry"],
+        second_start=c["default_second"],
+        observation_start=c["default_observation"],
+        label_entrada=c["label_entrada"],
+        label_segundo=c["label_segundo"],
+        label_observacion=c["label_observacion"],
+    )
+
+
+@app.get("/imagen/<filename>")
+def uploaded_image(filename):
+    image_path = UPLOADS / Path(filename).name
+    if not image_path.exists():
+        raise RuntimeError("Imagen no encontrada.")
+    return send_file(image_path)
+
+
+@app.post("/<sistema>/procesar")
+def process_image(sistema):
+    c = cfg(sistema)
+    filename = Path(request.form.get("filename", "")).name
+    image_path = UPLOADS / filename
+    if not filename or not image_path.exists():
+        raise RuntimeError("La imagen no existe. Vuelve a cargarla.")
+    try:
+        entry_start = float(request.form.get("entry_start", c["default_entry"]))
+        second_start = float(request.form.get("second_start", c["default_second"]))
+        observation_start = float(request.form.get("observation_start", c["default_observation"]))
+    except ValueError:
+        raise RuntimeError("Los límites de columnas no son válidos.")
+
+    rows = extract_rows(sistema, image_path, entry_start, second_start, observation_start)
+    save_rows(sistema, rows)
+
+    if sistema == "policia":
+        return render_template("revisar_policia.html", rows=rows, filename=filename)
+    return render_template(
+        "revisar_talma.html",
+        rows=rows,
+        areas=c["areas"],
+        filename=filename,
+    )
+
+
+@app.post("/<sistema>/guardar")
+def save_changes(sistema):
+    c = cfg(sistema)
+    received = json.loads(request.form.get("rows_json", "[]"))
+    cleaned = []
+    for row in received:
+        cleaner = clean_text_unicode if sistema == "policia" else clean_text
+        item = {column: cleaner(row.get(column, "")) for column in c["cols"]}
+        if sistema == "talma":
+            item["codigo"] = re.sub(r"\D", "", item.get("codigo", ""))
+            item["area"] = area_value(item.get("area", ""))
+        if sistema == "policia":
+            item["numero"] = re.sub(r"\D", "", item.get("numero", ""))
+            for field in ("entrada", "segundo", "observacion"):
+                item[field] = normalize_policia_menu_text(item.get(field, ""))
+        item["_warnings"] = []
+        cleaned.append(item)
+    save_rows(sistema, cleaned)
+    return jsonify({"ok": True, "count": len(cleaned)})
+
+
+def draw_centered_fit(pdf, text, center_x, y, max_width, font="Helvetica-Bold", max_size=16, min_size=9, preserve_accents=False):
+    safe_text = pdf_text(text, preserve_accents=preserve_accents)
+    size = max_size
+    while size > min_size and pdf.stringWidth(safe_text, font, size) > max_width:
+        size -= 1
+    if pdf.stringWidth(safe_text, font, size) > max_width:
+        original = safe_text
+        while len(safe_text) > 4 and pdf.stringWidth(safe_text + "...", font, size) > max_width:
+            safe_text = safe_text[:-1].rstrip()
+        if safe_text != original:
+            safe_text += "..."
+    pdf.setFont(font, size)
+    pdf.drawCentredString(center_x, y, safe_text)
+
+
+def _wrap_lines_for_size(pdf, text, max_width, font, size, preserve_accents=False):
+    words = pdf_text(text, preserve_accents=preserve_accents).split()
+    if not words:
+        return []
+    lines = []
+    current = ""
+    for word in words:
+        proposed = f"{current} {word}".strip()
+        if pdf.stringWidth(proposed, font, size) <= max_width:
+            current = proposed
+            continue
+        if current:
+            lines.append(current)
+            current = ""
+        piece = ""
+        for char in word:
+            candidate = piece + char
+            if piece and pdf.stringWidth(candidate, font, size) > max_width:
+                lines.append(piece)
+                piece = char
+            else:
+                piece = candidate
+        current = piece
+    if current:
+        lines.append(current)
+    return lines
+
+
+def draw_text_in_box(
+    pdf,
+    text,
+    x,
+    top_y,
+    max_width,
+    max_height,
+    font="Helvetica-Bold",
+    max_size=18,
+    min_size=10,
+    max_lines=3,
+    preserve_accents=False,
+):
+    safe_text = pdf_text(text, preserve_accents=preserve_accents)
+    if not safe_text:
+        return
+    chosen_size = min_size
+    chosen_lines = [safe_text]
+    chosen_leading = min_size * 1.08
+    for size in range(max_size, min_size - 1, -1):
+        lines = _wrap_lines_for_size(pdf, safe_text, max_width, font, size, preserve_accents=preserve_accents)
+        leading = size * 1.08
+        required_height = size + max(0, len(lines) - 1) * leading
+        if len(lines) <= max_lines and required_height <= max_height:
+            chosen_size = size
+            chosen_lines = lines
+            chosen_leading = leading
+            break
+    if len(chosen_lines) > max_lines:
+        chosen_lines = chosen_lines[:max_lines]
+        last = chosen_lines[-1]
+        suffix = "..."
+        while last and pdf.stringWidth(last + suffix, font, chosen_size) > max_width:
+            last = last[:-1].rstrip()
+        chosen_lines[-1] = (last + suffix) if last else suffix
+    pdf.setFont(font, chosen_size)
+    baseline = top_y - chosen_size
+    for line in chosen_lines:
+        pdf.drawString(x, baseline, line)
+        baseline -= chosen_leading
+
+
+def count_order_values(rows, field, preserve_accents=False):
+    counts = Counter()
+    labels = {}
+    for row in rows:
+        value = clean_text(row.get(field, ""), preserve_accents=preserve_accents)
+        if not value:
+            continue
+        key = value.casefold()
+        counts[key] += 1
+        labels.setdefault(key, value)
+    return sorted(
+        ((labels[key], amount) for key, amount in counts.items()),
+        key=lambda item: (-item[1], item[0].casefold()),
+    )
+
+
+def fit_single_line(pdf, text, max_width, font="Helvetica", size=10, preserve_accents=False):
+    value = pdf_text(text, preserve_accents=preserve_accents)
+    if pdf.stringWidth(value, font, size) <= max_width:
+        return value
+    suffix = "..."
+    while value and pdf.stringWidth(value + suffix, font, size) > max_width:
+        value = value[:-1].rstrip()
+    return value + suffix if value else suffix
+
+
+def draw_pdf_summary_talma(pdf, rows, page_width, page_height, areas):
+    left = 16 * mm
+    right = page_width - 16 * mm
+    top = page_height - 16 * mm
+    generated_at = datetime.now()
+
+    area_counts = Counter()
+    for row in rows:
+        area = clean_text(row.get("area", "")).upper() or "SIN ÁREA"
+        area_counts[area] += 1
+
+    ordered_areas = []
+    for area in areas:
+        if area_counts.get(area):
+            ordered_areas.append((area, area_counts.pop(area)))
+    ordered_areas.extend(sorted(area_counts.items(), key=lambda item: (-item[1], item[0])))
+
+    pdf.showPage()
+    pdf.setFont("Helvetica-Bold", 18)
+    pdf.drawString(left, top, "RESUMEN DE PEDIDOS — TALMA")
+    pdf.setFont("Helvetica", 8)
+    pdf.drawRightString(right, top + 1, generated_at.strftime("%d/%m/%Y %H:%M"))
+    pdf.setLineWidth(0.8)
+    pdf.line(left, top - 4 * mm, right, top - 4 * mm)
+
+    y = top - 14 * mm
+    pdf.setFont("Helvetica-Bold", 16)
+    pdf.drawString(left, y, f"TOTAL DE PEDIDOS: {len(rows)}")
+    y -= 13 * mm
+
+    pdf.setFont("Helvetica-Bold", 13)
+    pdf.drawString(left, y, "PEDIDOS POR ÁREA / CATEGORÍA")
+    pdf.setLineWidth(0.4)
+    pdf.line(left, y - 2 * mm, right, y - 2 * mm)
+    y -= 9 * mm
+
+    pdf.setFont("Helvetica-Bold", 10)
+    pdf.drawString(left + 2 * mm, y, "ÁREA / CATEGORÍA")
+    pdf.drawRightString(right - 2 * mm, y, "CANTIDAD")
+    y -= 7 * mm
+
+    if not ordered_areas:
+        pdf.setFont("Helvetica-Oblique", 10)
+        pdf.drawString(left + 2 * mm, y, "SIN DATOS")
+        return
+
+    for area, amount in ordered_areas:
+        pdf.setFont("Helvetica-Bold", 12)
+        pdf.drawString(left + 2 * mm, y, pdf_text(area))
+        pdf.drawRightString(right - 2 * mm, y, str(amount))
+        pdf.setLineWidth(0.25)
+        pdf.line(left + 2 * mm, y - 2 * mm, right - 2 * mm, y - 2 * mm)
+        y -= 8 * mm
+
+
+def draw_pdf_summary_policia(pdf, rows, page_width, page_height):
+    left = 16 * mm
+    right = page_width - 16 * mm
+    top = page_height - 16 * mm
+    generated_at = datetime.now()
+
+    pdf.showPage()
+    pdf.setFont("Helvetica-Bold", 18)
+    pdf.drawString(left, top, "RESUMEN DE PEDIDOS — POLICÍA")
+    pdf.setFont("Helvetica", 8)
+    pdf.drawRightString(right, top + 1, generated_at.strftime("%d/%m/%Y %H:%M"))
+    pdf.setLineWidth(0.8)
+    pdf.line(left, top - 4 * mm, right, top - 4 * mm)
+
+    y = top - 14 * mm
+    pdf.setFont("Helvetica-Bold", 16)
+    pdf.drawString(left, y, f"TOTAL DE PEDIDOS: {len(rows)}")
+    y -= 14 * mm
+
+    for field, title in (
+        ("entrada", "ENTRADAS MÁS PEDIDAS"),
+        ("segundo", "PLATOS DE FONDO MÁS PEDIDOS"),
+        ("observacion", "SUGERENCIAS"),
+    ):
+        values = count_order_values(rows, field, preserve_accents=True)
+        pdf.setFont("Helvetica-Bold", 13)
+        pdf.drawString(left, y, title)
+        pdf.setLineWidth(0.4)
+        pdf.line(left, y - 2 * mm, right, y - 2 * mm)
+        y -= 8 * mm
+        if not values:
+            pdf.setFont("Helvetica-Oblique", 10)
+            pdf.drawString(left + 2 * mm, y, "SIN DATOS")
+            y -= 10 * mm
+            continue
+        for label, amount in values[:12]:
+            if y < 25 * mm:
+                pdf.showPage()
+                y = top
+            pdf.setFont("Helvetica", 11)
+            pdf.drawString(left + 2 * mm, y, fit_single_line(pdf, label, right - left - 30 * mm, size=11, preserve_accents=True))
+            pdf.drawRightString(right - 2 * mm, y, str(amount))
+            y -= 6.5 * mm
+        y -= 6 * mm
+
+
+@app.get("/<sistema>/pdf")
+def create_pdf(sistema):
+    c = cfg(sistema)
+    rows = load_rows(sistema)
+    if not rows:
+        raise RuntimeError("No hay pedidos guardados para generar el PDF.")
+    OUTPUTS.mkdir(parents=True, exist_ok=True)
+    output = OUTPUTS / f"cuponera_{c['pdf_prefix']}_{datetime.now():%Y%m%d_%H%M%S}.pdf"
+
+    pdf = canvas.Canvas(str(output), pagesize=A4)
+    page_width, page_height = A4
+    preserve_accents = sistema == "policia"
+    margin = 8 * mm
+    coupon_width = (page_width - 2 * margin) / 2
+    coupon_height = (page_height - 2 * margin) / 4
+
+    for index, row in enumerate(rows):
+        position = index % 8
+        if index and position == 0:
+            pdf.showPage()
+        column = position % 2
+        line = position // 2
+        x = margin + column * coupon_width
+        top = page_height - margin - line * coupon_height
+        pad = 5 * mm
+
+        pdf.rect(x, top - coupon_height, coupon_width, coupon_height)
+        text_x = x + pad
+        text_y = top - 7 * mm
+
+        pdf.setFont("Helvetica-Bold", 8)
+        pdf.drawString(text_x, text_y, f"TICKET {index + 1:03d}")
+
+        if sistema == "talma":
+            header = pdf_text(row.get("area", "") or "SIN ÁREA").upper()
+            fecha = pdf_text(row.get("fecha", ""))
+            header_size = 18
+            name_max_size = 16
+            name_min_size = 9
+            content_top = top - 22 * mm
+            first_box_height = 13 * mm
+            second_box_top = content_top - 16 * mm
+            second_box_height = 13 * mm
+            menu_max_size = 27
+            menu_min_size = 15
+            observation_label_y = content_top - 35 * mm
+        else:
+            header = "POLICÍA"
+            fecha = ""
+            header_size = 20
+            name_max_size = 18
+            name_min_size = 10
+            # En POLICÍA se usa una cuponera más parecida a TALMA,
+            # destacando el área (POLICÍA), el nombre y aún más la entrada / plato de fondo.
+            content_top = top - 24 * mm
+            first_box_height = 15 * mm
+            second_box_top = content_top - 18 * mm
+            second_box_height = 15 * mm
+            menu_max_size = 31
+            menu_min_size = 16
+            observation_label_y = content_top - 41 * mm
+            num = clean_text(row.get("numero", ""))
+            if num:
+                pdf.setFont("Helvetica", 8)
+                pdf.drawString(text_x + 22 * mm, text_y, f"N° {num}")
+
+        pdf.setFont("Helvetica-Bold", header_size)
+        pdf.drawCentredString(x + coupon_width / 2, text_y, header)
+        if fecha:
+            pdf.setFont("Helvetica", 7)
+            pdf.drawRightString(x + coupon_width - pad, text_y, fecha)
+        text_y -= 7 * mm
+
+        name = pdf_text(row.get("nombre", ""), preserve_accents=preserve_accents).upper()
+        draw_centered_fit(
+            pdf,
+            name,
+            x + coupon_width / 2,
+            text_y,
+            coupon_width - 2 * pad,
+            font="Helvetica-Bold",
+            max_size=name_max_size,
+            min_size=name_min_size,
+            preserve_accents=preserve_accents,
+        )
+
+        ticket_bottom = top - coupon_height + 4 * mm
+        inner_width = coupon_width - 2 * pad
+
+        draw_text_in_box(
+            pdf,
+            row.get("entrada", ""),
+            text_x,
+            content_top,
+            inner_width,
+            first_box_height,
+            font="Helvetica-Bold",
+            max_size=menu_max_size,
+            min_size=menu_min_size,
+            max_lines=2,
+            preserve_accents=preserve_accents,
+        )
+
+        draw_text_in_box(
+            pdf,
+            row.get("segundo", ""),
+            text_x,
+            second_box_top,
+            inner_width,
+            second_box_height,
+            font="Helvetica-Bold",
+            max_size=menu_max_size,
+            min_size=menu_min_size,
+            max_lines=2,
+            preserve_accents=preserve_accents,
+        )
+
+        obs_label = "OBSERVACIÓN" if sistema == "talma" else "SUGERENCIAS"
+        if clean_text(row.get("observacion", "")):
+            pdf.setFont("Helvetica-Bold", 8)
+            pdf.drawString(text_x, observation_label_y, obs_label)
+            observation_top = observation_label_y - 2 * mm
+            observation_height = max(7 * mm, observation_top - ticket_bottom)
+            draw_text_in_box(
+                pdf,
+                row.get("observacion", ""),
+                text_x,
+                observation_top,
+                inner_width,
+                observation_height,
+                font="Helvetica-Bold",
+                max_size=10,
+                min_size=7,
+                max_lines=3,
+                preserve_accents=preserve_accents,
+            )
+
+    if sistema == "talma":
+        draw_pdf_summary_talma(pdf, rows, page_width, page_height, c["areas"])
+    else:
+        draw_pdf_summary_policia(pdf, rows, page_width, page_height)
+
+    pdf.save()
+    return send_file(output, as_attachment=True)
+
+
+# ---- Excel helpers (compartidos, parametrizados por sistema) ----
+
+def normalized_excel_header(values):
+    return [clean_text(str(v or "")).casefold() for v in values]
+
+
+def is_orders_sheet(sheet, headers):
+    expected = [clean_text(str(h or "")).casefold() for h in headers]
+    first = normalized_excel_header([cell.value for cell in next(sheet.iter_rows(min_row=1, max_row=1))])
+    return first[: len(expected)] == expected
+
+
+def parse_order_date(value):
+    text = clean_text(str(value or ""))
+    for fmt in ("%d/%m/%Y", "%Y-%m-%d", "%d-%m-%Y"):
+        try:
+            return datetime.strptime(text, fmt)
+        except ValueError:
+            continue
+    return None
+
+
+def order_date_label(rows, date_field="fecha"):
+    dates = []
+    for row in rows:
+        parsed = parse_order_date(row.get(date_field, ""))
+        if parsed:
+            dates.append(parsed)
+    if not dates:
+        return datetime.now().strftime("%d/%m/%Y")
+    lo, hi = min(dates), max(dates)
+    if lo.date() == hi.date():
+        return lo.strftime("%d/%m/%Y")
+    return f"{lo.strftime('%d/%m/%Y')} - {hi.strftime('%d/%m/%Y')}"
+
+
+def sheet_date_range(sheet, date_col_index=2):
+    dates = []
+    for row in sheet.iter_rows(min_row=2, values_only=True):
+        if not row or date_col_index >= len(row):
+            continue
+        parsed = parse_order_date(row[date_col_index])
+        if parsed:
+            dates.append(parsed)
+    if not dates:
+        return ""
+    lo, hi = min(dates), max(dates)
+    if lo.date() == hi.date():
+        return lo.strftime("%d/%m/%Y")
+    return f"{lo.strftime('%d/%m/%Y')} - {hi.strftime('%d/%m/%Y')}"
+
+
+def style_orders_sheet(sheet, widths):
+    header_fill = PatternFill("solid", fgColor="176B43")
+    header_font = Font(color="FFFFFF", bold=True)
+    thin = Border(
+        left=Side(style="thin", color="B0B0B0"),
+        right=Side(style="thin", color="B0B0B0"),
+        top=Side(style="thin", color="B0B0B0"),
+        bottom=Side(style="thin", color="B0B0B0"),
+    )
+    for col_idx, width in enumerate(widths, start=1):
+        sheet.column_dimensions[get_column_letter(col_idx)].width = width
+    for cell in sheet[1]:
+        cell.fill = header_fill
+        cell.font = header_font
+        cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
+        cell.border = thin
+    for row in sheet.iter_rows(min_row=2, max_row=sheet.max_row, max_col=len(widths)):
+        for cell in row:
+            cell.border = thin
+            cell.alignment = Alignment(vertical="center", wrap_text=True)
+
+
+def remove_previous_summary(sheet):
+    rows_to_delete = []
+    for idx, row in enumerate(sheet.iter_rows(min_row=1, values_only=True), start=1):
+        text = " ".join(clean_text(str(v or "")) for v in row).upper()
+        if "TOTAL DE PEDIDOS" in text or "PERIODO" in text or "PERÍODO" in text:
+            rows_to_delete.append(idx)
+    for idx in reversed(rows_to_delete):
+        sheet.delete_rows(idx, 1)
+
+
+def append_summary(sheet, added_count, accumulated_total, cols_count, period_label=""):
+    sheet.append([])
+    sheet.append(["PERIODO", period_label or datetime.now().strftime("%d/%m/%Y")])
+    sheet.append(["PEDIDOS AGREGADOS", added_count])
+    sheet.append(["TOTAL DE PEDIDOS ACUMULADO", accumulated_total])
+    for row_idx in range(sheet.max_row - 2, sheet.max_row + 1):
+        for col in range(1, min(3, cols_count + 1)):
+            cell = sheet.cell(row=row_idx, column=col)
+            cell.font = Font(bold=True)
+
+
+def append_orders(sheet, rows, cols, preserve_accents=False):
+    for row in rows:
+        sheet.append([clean_text(row.get(column, ""), preserve_accents=preserve_accents) for column in cols])
+
+
+def count_order_rows(sheet, headers):
+    count = 0
+    expected_len = len(headers)
+    for row in sheet.iter_rows(min_row=2, values_only=True):
+        if not row:
+            continue
+        values = [clean_text(str(v or "")) for v in row[:expected_len]]
+        text = " ".join(values).upper()
+        if "TOTAL DE PEDIDOS" in text or "PERIODO" in text or "PERÍODO" in text:
+            continue
+        if any(values):
+            count += 1
+    return count
+
+
+def prepare_orders_sheet(workbook, headers, preserve_accents=False):
+    # Preferir hoja llamada Pedidos; consolidar si hay varias
+    candidates = [s for s in workbook.worksheets if s.title.lower().startswith("pedido")]
+    if not candidates:
+        if workbook.worksheets:
+            sheet = workbook.worksheets[0]
+        else:
+            sheet = workbook.create_sheet("Pedidos")
+        if sheet.max_row < 1 or not is_orders_sheet(sheet, headers):
+            sheet.title = "Pedidos"
+            if sheet.max_row >= 1:
+                # reiniciar
+                for _ in range(sheet.max_row):
+                    sheet.delete_rows(1)
+            sheet.append(headers)
+        return sheet
+
+    main = candidates[0]
+    main.title = "Pedidos"
+    if main.max_row < 1 or not is_orders_sheet(main, headers):
+        for _ in range(main.max_row):
+            main.delete_rows(1)
+        main.append(headers)
+
+    for extra in candidates[1:]:
+        for row in extra.iter_rows(min_row=2, values_only=True):
+            if not row:
+                continue
+            values = [clean_text(str(v or ""), preserve_accents=preserve_accents) for v in row[: len(headers)]]
+            text = " ".join(values).upper()
+            if "TOTAL DE PEDIDOS" in text or "PERIODO" in text:
+                continue
+            if any(values):
+                main.append(values)
+        del workbook[extra.title]
+    return main
+
+
+@app.get("/<sistema>/excel")
+def create_excel(sistema):
+    c = cfg(sistema)
+    rows = load_rows(sistema)
+    if not rows:
+        raise RuntimeError("No hay pedidos guardados para exportar.")
+    OUTPUTS.mkdir(parents=True, exist_ok=True)
+    output = OUTPUTS / f"pedidos_{c['pdf_prefix']}_{datetime.now():%Y_%m}.xlsx"
+    workbook = Workbook()
+    sheet = workbook.active
+    sheet.title = "Pedidos"
+    sheet.append(c["excel_headers"])
+    append_orders(sheet, rows, c["cols"], preserve_accents=(sistema == "policia"))
+    total = count_order_rows(sheet, c["excel_headers"])
+    period = order_date_label(rows, "fecha") if sistema == "talma" else datetime.now().strftime("%d/%m/%Y")
+    append_summary(sheet, added_count=len(rows), accumulated_total=total, cols_count=len(c["cols"]), period_label=period)
+    style_orders_sheet(sheet, c["excel_widths"])
+    workbook.save(output)
+    return send_file(output, as_attachment=True, download_name=output.name)
+
+
+@app.post("/<sistema>/actualizar-excel")
+def update_excel(sistema):
+    c = cfg(sistema)
+    rows = load_rows(sistema)
+    if not rows:
+        raise RuntimeError("No hay pedidos guardados para agregar al Excel.")
+
+    uploaded = request.files.get("excel_anterior")
+    if not uploaded or not uploaded.filename:
+        raise RuntimeError("Selecciona el archivo Excel mensual que deseas actualizar.")
+    suffix = Path(uploaded.filename).suffix.lower()
+    if suffix != ".xlsx":
+        raise RuntimeError("El archivo anterior debe estar en formato .xlsx.")
+
+    OUTPUTS.mkdir(parents=True, exist_ok=True)
+    temp_input = UPLOADS / f"{uuid.uuid4().hex}.xlsx"
+    uploaded.save(temp_input)
+    try:
+        workbook = load_workbook(temp_input)
+        sheet = prepare_orders_sheet(workbook, c["excel_headers"], preserve_accents=(sistema == "policia"))
+        remove_previous_summary(sheet)
+        append_orders(sheet, rows, c["cols"], preserve_accents=(sistema == "policia"))
+        accumulated_total = count_order_rows(sheet, c["excel_headers"])
+        period = order_date_label(rows, "fecha") if sistema == "talma" else datetime.now().strftime("%d/%m/%Y")
+        append_summary(
+            sheet,
+            added_count=len(rows),
+            accumulated_total=accumulated_total,
+            cols_count=len(c["cols"]),
+            period_label=period,
+        )
+        style_orders_sheet(sheet, c["excel_widths"])
+
+        original_name = clean_text(Path(uploaded.filename).stem) or f"pedidos_{c['pdf_prefix']}"
+        output = OUTPUTS / f"{original_name}_actualizado.xlsx"
+        workbook.save(output)
+    finally:
+        try:
+            temp_input.unlink()
+        except OSError:
+            pass
+
+    return send_file(output, as_attachment=True, download_name=output.name)
+
+
+@app.get("/diagnostico")
+def diagnostic():
+    exe = find_tesseract()
+    return jsonify({
+        "version": "19.3-dual",
+        "sistemas": list(SISTEMAS.keys()),
+        "tesseract_encontrado": bool(exe),
+        "ruta": exe,
+        "idiomas": available_languages(exe) if exe else [],
+        "python": os.sys.version,
+        "uploads": str(UPLOADS),
+        "outputs": str(OUTPUTS),
+    })
+
+
+# Redirecciones de compatibilidad con rutas antiguas (TALMA)
+@app.post("/subir")
+def legacy_upload():
+    return upload_image("talma")
+
+@app.get("/calibrar/<filename>")
+def legacy_calibrate(filename):
+    return redirect(url_for("calibrate", sistema="talma", filename=filename))
+
+@app.post("/procesar")
+def legacy_process():
+    return process_image("talma")
+
+@app.post("/guardar")
+def legacy_save():
+    return save_changes("talma")
+
+@app.get("/pdf")
+def legacy_pdf():
+    return create_pdf("talma")
+
+@app.get("/excel")
+def legacy_excel():
+    return create_excel("talma")
+
+@app.post("/actualizar-excel")
+def legacy_update_excel():
+    return update_excel("talma")
 
 
 if __name__ == "__main__":
-    run()
+    app.run(host="127.0.0.1", port=5050, debug=False)

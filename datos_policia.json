@@ -1,0 +1,58 @@
+[
+  {
+    "numero": "1",
+    "nombre": "TNTE PNP CONTRERAS ARCE MARYLÍN",
+    "entrada": "Cazuela",
+    "segundo": "Chaufa con pollo",
+    "observacion": ""
+  },
+  {
+    "numero": "2",
+    "nombre": "ST1 PNP RODRÍGUEZ PAREDES GIOVANNA",
+    "entrada": "cazuela",
+    "segundo": "estofado de pollo",
+    "observacion": ""
+  },
+  {
+    "numero": "3",
+    "nombre": "ST3 PNP ALANOCA CONDORI LIDES",
+    "entrada": "ensalada con limón",
+    "segundo": "asado de lechón sin puré abundante jugo",
+    "observacion": "mate"
+  },
+  {
+    "numero": "4",
+    "nombre": "S2 PNP ARUA TORRES BELINDA",
+    "entrada": "franco",
+    "segundo": "",
+    "observacion": ""
+  },
+  {
+    "numero": "5",
+    "nombre": "S2 PNP TORRES DÍAZ NADIA",
+    "entrada": "cazuela de res",
+    "segundo": "estofado de pollo",
+    "observacion": ""
+  },
+  {
+    "numero": "7",
+    "nombre": "S2 PNP VELAZCO NIÑA JUDITH",
+    "entrada": "salpicón sin papa",
+    "segundo": "asado de chancho con puré",
+    "observacion": ""
+  },
+  {
+    "numero": "8",
+    "nombre": "S2 PNP HUARSAYA MAYTA JAVIER",
+    "entrada": "cazuela",
+    "segundo": "pollo broster",
+    "observacion": ""
+  },
+  {
+    "numero": "9",
+    "nombre": "S2 PNP MAQUERA MANDAMIENTO ERIXZON",
+    "entrada": "cazuela de",
+    "segundo": "lomo saltado",
+    "observacion": "gaseosa"
+  }
+]
