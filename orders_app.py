@@ -683,7 +683,7 @@ class AppHandler(BaseHTTPRequestHandler):
             public_orders_html = f"""
 <div class="card">
 <h2>Pedidos registrados</h2>
-<p class="muted">Registros de {esc(company['name'])} para hoy.</p>
+<p class="muted">Registros de {esc(company['name'])} para la fecha seleccionada.</p>
 <ul class="registered-orders">{public_order_rows}</ul>
 </div>"""
         else:
@@ -697,7 +697,19 @@ class AppHandler(BaseHTTPRequestHandler):
 <main class="wrap narrow">
 <div class="card">
 <h1>Menú de {esc(company['name'])}</h1>
-<p class="muted">Fecha del pedido: {esc(requested_date)} · Hora límite referencial: {esc(CONFIG.get('order_deadline',''))}</p>
+<div class="notice" style="margin:12px 0">
+  <b>¿Para qué día quieres hacer tu pedido?</b>
+  <form method="get" action="/empresa/{esc(slug)}" style="display:flex;gap:10px;align-items:end;flex-wrap:wrap;margin-top:10px">
+    <input type="hidden" name="token" value="{esc(token)}">
+    <div>
+      <label>Fecha del pedido</label>
+      <input type="date" name="fecha" value="{esc(requested_date)}" min="{today_iso()}" required>
+    </div>
+    <button type="submit" class="btn secondary">Ver menú de ese día</button>
+  </form>
+  <p class="muted" style="margin-bottom:0">Puedes elegir hoy o una fecha futura. El pedido quedará registrado para la fecha seleccionada.</p>
+</div>
+<p class="muted">Fecha seleccionada: <b>{esc(requested_date)}</b> · Hora límite referencial: {esc(CONFIG.get('order_deadline',''))}</p>
 {notice}
 <form method="post" action="/pedido/{esc(slug)}">
 <input type="hidden" name="token" value="{esc(token)}">
@@ -724,7 +736,7 @@ class AppHandler(BaseHTTPRequestHandler):
         if not company:
             self.send_html(page("No autorizado", '<main class="wrap narrow"><div class="card"><h1>No autorizado</h1></div></main>'), 403)
             return
-        order_date = form.get("fecha", today_iso())
+        order_date = form.get("fecha", today_iso()).strip()
         name = form.get("nombre", "").strip()
         is_talma = slug.lower() == "talma"
         dni = re.sub(r"\D", "", form.get("dni", "").strip()) if is_talma else ""
@@ -760,7 +772,7 @@ class AppHandler(BaseHTTPRequestHandler):
                     (company["id"], order_date, name, employee_key, dni, area, entry, main, notes, delivery, now_iso()),
                 )
         except sqlite3.IntegrityError:
-            params = urlencode({"token": token, "fecha": order_date, "error": "Ya existe un pedido para ese DNI en esta fecha." if is_talma else "Ya existe un pedido con ese nombre para esta fecha."})
+            params = urlencode({"token": token, "fecha": order_date, "error": "Ya existe un pedido para ese DNI en la fecha seleccionada." if is_talma else "Ya existe un pedido con ese nombre en la fecha seleccionada."})
             self.redirect(f"/empresa/{quote(slug)}?{params}")
             return
         self.redirect(f"/empresa/{quote(slug)}?{urlencode({'token':token,'fecha':order_date,'ok':'1'})}")
@@ -833,6 +845,8 @@ class AppHandler(BaseHTTPRequestHandler):
         menu = get_menu(selected_date)
         entries_text = "\n".join(r["name"] for r in menu["entrada"])
         mains_text = "\n".join(r["name"] for r in menu["fondo"])
+        entry_menu_view = "".join(f"<li>{esc(r['name'])}</li>" for r in menu["entrada"]) or "<li><span class='muted'>No hay entradas publicadas para este día.</span></li>"
+        main_menu_view = "".join(f"<li>{esc(r['name'])}</li>" for r in menu["fondo"]) or "<li><span class='muted'>No hay platos de fondo publicados para este día.</span></li>" 
         host = self.headers.get("Host", f"localhost:{PORT}")
         scheme = "https" if self.headers.get("X-Forwarded-Proto") == "https" else "http"
 
@@ -866,6 +880,29 @@ class AppHandler(BaseHTTPRequestHandler):
 {notice}
 <div class="grid grid3">
 <div class="stat">Pedidos del día<b>{total_today}</b></div><div class="stat">Empresas activas<b>{company_total}</b></div><div class="stat">Fecha seleccionada<b style="font-size:18px">{esc(selected_date)}</b></div>
+</div>
+
+<div class="card no-print">
+<h2>🔎 Consultar menú de cualquier día</h2>
+<form method="get" action="/admin/dashboard" class="actions" style="align-items:end;gap:12px;flex-wrap:wrap">
+  <div>
+    <label>Selecciona una fecha</label>
+    <input type="date" name="fecha" value="{esc(selected_date)}" required>
+  </div>
+  <input type="hidden" name="empresa" value="{esc(selected_company)}">
+  <button type="submit">Ver menú</button>
+</form>
+<div class="grid grid2" style="margin-top:14px">
+  <div>
+    <h3>Entradas — {esc(selected_date)}</h3>
+    <ul>{entry_menu_view}</ul>
+  </div>
+  <div>
+    <h3>Platos de fondo — {esc(selected_date)}</h3>
+    <ul>{main_menu_view}</ul>
+  </div>
+</div>
+<p class="muted" style="margin-bottom:0">Al cambiar la fecha y pulsar <b>Ver menú</b>, se carga directamente el menú guardado para ese día desde la base de datos.</p>
 </div>
 
 <div class="card no-print">

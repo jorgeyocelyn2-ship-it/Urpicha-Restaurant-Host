@@ -9,3 +9,10 @@ Correcciones:
 - Redirige al mismo día y vuelve a leer el menú desde la base de datos.
 - Muestra cuántas entradas y fondos quedaron guardados.
 - Corrige el error de regex que impedía normalizar espacios correctamente.
+
+
+## v20.5
+- Selector de fecha para empleados en todos los enlaces de empresa.
+- El pedido se guarda para la fecha seleccionada.
+- Visor administrativo del menú por cualquier fecha.
+- El editor y visor usan la misma fecha consultada desde SQLite.
