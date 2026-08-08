@@ -6,6 +6,7 @@ No requiere librerías externas: usa solo Python + SQLite.
 from __future__ import annotations
 
 import csv
+from collections import Counter
 import hashlib
 import hmac
 import html
@@ -25,6 +26,11 @@ from http import cookies
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, quote, urlencode, urlparse
+from email.parser import BytesParser
+from email.policy import default as email_default_policy
+from openpyxl import Workbook, load_workbook
+from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
+from openpyxl.utils import get_column_letter
 
 BASE_DIR = Path(__file__).resolve().parent
 DATA_DIR = Path(os.environ.get("DATA_DIR", str(BASE_DIR / "datos"))).expanduser().resolve()
@@ -268,6 +274,212 @@ def valid_session(value: str | None) -> bool:
         return hmac.compare_digest(sig, expected)
     except (ValueError, TypeError):
         return False
+
+
+
+def normalize_report_header(value: object) -> str:
+    text = unicodedata.normalize("NFKD", str(value or "")).encode("ascii", "ignore").decode("ascii")
+    return re.sub(r"[^a-z0-9]+", " ", text.lower()).strip()
+
+
+def read_multipart_file(handler: BaseHTTPRequestHandler, field_name: str, max_bytes: int = 20_000_000):
+    """Lee un único archivo de un formulario multipart sin depender del módulo cgi."""
+    try:
+        length = int(handler.headers.get("Content-Length", "0"))
+    except ValueError:
+        length = 0
+    if length <= 0 or length > max_bytes:
+        raise ValueError("El archivo está vacío o supera el límite de 20 MB.")
+    raw = handler.rfile.read(length)
+    content_type = handler.headers.get("Content-Type", "")
+    if "multipart/form-data" not in content_type:
+        raise ValueError("El formulario de archivo no es multipart/form-data.")
+    mime = b"Content-Type: " + content_type.encode("utf-8") + b"\r\nMIME-Version: 1.0\r\n\r\n" + raw
+    message = BytesParser(policy=email_default_policy).parsebytes(mime)
+    for part in message.iter_parts():
+        if part.get_content_disposition() == "form-data" and part.get_param("name", header="content-disposition") == field_name:
+            filename = part.get_filename() or "historico.xlsx"
+            return filename, part.get_payload(decode=True) or b""
+    raise ValueError("No se encontró el archivo Excel.")
+
+
+def extract_historical_orders(workbook):
+    """Extrae filas de un Excel anterior usando encabezados flexibles."""
+    aliases = {
+        "fecha": {"fecha", "date", "dia", "fecha pedido"},
+        "empresa": {"empresa", "company", "compania"},
+        "nombre": {"empleado", "nombre", "nombre y apellido", "persona", "trabajador"},
+        "area": {"area", "area o sede", "sede"},
+        "entrada": {"entrada", "plato de entrada"},
+        "fondo": {"plato de fondo", "fondo", "segundo", "plato fondo", "main"},
+        "observacion": {"observacion", "observaciones", "sugerencias", "notas"},
+    }
+    records = []
+    for sheet in workbook.worksheets:
+        rows = list(sheet.iter_rows(values_only=True))
+        if not rows:
+            continue
+        header_idx = None
+        mapping = {}
+        for i, raw_header in enumerate(rows[:10]):
+            normalized = [normalize_report_header(v) for v in raw_header]
+            candidate = {}
+            for idx, h in enumerate(normalized):
+                for field, names in aliases.items():
+                    if h in names and field not in candidate:
+                        candidate[field] = idx
+            if "nombre" in candidate and ("fecha" in candidate or "entrada" in candidate):
+                header_idx = i
+                mapping = candidate
+                break
+        if header_idx is None:
+            continue
+
+        for raw in rows[header_idx + 1:]:
+            def val(field):
+                idx = mapping.get(field)
+                return raw[idx] if idx is not None and idx < len(raw) else ""
+
+            name = re.sub(r"\s+", " ", str(val("nombre") or "")).strip()
+            entry = re.sub(r"\s+", " ", str(val("entrada") or "")).strip()
+            fondo = re.sub(r"\s+", " ", str(val("fondo") or "")).strip()
+            if not name and not entry and not fondo:
+                continue
+
+            raw_date = val("fecha")
+            if isinstance(raw_date, datetime):
+                order_date = raw_date.strftime("%Y-%m-%d")
+            elif isinstance(raw_date, date):
+                order_date = raw_date.isoformat()
+            else:
+                parsed = None
+                raw_text = re.sub(r"\s+", " ", str(raw_date or "")).strip()
+                for fmt in ("%d/%m/%Y", "%Y-%m-%d", "%d-%m-%Y", "%d/%m/%y"):
+                    try:
+                        parsed = datetime.strptime(raw_text, fmt)
+                        break
+                    except ValueError:
+                        pass
+                order_date = parsed.strftime("%Y-%m-%d") if parsed else raw_text
+
+            records.append({
+                "fecha": order_date,
+                "empresa": re.sub(r"\s+", " ", str(val("empresa") or "")).strip(),
+                "nombre": name,
+                "area": re.sub(r"\s+", " ", str(val("area") or "")).strip(),
+                "entrada": entry,
+                "fondo": fondo,
+                "observacion": re.sub(r"\s+", " ", str(val("observacion") or "")).strip(),
+            })
+    return records
+
+
+def build_historical_report(workbook, historical_records, current_records):
+    """Añade al Excel un detalle unificado y reportes por persona y por día."""
+    all_records = []
+    seen = set()
+
+    for record in historical_records + current_records:
+        key = (
+            normalize_key(record.get("fecha", "")),
+            normalize_key(record.get("empresa", "")),
+            normalize_key(record.get("nombre", "")),
+            normalize_key(record.get("entrada", "")),
+            normalize_key(record.get("fondo", "")),
+        )
+        if not key[0] or not key[2]:
+            continue
+        if key in seen:
+            continue
+        seen.add(key)
+        all_records.append(record)
+
+    all_records.sort(key=lambda r: (r.get("fecha", ""), r.get("empresa", ""), normalize_key(r.get("nombre", ""))))
+
+    # Reemplaza las hojas de reporte para que la actualización sea idempotente.
+    for name in ("REPORTE PEDIDOS", "DETALLE UNIFICADO"):
+        if name in workbook.sheetnames:
+            del workbook[name]
+
+    detail = workbook.create_sheet("DETALLE UNIFICADO")
+    headers = ["Fecha", "Empresa", "Persona", "Área", "Entrada", "Plato de fondo", "Observación", "N° Almuerzo"]
+    detail.append(headers)
+
+    person_counts = {}
+    for record in all_records:
+        person_key = (normalize_key(record["empresa"]), normalize_key(record["nombre"]))
+        person_counts[person_key] = person_counts.get(person_key, 0) + 1
+
+    running = {}
+    for record in all_records:
+        person_key = (normalize_key(record["empresa"]), normalize_key(record["nombre"]))
+        running[person_key] = running.get(person_key, 0) + 1
+        detail.append([
+            record["fecha"], record["empresa"], record["nombre"], record["area"],
+            record["entrada"], record["fondo"], record["observacion"], running[person_key]
+        ])
+
+    report = workbook.create_sheet("REPORTE PEDIDOS")
+    report.append(["REPORTE HISTÓRICO DE ALMUERZOS"])
+    report.append([f"Generado: {local_now().strftime('%d/%m/%Y %H:%M')}"])
+    report.append([f"Total de registros: {len(all_records)}"])
+    report.append([])
+    report.append(["RESUMEN POR PERSONA"])
+    report.append(["Empresa", "Persona", "Total almuerzos", "Último pedido"])
+
+    by_person = {}
+    for record in all_records:
+        key = (record["empresa"], record["nombre"])
+        item = by_person.setdefault(key, {"total": 0, "last": "", "entries": Counter(), "mains": Counter()})
+        item["total"] += 1
+        item["last"] = max(item["last"], record["fecha"])
+        if record["entrada"]:
+            item["entries"][record["entrada"]] += 1
+        if record["fondo"]:
+            item["mains"][record["fondo"]] += 1
+
+    for (empresa, nombre), item in sorted(by_person.items(), key=lambda x: (normalize_key(x[0][0]), normalize_key(x[0][1]))):
+        report.append([empresa, nombre, item["total"], item["last"]])
+
+    report.append([])
+    report.append(["RESUMEN POR DÍA"])
+    report.append(["Fecha", "Empresa", "Pedidos"])
+    by_day = Counter((r["fecha"], r["empresa"]) for r in all_records)
+    for (fecha, empresa), total in sorted(by_day.items()):
+        report.append([fecha, empresa, total])
+
+    report.append([])
+    report.append(["PLATOS MÁS PEDIDOS"])
+    report.append(["Tipo", "Plato", "Cantidad"])
+    dish_counts = Counter()
+    for record in all_records:
+        if record["entrada"]:
+            dish_counts[("Entrada", record["entrada"])] += 1
+        if record["fondo"]:
+            dish_counts[("Plato de fondo", record["fondo"])] += 1
+    for (kind, dish), total in dish_counts.most_common():
+        report.append([kind, dish, total])
+
+    # Formato
+    header_fill = PatternFill("solid", fgColor="176B43")
+    header_font = Font(color="FFFFFF", bold=True)
+    thin = Side(style="thin", color="D0D5DD")
+    for sheet in (detail, report):
+        for row in sheet.iter_rows():
+            for cell in row:
+                cell.alignment = Alignment(vertical="top", wrap_text=True)
+                cell.border = Border(bottom=thin)
+        for cell in sheet[1]:
+            cell.fill = header_fill
+            cell.font = header_font
+        sheet.freeze_panes = "A2"
+
+    for idx, width in enumerate([14, 18, 28, 18, 32, 36, 30, 14], 1):
+        detail.column_dimensions[get_column_letter(idx)].width = width
+    for idx, width in enumerate([20, 30, 18, 18], 1):
+        report.column_dimensions[get_column_letter(idx)].width = width
+
+    return len(all_records), len(by_person)
 
 
 class AppHandler(BaseHTTPRequestHandler):
@@ -646,6 +858,8 @@ class AppHandler(BaseHTTPRequestHandler):
 <div class="table-wrap"><table><thead><tr><th>Empresa</th><th>Enlace para empleados</th><th>Estado</th><th></th></tr></thead><tbody>{company_rows}</tbody></table></div>
 </div>
 
+
+
 <div class="card">
 <h2>Pedidos y resumen</h2>
 <form method="get" action="/admin/dashboard" class="grid grid3 no-print">
@@ -654,6 +868,16 @@ class AppHandler(BaseHTTPRequestHandler):
 <div class="grid grid2"><div><h3>Entradas</h3><ul>{entry_rows}</ul></div><div><h3>Fondos</h3><ul>{main_rows}</ul></div></div>
 <div class="actions no-print" style="margin-bottom:14px"><a class="btn secondary" href="/admin/export.csv?{export_params}">Descargar CSV/Excel</a><a class="btn" target="_blank" href="/admin/cupones?{export_params}">Generar cupones</a></div>
 <div class="table-wrap"><table><thead><tr><th>Empresa</th><th>Empleado</th><th>Área</th><th>Entrada</th><th>Fondo</th><th>Modalidad</th><th>Observación</th><th>Hora</th><th></th></tr></thead><tbody>{order_rows}</tbody></table></div>
+</div>
+
+<div class="card no-print">
+<h2>Reporte histórico y actualización de Excel</h2>
+<p class="muted">Sube un Excel antiguo de pedidos. El sistema conservará su información, agregará los pedidos registrados actualmente y generará un reporte de los días anteriores, acumulado por persona, empresa, día y plato.</p>
+<form method="post" action="/admin/historico-excel" enctype="multipart/form-data" class="actions">
+  <input type="file" name="excel_historico" accept=".xlsx,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" required style="max-width:430px">
+  <button type="submit">Actualizar Excel y generar reporte</button>
+</form>
+<p class="muted" style="margin-bottom:0">El archivo resultante incluirá las hojas <b>DETALLE UNIFICADO</b> y <b>REPORTE PEDIDOS</b>, con el N° de almuerzo acumulado por persona.</p>
 </div>
 </main>"""
         self.send_html(page("Panel administrador", body))
@@ -762,6 +986,47 @@ class AppHandler(BaseHTTPRequestHandler):
                 conn.execute("UPDATE companies SET active=CASE active WHEN 1 THEN 0 ELSE 1 END WHERE id=?", (int(form["id"]),))
         self.redirect("/admin/dashboard?ok=1")
 
+    def update_historical_excel(self) -> None:
+        try:
+            filename, data = read_multipart_file(self, "excel_historico")
+            if not filename.lower().endswith(".xlsx"):
+                raise ValueError("Solo se aceptan archivos .xlsx.")
+            workbook = load_workbook(io.BytesIO(data))
+            historical = extract_historical_orders(workbook)
+
+            with db() as conn:
+                current_rows = conn.execute(
+                    """SELECT o.order_date, c.name AS company_name, o.employee_name, o.area,
+                              o.entry_item, o.main_item, o.notes
+                       FROM orders o JOIN companies c ON c.id=o.company_id
+                       ORDER BY o.order_date, c.name, o.employee_name"""
+                ).fetchall()
+
+            current = [{
+                "fecha": r["order_date"],
+                "empresa": r["company_name"],
+                "nombre": r["employee_name"],
+                "area": r["area"],
+                "entrada": r["entry_item"],
+                "fondo": r["main_item"],
+                "observacion": r["notes"],
+            } for r in current_rows]
+
+            total, people = build_historical_report(workbook, historical, current)
+            output = io.BytesIO()
+            workbook.save(output)
+            output.seek(0)
+
+            safe_name = re.sub(r"[^A-Za-z0-9._-]+", "_", Path(filename).stem) or "pedidos_historico"
+            download_name = f"{safe_name}_reporte_actualizado.xlsx"
+            self.send_bytes(output.getvalue(),
+                            "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                            download_name)
+        except Exception as error:
+            print(f"Error al actualizar Excel histórico: {error}", file=sys.stderr)
+            message = esc(str(error))
+            self.send_html(page("Error de Excel", f'<main class="wrap narrow"><div class="card"><h1>No se pudo actualizar el Excel</h1><p>{message}</p><a class="btn" href="/admin/dashboard">Volver al panel</a></div></main>'), 400)
+
     def delete_order(self) -> None:
         form = self.read_form()
         if form.get("id", "").isdigit():
@@ -818,7 +1083,7 @@ class AppHandler(BaseHTTPRequestHandler):
         for idx, r in enumerate(rows, start=1):
             ticket_cards.append(
                 f"""<section class="ticket">
-<div class="ticket-top"><div class="ticket-number">TICKET {idx:03d}</div></div>
+<div class="ticket-top"><div class="ticket-number">TICKET {idx:03d}</div><div class="ticket-company">{esc((r['company_name'] or '').upper())}</div></div>
 <div class="ticket-head">
   <div class="ticket-area">{esc((r['area'] or 'Sin área').upper())}</div>
   <div class="ticket-person">{esc((r['employee_name'] or '').upper())}</div>
@@ -841,11 +1106,12 @@ class AppHandler(BaseHTTPRequestHandler):
 .coupon-card{background:#fff;border:1px solid var(--line);border-radius:14px;padding:16px;box-shadow:0 2px 10px rgba(16,24,40,.04)}
 .ticket-page{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));grid-template-rows:repeat(4,1fr);gap:0;margin:12px auto 24px;max-width:190mm;min-height:273mm;background:#fff;border:1px solid #222}
 .ticket{margin:0!important;border:1px solid #222!important;padding:4.5mm 4.5mm 4mm!important;min-width:0;min-height:0;display:flex;flex-direction:column;justify-content:flex-start;text-align:left;overflow:hidden;background:#fff}
-.ticket-top{display:flex;justify-content:flex-start;align-items:flex-start;min-height:16px}
-.ticket-number{font-size:10px;font-weight:900;letter-spacing:.3px}
-.ticket-head{text-align:center;margin-top:0;margin-bottom:10px}
-.ticket-area{font-size:19px;line-height:1.02;font-weight:1000;white-space:normal;overflow-wrap:anywhere}
-.ticket-person{font-size:19px;line-height:1.02;font-weight:1000;white-space:normal;overflow-wrap:anywhere;margin-top:1px}
+.ticket-top{display:flex;justify-content:space-between;align-items:flex-start;min-height:16px}
+.ticket-number{font-size:9px;font-weight:900;letter-spacing:.3px}
+.ticket-company{font-size:8px;line-height:1;font-weight:900;letter-spacing:.5px;border:1px solid #222;padding:1px 3px;white-space:nowrap}
+.ticket-head{text-align:center;margin-top:0;margin-bottom:8px}
+.ticket-area{font-size:14px;line-height:1.02;font-weight:800;white-space:normal;overflow-wrap:anywhere}
+.ticket-person{font-size:14px;line-height:1.02;font-weight:800;white-space:normal;overflow-wrap:anywhere;margin-top:1px}
 .dish-entry,.dish-main{font-weight:1000;text-align:center;overflow-wrap:anywhere;word-break:normal;margin:0 auto}
 .dish-entry{margin-top:4px;margin-bottom:22px}
 .dish-main{margin-bottom:22px}

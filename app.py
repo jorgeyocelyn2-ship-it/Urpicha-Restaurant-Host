@@ -1048,10 +1048,16 @@ def create_pdf(sistema):
                 pdf.setFont("Helvetica", 8)
                 pdf.drawString(text_x + 22 * mm, text_y, f"N° {num}")
 
-        # Identificador de empresa en la esquina superior derecha de cada cupón.
+        # Identificador de empresa: pequeño, visible y siempre en la esquina superior derecha.
         company_label = "TALMA" if sistema == "talma" else "POLICÍA"
+        label_w = 16 * mm
+        label_h = 4.5 * mm
+        label_x = x + coupon_width - pad - label_w
+        label_y = top - label_h - 2.5 * mm
+        pdf.setLineWidth(0.5)
+        pdf.rect(label_x, label_y, label_w, label_h)
         pdf.setFont("Helvetica-Bold", 7)
-        pdf.drawRightString(x + coupon_width - pad, top - 4.5 * mm, company_label)
+        pdf.drawCentredString(label_x + label_w / 2, label_y + 1.35 * mm, company_label)
 
         pdf.setFont("Helvetica-Bold", header_size)
         pdf.drawCentredString(x + coupon_width / 2, text_y, header)
@@ -1451,7 +1457,7 @@ def update_excel(sistema):
 def diagnostic():
     exe = find_tesseract()
     return jsonify({
-        "version": "19.5-cupones-excel-acumulado",
+        "version": "19.6-reporte-historico-empresa-cuponera",
         "sistemas": list(SISTEMAS.keys()),
         "tesseract_encontrado": bool(exe),
         "ruta": exe,
