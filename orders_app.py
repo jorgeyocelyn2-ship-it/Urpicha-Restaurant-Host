@@ -394,7 +394,10 @@ def build_historical_report(workbook, historical_records, current_records):
         seen.add(key)
         all_records.append(record)
 
-    all_records.sort(key=lambda r: (r.get("fecha", ""), r.get("empresa", ""), normalize_key(r.get("nombre", ""))))
+    # El detalle queda ordenado alfabéticamente por persona para identificarla rápidamente.
+    # Dentro de cada persona, sus almuerzos se ordenan por fecha y empresa para que
+    # el N° Almuerzo siga una secuencia lógica.
+    all_records.sort(key=lambda r: (normalize_key(r.get("nombre", "")), normalize_key(r.get("empresa", "")), r.get("fecha", "")))
 
     # Reemplaza las hojas de reporte para que la actualización sea idempotente.
     for name in ("REPORTE PEDIDOS", "DETALLE UNIFICADO"):
@@ -473,6 +476,11 @@ def build_historical_report(workbook, historical_records, current_records):
             cell.fill = header_fill
             cell.font = header_font
         sheet.freeze_panes = "A2"
+    if detail.max_row > 1:
+        detail.auto_filter.ref = detail.dimensions
+    if report.max_row > 1:
+        # El resumen por persona también queda alfabético.
+        report.auto_filter.ref = f"A6:D{5 + len(by_person) + 1}" if by_person else "A6:D6"
 
     for idx, width in enumerate([14, 18, 28, 18, 32, 36, 30, 14], 1):
         detail.column_dimensions[get_column_letter(idx)].width = width
@@ -595,6 +603,9 @@ class AppHandler(BaseHTTPRequestHandler):
         elif path == "/admin/pedido/eliminar":
             if self.require_admin():
                 self.delete_order()
+        elif path == "/admin/historico-excel":
+            if self.require_admin():
+                self.update_historical_excel()
         elif path.startswith("/pedido/"):
             self.submit_order(path.split("/", 2)[2])
         else:
@@ -792,7 +803,7 @@ class AppHandler(BaseHTTPRequestHandler):
             orders = conn.execute(
                 f"""SELECT o.*, c.name AS company_name FROM orders o
                     JOIN companies c ON c.id=o.company_id
-                    WHERE {' AND '.join(filters)} ORDER BY c.name, o.created_at""",
+                    WHERE {' AND '.join(filters)} ORDER BY o.employee_name COLLATE NOCASE, c.name COLLATE NOCASE, o.created_at""",
                 args,
             ).fetchall()
             total_today = conn.execute("SELECT COUNT(*) FROM orders WHERE order_date=?", (selected_date,)).fetchone()[0]
@@ -870,14 +881,28 @@ class AppHandler(BaseHTTPRequestHandler):
 <div class="table-wrap"><table><thead><tr><th>Empresa</th><th>Empleado</th><th>Área</th><th>Entrada</th><th>Fondo</th><th>Modalidad</th><th>Observación</th><th>Hora</th><th></th></tr></thead><tbody>{order_rows}</tbody></table></div>
 </div>
 
-<div class="card no-print">
-<h2>Reporte histórico y actualización de Excel</h2>
-<p class="muted">Sube un Excel antiguo de pedidos. El sistema conservará su información, agregará los pedidos registrados actualmente y generará un reporte de los días anteriores, acumulado por persona, empresa, día y plato.</p>
-<form method="post" action="/admin/historico-excel" enctype="multipart/form-data" class="actions">
-  <input type="file" name="excel_historico" accept=".xlsx,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" required style="max-width:430px">
-  <button type="submit">Actualizar Excel y generar reporte</button>
-</form>
-<p class="muted" style="margin-bottom:0">El archivo resultante incluirá las hojas <b>DETALLE UNIFICADO</b> y <b>REPORTE PEDIDOS</b>, con el N° de almuerzo acumulado por persona.</p>
+<div class="card no-print" id="excel-historico">
+<h2>📊 Actualizar un Excel pasado / reporte histórico</h2>
+<p class="muted">Esta opción está dentro del panel de <b>Pedidos</b>. Sube aquí un Excel de días o meses anteriores y el sistema lo combinará con los pedidos que ya están registrados actualmente.</p>
+<div class="grid grid2">
+  <div>
+    <h3>1. Seleccionar Excel antiguo</h3>
+    <form method="post" action="/admin/historico-excel" enctype="multipart/form-data">
+      <input type="file" name="excel_historico" accept=".xlsx,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" required style="width:100%;box-sizing:border-box;margin-bottom:10px">
+      <button type="submit">Actualizar Excel y generar reporte</button>
+    </form>
+  </div>
+  <div>
+    <h3>2. ¿Qué genera?</h3>
+    <ul>
+      <li><b>DETALLE UNIFICADO:</b> todos los pedidos antiguos + actuales.</li>
+      <li><b>Orden alfabético:</b> las personas aparecen de A a Z.</li>
+      <li><b>N° Almuerzo:</b> se acumula por persona.</li>
+      <li><b>REPORTE PEDIDOS:</b> totales por persona, día y plato.</li>
+    </ul>
+  </div>
+</div>
+<p class="muted" style="margin-bottom:0"><b>Importante:</b> el archivo original no se modifica. Se descarga una copia nueva con el reporte actualizado.</p>
 </div>
 </main>"""
         self.send_html(page("Panel administrador", body))
@@ -1045,7 +1070,7 @@ class AppHandler(BaseHTTPRequestHandler):
         with db() as conn:
             rows = conn.execute(
                 f"""SELECT o.*, c.name company_name FROM orders o JOIN companies c ON c.id=o.company_id
-                    WHERE {' AND '.join(filters)} ORDER BY c.name, o.employee_name""",
+                    WHERE {' AND '.join(filters)} ORDER BY o.employee_name COLLATE NOCASE, c.name COLLATE NOCASE, o.created_at""",
                 args,
             ).fetchall()
         return selected_date, rows

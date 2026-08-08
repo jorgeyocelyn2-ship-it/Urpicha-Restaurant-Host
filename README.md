@@ -34,3 +34,5 @@ El sistema sigue usando `DATA_DIR` para la base SQLite de pedidos. Además crea:
 - `DATA_DIR/scanners/outputs/`
 
 Así los datos del scanner pueden vivir en el mismo disco persistente de Render.
+
+Versión: 19.7 - actualización de Excel histórico desde Panel Pedidos + orden alfabético por persona
