@@ -53,8 +53,8 @@ SISTEMAS = {
         "default_entry": 0.455,
         "default_second": 0.545,
         "default_observation": 0.685,
-        "excel_headers": ["Registro", "Fecha", "Sede", "Código", "Nombre", "Área", "Entrada", "Segundo", "Observación"],
-        "excel_widths": [24, 15, 12, 14, 30, 12, 28, 34, 50],
+        "excel_headers": ["Registro", "Fecha", "Sede", "Código", "Nombre", "N° Almuerzo", "Área", "Entrada", "Segundo", "Observación"],
+        "excel_widths": [24, 15, 12, 14, 30, 14, 12, 28, 34, 50],
         "pdf_prefix": "talma",
         "header_label": None,  # usa área
     },
@@ -72,8 +72,8 @@ SISTEMAS = {
         "default_entry": 0.330,
         "default_second": 0.566,
         "default_observation": 0.798,
-        "excel_headers": ["N°", "Nombre y apellido", "Entrada", "Plato de fondo", "Sugerencias"],
-        "excel_widths": [8, 42, 28, 34, 28],
+        "excel_headers": ["N°", "Nombre y apellido", "N° Almuerzo", "Entrada", "Plato de fondo", "Sugerencias"],
+        "excel_widths": [8, 42, 14, 28, 34, 28],
         "pdf_prefix": "policia",
         "header_label": "POLICÍA",
     },
@@ -1019,35 +1019,39 @@ def create_pdf(sistema):
         if sistema == "talma":
             header = pdf_text(row.get("area", "") or "SIN ÁREA").upper()
             fecha = pdf_text(row.get("fecha", ""))
-            header_size = 18
-            name_max_size = 16
-            name_min_size = 9
-            content_top = top - 22 * mm
-            first_box_height = 13 * mm
-            second_box_top = content_top - 16 * mm
-            second_box_height = 13 * mm
-            menu_max_size = 27
-            menu_min_size = 15
-            observation_label_y = content_top - 35 * mm
+            header_size = 12
+            name_max_size = 12
+            name_min_size = 8
+            content_top = top - 19 * mm
+            first_box_height = 16 * mm
+            second_box_top = content_top - 19 * mm
+            second_box_height = 16 * mm
+            menu_max_size = 35
+            menu_min_size = 17
+            observation_label_y = content_top - 39 * mm
         else:
             header = "POLICÍA"
             fecha = ""
-            header_size = 20
-            name_max_size = 18
-            name_min_size = 10
-            # En POLICÍA se usa una cuponera más parecida a TALMA,
-            # destacando el área (POLICÍA), el nombre y aún más la entrada / plato de fondo.
-            content_top = top - 24 * mm
-            first_box_height = 15 * mm
-            second_box_top = content_top - 18 * mm
-            second_box_height = 15 * mm
-            menu_max_size = 31
-            menu_min_size = 16
-            observation_label_y = content_top - 41 * mm
+            header_size = 12
+            name_max_size = 13
+            name_min_size = 8
+            # POLICÍA: empresa en esquina; nombre/área más discretos y platos mucho más grandes.
+            content_top = top - 19 * mm
+            first_box_height = 17 * mm
+            second_box_top = content_top - 20 * mm
+            second_box_height = 17 * mm
+            menu_max_size = 39
+            menu_min_size = 18
+            observation_label_y = content_top - 42 * mm
             num = clean_text(row.get("numero", ""))
             if num:
                 pdf.setFont("Helvetica", 8)
                 pdf.drawString(text_x + 22 * mm, text_y, f"N° {num}")
+
+        # Identificador de empresa en la esquina superior derecha de cada cupón.
+        company_label = "TALMA" if sistema == "talma" else "POLICÍA"
+        pdf.setFont("Helvetica-Bold", 7)
+        pdf.drawRightString(x + coupon_width - pad, top - 4.5 * mm, company_label)
 
         pdf.setFont("Helvetica-Bold", header_size)
         pdf.drawCentredString(x + coupon_width / 2, text_y, header)
@@ -1204,6 +1208,16 @@ def style_orders_sheet(sheet, widths):
 
 
 def remove_previous_summary(sheet):
+    # Elimina resúmenes anteriores para que la actualización mensual no duplique totales.
+    start = None
+    for idx, row in enumerate(sheet.iter_rows(min_row=1, values_only=True), start=1):
+        text = " ".join(clean_text(str(v or "")) for v in row).upper()
+        if "RESUMEN DE ALMUERZOS POR PERSONA" in text:
+            start = idx
+            break
+    if start is not None:
+        sheet.delete_rows(start, sheet.max_row - start + 1)
+
     rows_to_delete = []
     for idx, row in enumerate(sheet.iter_rows(min_row=1, values_only=True), start=1):
         text = " ".join(clean_text(str(v or "")) for v in row).upper()
@@ -1224,9 +1238,82 @@ def append_summary(sheet, added_count, accumulated_total, cols_count, period_lab
             cell.font = Font(bold=True)
 
 
+def person_key(value):
+    return clean_text(str(value or ""), preserve_accents=True).casefold()
+
+
 def append_orders(sheet, rows, cols, preserve_accents=False):
+    """Agrega pedidos y deja un número de almuerzo acumulativo por persona."""
+    # Buscar el nombre dentro de las columnas del sistema.
+    name_index = cols.index("nombre") if "nombre" in cols else None
+    existing_counts = Counter()
+    if name_index is not None:
+        for values in sheet.iter_rows(min_row=2, values_only=True):
+            if not values or name_index >= len(values):
+                continue
+            key = person_key(values[name_index])
+            if key:
+                existing_counts[key] += 1
+
     for row in rows:
-        sheet.append([clean_text(row.get(column, ""), preserve_accents=preserve_accents) for column in cols])
+        values = [clean_text(row.get(column, ""), preserve_accents=preserve_accents) for column in cols]
+        if name_index is not None:
+            key = person_key(row.get("nombre", ""))
+            existing_counts[key] += 1
+            values.insert(name_index + 1, existing_counts[key])
+        sheet.append(values)
+
+
+def recompute_lunch_numbers(sheet, headers):
+    """Recalcula N° de almuerzo por persona en el orden en que aparecen los pedidos."""
+    if "N° Almuerzo" not in headers:
+        return
+    name_col = headers.index("Nombre") + 1 if "Nombre" in headers else (
+        headers.index("Nombre y apellido") + 1 if "Nombre y apellido" in headers else None
+    )
+    num_col = headers.index("N° Almuerzo") + 1
+    if not name_col:
+        return
+    counts = Counter()
+    for row_idx in range(2, sheet.max_row + 1):
+        name = sheet.cell(row=row_idx, column=name_col).value
+        key = person_key(name)
+        if not key:
+            continue
+        counts[key] += 1
+        sheet.cell(row=row_idx, column=num_col).value = counts[key]
+
+
+def append_person_summary(sheet, headers):
+    """Añade al final de la hoja el total acumulado de almuerzos por persona."""
+    name_col = headers.index("Nombre") + 1 if "Nombre" in headers else (
+        headers.index("Nombre y apellido") + 1 if "Nombre y apellido" in headers else None
+    )
+    if not name_col:
+        return
+    counts = Counter()
+    labels = {}
+    for row_idx in range(2, sheet.max_row + 1):
+        value = clean_text_unicode(str(sheet.cell(row=row_idx, column=name_col).value or "")).strip()
+        if not value:
+            continue
+        key = value.casefold()
+        counts[key] += 1
+        labels.setdefault(key, value)
+
+    sheet.append([])
+    sheet.append(["RESUMEN DE ALMUERZOS POR PERSONA"])
+    sheet.append(["PERSONA", "TOTAL ALMUERZOS"])
+    for key, total in sorted(counts.items(), key=lambda item: (-item[1], labels[item[0]].casefold())):
+        sheet.append([labels[key], total])
+
+    title_row = sheet.max_row - len(counts) - 1
+    for cell in sheet[title_row]:
+        cell.font = Font(bold=True, size=12)
+    for cell in sheet[title_row + 1]:
+        cell.font = Font(bold=True, color="FFFFFF")
+        cell.fill = PatternFill("solid", fgColor="176B43")
+        cell.alignment = Alignment(horizontal="center")
 
 
 def count_order_rows(sheet, headers):
@@ -1245,28 +1332,36 @@ def count_order_rows(sheet, headers):
 
 
 def prepare_orders_sheet(workbook, headers, preserve_accents=False):
-    # Preferir hoja llamada Pedidos; consolidar si hay varias
+    # Preferir hoja llamada Pedidos; consolidar si hay varias.
     candidates = [s for s in workbook.worksheets if s.title.lower().startswith("pedido")]
     if not candidates:
-        if workbook.worksheets:
-            sheet = workbook.worksheets[0]
-        else:
-            sheet = workbook.create_sheet("Pedidos")
+        sheet = workbook.worksheets[0] if workbook.worksheets else workbook.create_sheet("Pedidos")
+        sheet.title = "Pedidos"
         if sheet.max_row < 1 or not is_orders_sheet(sheet, headers):
-            sheet.title = "Pedidos"
-            if sheet.max_row >= 1:
-                # reiniciar
-                for _ in range(sheet.max_row):
-                    sheet.delete_rows(1)
+            for _ in range(sheet.max_row):
+                sheet.delete_rows(1)
             sheet.append(headers)
         return sheet
 
     main = candidates[0]
     main.title = "Pedidos"
-    if main.max_row < 1 or not is_orders_sheet(main, headers):
-        for _ in range(main.max_row):
-            main.delete_rows(1)
-        main.append(headers)
+    current = normalized_excel_header([cell.value for cell in next(main.iter_rows(min_row=1, max_row=1))]) if main.max_row else []
+    expected = normalized_excel_header(headers)
+
+    if current != expected:
+        # Migración compatible de Excel mensual anterior: conserva pedidos y agrega N° Almuerzo.
+        legacy = headers.copy()
+        if "N° Almuerzo" in legacy:
+            legacy.remove("N° Almuerzo")
+        legacy_expected = normalized_excel_header(legacy)
+        if current[:len(legacy_expected)] == legacy_expected:
+            insert_at = legacy.index("Nombre") + 2 if "Nombre" in legacy else legacy.index("Nombre y apellido") + 2
+            main.insert_cols(insert_at)
+            main.cell(row=1, column=insert_at).value = "N° Almuerzo"
+        else:
+            for _ in range(main.max_row):
+                main.delete_rows(1)
+            main.append(headers)
 
     for extra in candidates[1:]:
         for row in extra.iter_rows(min_row=2, values_only=True):
@@ -1274,7 +1369,7 @@ def prepare_orders_sheet(workbook, headers, preserve_accents=False):
                 continue
             values = [clean_text(str(v or ""), preserve_accents=preserve_accents) for v in row[: len(headers)]]
             text = " ".join(values).upper()
-            if "TOTAL DE PEDIDOS" in text or "PERIODO" in text:
+            if "TOTAL DE PEDIDOS" in text or "PERIODO" in text or "RESUMEN DE ALMUERZOS" in text:
                 continue
             if any(values):
                 main.append(values)
@@ -1295,9 +1390,11 @@ def create_excel(sistema):
     sheet.title = "Pedidos"
     sheet.append(c["excel_headers"])
     append_orders(sheet, rows, c["cols"], preserve_accents=(sistema == "policia"))
+    recompute_lunch_numbers(sheet, c["excel_headers"])
     total = count_order_rows(sheet, c["excel_headers"])
     period = order_date_label(rows, "fecha") if sistema == "talma" else datetime.now().strftime("%d/%m/%Y")
-    append_summary(sheet, added_count=len(rows), accumulated_total=total, cols_count=len(c["cols"]), period_label=period)
+    append_summary(sheet, added_count=len(rows), accumulated_total=total, cols_count=len(c["excel_headers"]), period_label=period)
+    append_person_summary(sheet, c["excel_headers"])
     style_orders_sheet(sheet, c["excel_widths"])
     workbook.save(output)
     return send_file(output, as_attachment=True, download_name=output.name)
@@ -1325,15 +1422,17 @@ def update_excel(sistema):
         sheet = prepare_orders_sheet(workbook, c["excel_headers"], preserve_accents=(sistema == "policia"))
         remove_previous_summary(sheet)
         append_orders(sheet, rows, c["cols"], preserve_accents=(sistema == "policia"))
+        recompute_lunch_numbers(sheet, c["excel_headers"])
         accumulated_total = count_order_rows(sheet, c["excel_headers"])
         period = order_date_label(rows, "fecha") if sistema == "talma" else datetime.now().strftime("%d/%m/%Y")
         append_summary(
             sheet,
             added_count=len(rows),
             accumulated_total=accumulated_total,
-            cols_count=len(c["cols"]),
+            cols_count=len(c["excel_headers"]),
             period_label=period,
         )
+        append_person_summary(sheet, c["excel_headers"])
         style_orders_sheet(sheet, c["excel_widths"])
 
         original_name = clean_text(Path(uploaded.filename).stem) or f"pedidos_{c['pdf_prefix']}"
@@ -1352,7 +1451,7 @@ def update_excel(sistema):
 def diagnostic():
     exe = find_tesseract()
     return jsonify({
-        "version": "19.4-dual-embedded-templates",
+        "version": "19.5-cupones-excel-acumulado",
         "sistemas": list(SISTEMAS.keys()),
         "tesseract_encontrado": bool(exe),
         "ruta": exe,
