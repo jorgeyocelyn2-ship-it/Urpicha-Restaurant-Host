@@ -13,7 +13,7 @@ from openpyxl.utils import get_column_letter
 from collections import Counter
 from http.server import ThreadingHTTPServer
 from urllib.parse import urlsplit
-import subprocess, tempfile, csv, io, json, re, uuid, statistics, shutil, os, traceback, unicodedata, threading, http.client
+import subprocess, tempfile, csv, io, json, re, uuid, statistics, shutil, os, traceback, unicodedata, threading, http.client, time, hmac, hashlib
 
 import orders_app
 from scanner_templates import SCANNER_TEMPLATES, SCANNER_CSS
@@ -28,6 +28,43 @@ app.jinja_loader = ChoiceLoader([
     DictLoader(SCANNER_TEMPLATES),
 ])
 app.secret_key = os.environ.get("SECRET_KEY", "cuponera-v19-dual")
+
+# Configuración compartida del portal TALMA.
+CONFIG = {"secret_key": app.secret_key}
+
+def esc(value):
+    """Escapa valores antes de insertarlos en HTML generado por el portal TALMA."""
+    return str(escape("" if value is None else value))
+
+def page(title: str, body: str) -> str:
+    """Página HTML base usada por el portal privado TALMA."""
+    return f"""<!doctype html>
+<html lang=\"es\">
+<head>
+<meta charset=\"utf-8\">
+<meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">
+<meta name=\"robots\" content=\"noindex,nofollow\">
+<title>{esc(title)} — Urpicha Restaurante</title>
+<style>{SCANNER_CSS}
+.wrap{{max-width:1200px;margin:30px auto;padding:20px}}
+.narrow{{max-width:560px}}
+.card{{background:#fff;padding:24px;border:1px solid #d8dfe6;border-radius:15px;box-shadow:0 5px 18px rgba(0,0,0,.05);margin-bottom:20px}}
+.actions{{display:flex;gap:10px;align-items:center;flex-wrap:wrap}}
+.btn{{display:inline-block;border:0;border-radius:9px;padding:10px 14px;background:#176b43;color:#fff;text-decoration:none;font-weight:700}}
+.btn.secondary{{background:#e7edf1;color:#17212b}}
+.muted{{color:#5f6b76}}
+.notice{{padding:12px 14px;border-radius:8px;background:#e9f6ef;margin:12px 0}}
+.notice.error{{background:#fdecea;color:#8a1c13;border-left:5px solid #b42318}}
+.grid{{display:grid;gap:16px}}
+.grid3{{grid-template-columns:repeat(3,minmax(0,1fr))}}
+.stat{{background:#fff;border:1px solid #d8dfe6;border-radius:14px;padding:18px;font-weight:700}}
+.stat b{{display:block;font-size:28px;margin-top:6px}}
+.table-wrap{{overflow:auto}}
+@media(max-width:800px){{.grid3{{grid-template-columns:1fr}}}}
+</style>
+</head>
+<body>{body}</body>
+</html>"""
 DATA_ROOT = Path(os.environ.get("DATA_DIR", str(ROOT / "datos"))).expanduser().resolve()
 SCANNER_ROOT = DATA_ROOT / "scanners"
 UPLOADS = SCANNER_ROOT / "uploads"
