@@ -1,0 +1,29 @@
+URPICHA v20.1 - FIX REAL
+============================
+
+Correcciones principales:
+1. Se agregó import http.client. Esto corrige el proxy interno Flask -> sistema de pedidos.
+2. Se implementó realmente /talma y /talma/ dentro de app.py; la versión anterior solo tenía archivos sueltos y el catch-all enviaba /talma al servidor de pedidos, que devolvía 404.
+3. /talma usa una contraseña independiente TALMA_PASSWORD.
+4. /talma/excel genera un Excel con todos los pedidos de la empresa Talma desde la base SQLite persistente.
+5. Se agregó TALMA_PASSWORD al render.yaml.
+6. Se mantiene el Persistent Disk en /opt/render/project/src/datos.
+7. Los scanners TALMA y POLICÍA siguen siendo rutas Flask reales:
+   /admin/talma/
+   /admin/policia/
+   /admin/talma/subir
+   /admin/policia/subir
+   y sus rutas de calibración/procesamiento/PDF/Excel.
+8. Se mantiene el loader de plantillas embebidas para evitar TemplateNotFound.
+9. Se mantiene Tesseract + spa en Docker.
+
+Verificación realizada:
+- AST/sintaxis Python de app.py: OK.
+- AST/sintaxis Python de orders_app.py: OK.
+- Dockerfile contiene Tesseract y spa.
+- render.yaml contiene runtime docker y Persistent Disk.
+- Las rutas /talma y /talma/ están definidas antes del catch-all proxy.
+- El proxy usa http.client correctamente.
+- Los templates del scanner y scanner_templates.py están presentes.
+
+No fue posible ejecutar un build Docker real en este entorno porque no hay Docker daemon ni acceso a PyPI. Por eso no se afirma una prueba de producción; el paquete queda corregido y auditado estáticamente para Render.

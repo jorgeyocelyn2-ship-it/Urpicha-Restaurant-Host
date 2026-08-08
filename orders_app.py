@@ -490,55 +490,6 @@ def build_historical_report(workbook, historical_records, current_records):
     return len(all_records), len(by_person)
 
 
-
-def sync_talma_excel():
-    """Genera/actualiza un Excel persistente con TODOS los pedidos TALMA.
-    La base SQLite es la fuente de verdad; el XLSX es una copia/reporte.
-    """
-    try:
-        output_dir = DATA_DIR / "talma"
-        output_dir.mkdir(parents=True, exist_ok=True)
-        output = output_dir / "pedidos_talma.xlsx"
-        with db() as conn:
-            rows = conn.execute(
-                """SELECT o.id,o.order_date,o.employee_name,o.area,o.entry_item,o.main_item,
-                          o.notes,o.delivery_type,o.created_at
-                   FROM orders o JOIN companies c ON c.id=o.company_id
-                   WHERE c.slug='talma'
-                   ORDER BY lower(o.employee_name),o.order_date,o.id"""
-            ).fetchall()
-        wb=Workbook()
-        ws=wb.active; ws.title="Pedidos TALMA"
-        headers=["ID","Fecha","Nombre","N° Almuerzo","Área","Entrada","Segundo","Observación","Modalidad","Hora"]
-        ws.append(headers)
-        counts=Counter()
-        for r in rows:
-            k=normalize_key(r["employee_name"]); counts[k]+=1
-            ws.append([r["id"],r["order_date"],r["employee_name"],counts[k],r["area"],
-                       r["entry_item"],r["main_item"],r["notes"],r["delivery_type"],r["created_at"]])
-        for i,w in enumerate([10,14,32,14,14,28,34,34,18,18],1):
-            ws.column_dimensions[get_column_letter(i)].width=w
-        fill=PatternFill("solid",fgColor="176B43")
-        for c in ws[1]:
-            c.fill=fill;c.font=Font(color="FFFFFF",bold=True);c.alignment=Alignment(horizontal="center")
-        for row in ws.iter_rows(): 
-            for c in row: c.alignment=Alignment(vertical="center",wrap_text=True)
-        ws.freeze_panes="A2"
-        rs=wb.create_sheet("Resumen")
-        rs.append(["PERSONA","TOTAL ALMUERZOS"])
-        totals=Counter(); labels={}
-        for r in rows:
-            k=normalize_key(r["employee_name"]); totals[k]+=1; labels.setdefault(k,r["employee_name"])
-        for k in sorted(totals):
-            rs.append([labels[k],totals[k]])
-        for c in rs[1]:
-            c.fill=fill;c.font=Font(color="FFFFFF",bold=True)
-        rs.column_dimensions["A"].width=35; rs.column_dimensions["B"].width=20
-        wb.save(output)
-    except Exception:
-        # Nunca impedir que se registre un pedido si falla la copia XLSX.
-        pass
-
 class AppHandler(BaseHTTPRequestHandler):
     server_version = "Almuerzos/1.0"
 

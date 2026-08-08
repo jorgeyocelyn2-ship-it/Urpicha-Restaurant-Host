@@ -1,4 +1,4 @@
-from flask import Flask, render_template, request, send_file, jsonify, redirect, url_for, Response, session
+from flask import Flask, render_template, request, send_file, jsonify, redirect, url_for, Response
 from jinja2 import ChoiceLoader, FileSystemLoader, DictLoader
 from markupsafe import escape
 from pathlib import Path
@@ -1457,7 +1457,7 @@ def update_excel(sistema):
 def diagnostic():
     exe = find_tesseract()
     return jsonify({
-        "version": "20.0-portal-talma-persistente",
+        "version": "20.1-portal-talma-scanners-fix",
         "sistemas": list(SISTEMAS.keys()),
         "tesseract_encontrado": bool(exe),
         "ruta": exe,
@@ -1470,6 +1470,184 @@ def diagnostic():
         "templates_en_disco": sorted(p.name for p in TEMPLATES_DIR.glob("*.html")) if TEMPLATES_DIR.exists() else [],
         "templates_embebidas": sorted(SCANNER_TEMPLATES.keys()),
     })
+
+
+
+# ---------------------------------------------------------------------------
+# Portal privado TALMA
+# ---------------------------------------------------------------------------
+def _talma_password() -> str:
+    return os.environ.get("TALMA_PASSWORD", "Talma2026")
+
+
+def _talma_session_value() -> str:
+    expires = str(int(time.time()) + 12 * 3600)
+    payload = f"talma:{expires}"
+    sig = hmac.new(CONFIG["secret_key"].encode(), payload.encode(), hashlib.sha256).hexdigest()
+    return f"{payload}:{sig}"
+
+
+def _valid_talma_session(value: str | None) -> bool:
+    if not value:
+        return False
+    try:
+        user, expires, sig = value.split(":", 2)
+        if user != "talma" or int(expires) < time.time():
+            return False
+        payload = f"{user}:{expires}"
+        expected = hmac.new(CONFIG["secret_key"].encode(), payload.encode(), hashlib.sha256).hexdigest()
+        return hmac.compare_digest(sig, expected)
+    except (ValueError, TypeError):
+        return False
+
+
+def _talma_page(title: str, body: str) -> str:
+    return page(title, f"""
+<main class="wrap">
+<div class="actions no-print" style="justify-content:space-between;margin-bottom:16px">
+  <h1 style="margin:0">Portal TALMA</h1>
+  <span class="actions"><a class="btn secondary" href="/talma/excel">Descargar Excel</a>
+  <a class="btn secondary" href="/talma/logout">Cerrar sesión</a></span>
+</div>
+{body}
+</main>
+""")
+
+
+def _talma_login(error: bool = False):
+    notice = '<div class="notice error">Contraseña incorrecta.</div>' if error else ""
+    body = f"""
+<main class="wrap narrow">
+<div class="card">
+<h1>Acceso TALMA</h1>
+<p class="muted">Este apartado es exclusivo para TALMA.</p>
+{notice}
+<form method="post" action="/talma/login">
+<label>Contraseña TALMA</label>
+<input type="password" name="password" required autofocus autocomplete="current-password">
+<button type="submit">Ingresar</button>
+</form>
+</div>
+</main>"""
+    return page("Acceso TALMA", body)
+
+
+@app.get("/talma")
+@app.get("/talma/")
+def talma_portal():
+    if not _valid_talma_session(request.cookies.get("talma_session")):
+        return _talma_login()
+    orders_app.init_db()
+    with orders_app.db() as conn:
+        rows = conn.execute(
+            """SELECT o.id, o.order_date, o.employee_name, o.area, o.entry_item,
+                      o.main_item, o.notes, o.created_at
+               FROM orders o JOIN companies c ON c.id=o.company_id
+               WHERE c.slug='talma'
+               ORDER BY o.employee_name COLLATE NOCASE, o.order_date, o.id"""
+        ).fetchall()
+    counts = {}
+    for r in rows:
+        key = orders_app.normalize_key(r["employee_name"])
+        counts[key] = counts.get(key, 0) + 1
+    running = {}
+    table_rows = []
+    for r in rows:
+        key = orders_app.normalize_key(r["employee_name"])
+        running[key] = running.get(key, 0) + 1
+        table_rows.append(
+            f"<tr><td>{esc(r['order_date'])}</td><td><b>{esc(r['employee_name'])}</b></td>"
+            f"<td>{esc(r['area'])}</td><td>{esc(r['entry_item'])}</td><td>{esc(r['main_item'])}</td>"
+            f"<td>{running[key]}</td><td>{esc((r['created_at'] or '')[11:16])}</td></tr>"
+        )
+    summary = []
+    for name_key, total in sorted(counts.items(), key=lambda x: x[0]):
+        label = next((r["employee_name"] for r in rows if orders_app.normalize_key(r["employee_name"]) == name_key), name_key)
+        summary.append(f"<tr><td>{esc(label)}</td><td>{total}</td></tr>")
+    body = f"""
+<div class="grid grid3">
+<div class="stat">Pedidos TALMA<b>{len(rows)}</b></div>
+<div class="stat">Personas<b>{len(counts)}</b></div>
+<div class="stat">Excel<b>Actualizable</b></div>
+</div>
+<div class="card">
+<h2>Resumen por persona</h2>
+<div class="table-wrap"><table><thead><tr><th>Persona</th><th>Total almuerzos</th></tr></thead>
+<tbody>{''.join(summary) or '<tr><td colspan="2">No hay pedidos.</td></tr>'}</tbody></table></div>
+</div>
+<div class="card">
+<h2>Todos los pedidos TALMA</h2>
+<div class="table-wrap"><table><thead><tr><th>Fecha</th><th>Persona</th><th>Área</th><th>Entrada</th><th>Plato de fondo</th><th>N° Almuerzo</th><th>Hora</th></tr></thead>
+<tbody>{''.join(table_rows) or '<tr><td colspan="7">No hay pedidos.</td></tr>'}</tbody></table></div>
+</div>
+"""
+    return _talma_page("TALMA", body)
+
+
+@app.post("/talma/login")
+def talma_login():
+    password = request.form.get("password", "")
+    if not hmac.compare_digest(password, _talma_password()):
+        return _talma_login(True)
+    value = _talma_session_value()
+    secure = "; Secure" if request.headers.get("X-Forwarded-Proto") == "https" else ""
+    response = redirect("/talma/")
+    response.headers["Set-Cookie"] = f"talma_session={value}; Path=/; Max-Age=43200; HttpOnly; SameSite=Lax{secure}"
+    return response
+
+
+@app.get("/talma/logout")
+def talma_logout():
+    response = redirect("/talma")
+    response.headers["Set-Cookie"] = "talma_session=; Path=/; Max-Age=0; HttpOnly; SameSite=Lax"
+    return response
+
+
+@app.get("/talma/excel")
+def talma_excel():
+    if not _valid_talma_session(request.cookies.get("talma_session")):
+        return _talma_login()
+    orders_app.init_db()
+    with orders_app.db() as conn:
+        rows = conn.execute(
+            """SELECT o.order_date, o.employee_name, o.area, o.entry_item,
+                      o.main_item, o.notes, o.created_at
+               FROM orders o JOIN companies c ON c.id=o.company_id
+               WHERE c.slug='talma'
+               ORDER BY o.employee_name COLLATE NOCASE, o.order_date, o.id"""
+        ).fetchall()
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "Pedidos TALMA"
+    headers = ["Fecha", "Persona", "Área", "Entrada", "Plato de fondo", "Observación", "N° Almuerzo", "Hora"]
+    ws.append(headers)
+    counts = {}
+    for r in rows:
+        key = orders_app.normalize_key(r["employee_name"])
+        counts[key] = counts.get(key, 0) + 1
+        ws.append([r["order_date"], r["employee_name"], r["area"], r["entry_item"], r["main_item"],
+                   r["notes"], counts[key], (r["created_at"] or "")[11:16]])
+    for i, width in enumerate([14, 34, 16, 32, 36, 40, 14, 10], 1):
+        ws.column_dimensions[get_column_letter(i)].width = width
+    for cell in ws[1]:
+        cell.font = Font(bold=True, color="FFFFFF")
+        cell.fill = PatternFill("solid", fgColor="176B43")
+        cell.alignment = Alignment(horizontal="center")
+    for row in ws.iter_rows(min_row=2):
+        for cell in row:
+            cell.alignment = Alignment(vertical="top", wrap_text=True)
+    summary = wb.create_sheet("Resumen")
+    summary.append(["PERSONA", "TOTAL ALMUERZOS"])
+    for key, total in sorted(counts.items()):
+        label = next((r["employee_name"] for r in rows if orders_app.normalize_key(r["employee_name"]) == key), key)
+        summary.append([label, total])
+    summary.column_dimensions["A"].width = 34
+    summary.column_dimensions["B"].width = 20
+    output = io.BytesIO()
+    wb.save(output)
+    output.seek(0)
+    return send_file(output, as_attachment=True, download_name=f"pedidos_talma_{datetime.now():%Y_%m_%d}.xlsx",
+                     mimetype="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
 
 
 # ---------------------------------------------------------------------------
@@ -1536,165 +1714,6 @@ def _proxy_to_orders(path=""):
         return Response(data, status=upstream.status, headers=response_headers)
     finally:
         connection.close()
-
-
-
-# ---------------------------------------------------------------------------
-# Portal privado TALMA
-# ---------------------------------------------------------------------------
-TALMA_PASSWORD = os.environ.get("TALMA_PASSWORD", "Talma2026")
-
-
-def _talma_rows():
-    orders_app.init_db()
-    with orders_app.db() as conn:
-        rows = conn.execute(
-            """SELECT o.id, o.order_date, o.employee_name, o.area, o.entry_item,
-                      o.main_item, o.notes, o.delivery_type, o.created_at
-               FROM orders o
-               JOIN companies c ON c.id=o.company_id
-               WHERE c.slug='talma'
-               ORDER BY lower(o.employee_name), o.order_date, o.id"""
-        ).fetchall()
-    return rows
-
-
-def _talma_excel_bytes():
-    rows = _talma_rows()
-    wb = Workbook()
-    ws = wb.active
-    ws.title = "Pedidos TALMA"
-    headers = ["ID", "Fecha", "Nombre", "Área", "Entrada", "Segundo", "Observación", "Modalidad", "Hora"]
-    ws.append(headers)
-    counts = Counter()
-    # Orden alfabético por persona y fecha
-    for r in rows:
-        key = orders_app.normalize_key(r["employee_name"])
-        counts[key] += 1
-        ws.append([
-            r["id"], r["order_date"], r["employee_name"], r["area"],
-            r["entry_item"], r["main_item"], r["notes"], r["delivery_type"],
-            r["created_at"]
-        ])
-    # N° almuerzo en columna J, insertada después de Nombre
-    ws.insert_cols(4, 1)
-    ws.cell(1,4).value = "N° Almuerzo"
-    counts2 = Counter()
-    for i in range(2, ws.max_row+1):
-        name = str(ws.cell(i,3).value or "")
-        k = orders_app.normalize_key(name)
-        counts2[k] += 1
-        ws.cell(i,4).value = counts2[k]
-    # Reordenar filas por nombre/fecha, manteniendo el encabezado
-    data=list(ws.iter_rows(min_row=2, values_only=True))
-    data.sort(key=lambda x: (orders_app.normalize_key(x[2]), str(x[1] or ""), x[0] or 0))
-    for i,row in enumerate(data, start=2):
-        for j,val in enumerate(row, start=1):
-            ws.cell(i,j).value=val
-    widths=[10,14,32,14,14,28,34,18,18]
-    for i,w in enumerate(widths,1):
-        ws.column_dimensions[get_column_letter(i)].width=w
-    fill=PatternFill("solid", fgColor="176B43")
-    for c in ws[1]:
-        c.fill=fill; c.font=Font(color="FFFFFF",bold=True); c.alignment=Alignment(horizontal="center")
-    for row in ws.iter_rows():
-        for c in row: c.alignment=Alignment(vertical="center",wrap_text=True)
-    ws.freeze_panes="A2"
-    # Resumen
-    rs=wb.create_sheet("Resumen")
-    rs.append(["PERSONA","TOTAL ALMUERZOS"])
-    summary=Counter()
-    labels={}
-    for r in rows:
-        k=orders_app.normalize_key(r["employee_name"])
-        summary[k]+=1
-        labels.setdefault(k,r["employee_name"])
-    for k in sorted(summary, key=lambda k: k):
-        rs.append([labels[k],summary[k]])
-    for c in rs[1]:
-        c.fill=fill; c.font=Font(color="FFFFFF",bold=True)
-    rs.column_dimensions["A"].width=35
-    rs.column_dimensions["B"].width=20
-    rs.freeze_panes="A2"
-    bio=io.BytesIO()
-    wb.save(bio); bio.seek(0)
-    return bio
-
-
-def _talma_portal_html(error=""):
-    rows=_talma_rows()
-    summary=Counter()
-    labels={}
-    for r in rows:
-        k=orders_app.normalize_key(r["employee_name"])
-        summary[k]+=1; labels.setdefault(k,r["employee_name"])
-    notice=f'<div class="notice error">{escape(error)}</div>' if error else ""
-    summary_rows="".join(f"<tr><td>{escape(labels[k])}</td><td>{summary[k]}</td></tr>"
-                         for k in sorted(summary))
-    detail_rows="".join(
-        f"<tr><td>{r['order_date']}</td><td>{escape(r['employee_name'])}</td><td>{escape(r['area'])}</td>"
-        f"<td>{escape(r['entry_item'])}</td><td>{escape(r['main_item'])}</td><td>{escape(r['created_at'])}</td></tr>"
-        for r in rows
-    )
-    body=f"""
-<main class="wrap">
-<div class="card">
-<h1>Portal TALMA</h1>
-<p class="muted">Acceso privado · solo pedidos de TALMA</p>
-{notice}
-<div class="actions">
-<a class="btn" href="/talma/excel">Descargar Excel completo</a>
-<a class="btn secondary" href="/talma/logout">Cerrar sesión</a>
-</div>
-</div>
-<div class="grid grid2">
-<div class="stat">Pedidos totales<b>{len(rows)}</b></div>
-<div class="stat">Personas<b>{len(summary)}</b></div>
-</div>
-<div class="card"><h2>Resumen por persona</h2>
-<div class="table-wrap"><table><thead><tr><th>Persona</th><th>Total almuerzos</th></tr></thead><tbody>{summary_rows or '<tr><td colspan="2">No hay pedidos todavía.</td></tr>'}</tbody></table></div></div>
-<div class="card"><h2>Todos los pedidos TALMA</h2>
-<div class="table-wrap"><table><thead><tr><th>Fecha</th><th>Nombre</th><th>Área</th><th>Entrada</th><th>Segundo</th><th>Hora</th></tr></thead><tbody>{detail_rows or '<tr><td colspan="6">No hay pedidos.</td></tr>'}</tbody></table></div></div>
-</main>"""
-    return page("Portal TALMA", body, '<meta name="robots" content="noindex,nofollow,noarchive">')
-
-@app.route("/talma", methods=["GET", "POST"])
-@app.route("/talma/", methods=["GET", "POST"])
-def talma_portal():
-    if request.method == "POST":
-        password=request.form.get("password","")
-        if hmac.compare_digest(password, TALMA_PASSWORD):
-            session["talma_authenticated"]=True
-            return redirect("/talma/")
-        return talma_login("Contraseña incorrecta.")
-    if not session.get("talma_authenticated"):
-        return talma_login()
-    return _talma_portal_html()
-
-
-def talma_login(error=""):
-    notice=f'<div class="notice error">{escape(error)}</div>' if error else ""
-    body=f"""<main class="wrap narrow"><div class="card">
-<h1>Acceso TALMA</h1><p class="muted">Esta sección requiere una contraseña independiente del panel administrador.</p>
-{notice}<form method="post" action="/talma/">
-<label>Contraseña TALMA</label><input type="password" name="password" required autofocus>
-<br><br><button type="submit">Ingresar</button></form></div></main>"""
-    return page("Acceso TALMA", body, '<meta name="robots" content="noindex,nofollow,noarchive">')
-
-
-@app.get("/talma/excel")
-def talma_excel():
-    if not session.get("talma_authenticated"):
-        return redirect("/talma/")
-    bio=_talma_excel_bytes()
-    return send_file(bio, as_attachment=True, download_name=f"pedidos_talma_{datetime.now():%Y_%m_%d}.xlsx",
-                     mimetype="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
-
-
-@app.get("/talma/logout")
-def talma_logout():
-    session.pop("talma_authenticated", None)
-    return redirect("/talma/")
 
 
 @app.route("/", defaults={"path": ""}, methods=["GET", "POST", "HEAD"])
