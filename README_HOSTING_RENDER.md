@@ -1,58 +1,45 @@
-# Publicar el sistema en Render con dominio y HTTPS
+# Publicar esta versión en Render
 
-Esta carpeta ya está preparada para Render.
+## Importante: usar Docker
 
-## Antes de subirla
+Los scanners TALMA y POLICÍA necesitan **Tesseract OCR**, que es un paquete del sistema operativo. Por eso esta versión incluye un `Dockerfile` que instala:
 
-No suba a internet una base de datos local con pedidos reales. La carpeta `datos` debe estar vacía.
+- `tesseract-ocr`
+- `tesseract-ocr-spa`
+- las dependencias Python del proyecto
 
-## 1. Crear el repositorio en GitHub
+En Render, el servicio debe usar **Runtime / Language: Docker** para que el scanner funcione en producción.
 
-1. Ingrese a GitHub y cree un repositorio privado.
-2. Seleccione **Add file > Upload files**.
-3. Suba todos los archivos de esta carpeta, incluido `render.yaml`.
-4. Confirme con **Commit changes**.
+## Configuración prevista
 
-## 2. Crear el servicio en Render
+El `render.yaml` ya incluye:
 
-1. Ingrese a Render usando su cuenta de GitHub.
-2. Abra **Blueprints** y seleccione **New Blueprint Instance**.
-3. Seleccione el repositorio que acaba de crear.
-4. Render leerá `render.yaml`.
-5. Cuando lo solicite, complete:
-   - `RESTAURANT_NAME`: nombre de su restaurante.
-   - `ADMIN_PASSWORD`: una contraseña larga y privada.
-6. Confirme el despliegue.
+- Health check: `/health`
+- Disco persistente: `/opt/render/project/src/datos`
+- `DATA_DIR=/opt/render/project/src/datos`
+- `SECRET_KEY` generada por Render
+- un solo worker Gunicorn para evitar duplicar el servidor interno y mantener SQLite simple
 
-El archivo configura automáticamente:
+Variables que debes revisar en Render:
 
-- Python.
-- Puerto público proporcionado por Render.
-- HTTPS en la dirección `.onrender.com`.
-- Disco persistente para `datos/pedidos.db`.
-- Clave secreta aleatoria.
-- Revisión de estado en `/health`.
+- `RESTAURANT_NAME`
+- `ADMIN_PASSWORD`
+- `SECRET_KEY`
+- `ORDER_DEADLINE`
+- `DATA_DIR=/opt/render/project/src/datos`
 
-## 3. Primera prueba
+## Si tu servicio actual está como Python
 
-Cuando el servicio figure como **Live**, abra la URL indicada por Render, por ejemplo:
+El Dockerfile no se usará mientras el servicio continúe con runtime Python. Debes cambiar/sincronizar el servicio a Docker o crear un Web Service Docker conectado al mismo repositorio.
 
-`https://pedidos-almuerzos.onrender.com/admin`
+Después del despliegue comprueba:
 
-Entre con la contraseña configurada en `ADMIN_PASSWORD`.
+1. `/health` responde `ok`.
+2. `/admin` abre el inicio de sesión.
+3. Al entrar aparecen las pestañas Pedidos, TALMA y POLICÍA.
+4. `/admin/scanner-diagnostico` debe indicar que Tesseract fue encontrado y mostrar `spa` entre los idiomas.
+5. Prueba una captura TALMA y otra POLICÍA antes de usarlo en producción.
 
-## 4. Conectar un dominio propio
+## Dominio personalizado
 
-1. En Render, abra el servicio.
-2. Entre a **Settings > Custom Domains**.
-3. Pulse **Add Custom Domain**.
-4. Escriba su dominio o subdominio, por ejemplo `pedidos.mirestaurante.com`.
-5. Render mostrará los registros DNS que debe crear donde compró el dominio.
-6. Cree esos registros y vuelva a Render.
-7. Pulse **Verify**.
-
-Render emitirá el certificado TLS y redirigirá automáticamente de HTTP a HTTPS.
-
-## Copia de seguridad
-
-La base está en `/opt/render/project/src/datos/pedidos.db`. El disco persistente conserva los pedidos entre reinicios y despliegues. Mantenga además una copia periódica del archivo SQLite.
+El dominio personalizado se configura en Render sobre el Web Service que esté ejecutando esta versión. Si sustituyes el servicio anterior por uno nuevo, tendrás que asociar el dominio al servicio nuevo.

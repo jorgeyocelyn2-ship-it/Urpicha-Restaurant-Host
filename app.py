@@ -1,4 +1,4 @@
-from flask import Flask, render_template, request, send_file, jsonify, redirect, url_for
+from flask import Flask, render_template, request, send_file, jsonify, redirect, url_for, Response
 from pathlib import Path
 from datetime import datetime
 from PIL import Image, ImageOps, ImageEnhance
@@ -9,13 +9,19 @@ from openpyxl import Workbook, load_workbook
 from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
 from openpyxl.utils import get_column_letter
 from collections import Counter
-import subprocess, tempfile, csv, io, json, re, uuid, statistics, shutil, os, traceback, unicodedata
+from http.server import ThreadingHTTPServer
+from urllib.parse import urlsplit
+import subprocess, tempfile, csv, io, json, re, uuid, statistics, shutil, os, traceback, unicodedata, threading, http.client
+
+import orders_app
 
 app = Flask(__name__)
-app.secret_key = "cuponera-v19-dual"
+app.secret_key = os.environ.get("SECRET_KEY", "cuponera-v19-dual")
 ROOT = Path(__file__).resolve().parent
-UPLOADS = ROOT / "uploads"
-OUTPUTS = ROOT / "outputs"
+DATA_ROOT = Path(os.environ.get("DATA_DIR", str(ROOT / "datos"))).expanduser().resolve()
+SCANNER_ROOT = DATA_ROOT / "scanners"
+UPLOADS = SCANNER_ROOT / "uploads"
+OUTPUTS = SCANNER_ROOT / "outputs"
 
 UPLOADS.mkdir(parents=True, exist_ok=True)
 OUTPUTS.mkdir(parents=True, exist_ok=True)
@@ -28,7 +34,7 @@ SISTEMAS = {
         "titulo": "TALMA",
         "subtitulo": "Carga la captura del Excel de pedidos TALMA. Antes de leerla podrás ajustar las columnas.",
         "ayuda": "Sistema TALMA: código, nombre, área (RAMPA, PAX, CARGA, OMA), entrada, segundo y observación.",
-        "data_file": ROOT / "datos_talma.json",
+        "data_file": SCANNER_ROOT / "datos_talma.json",
         "cols": ["registro", "fecha", "sede", "codigo", "nombre", "area", "entrada", "segundo", "observacion"],
         "areas": ["RAMPA", "PAX", "CARGA", "OMA"],
         "label_entrada": "ENTRADA",
@@ -46,7 +52,7 @@ SISTEMAS = {
         "titulo": "POLICÍA",
         "subtitulo": "Carga la captura de la planilla PNP. Ajusta las barras de Entrada, Plato de fondo y Sugerencias.",
         "ayuda": "Sistema POLICÍA: N°, nombre y apellido, entrada, plato de fondo y sugerencias. Sin columna de área.",
-        "data_file": ROOT / "datos_policia.json",
+        "data_file": SCANNER_ROOT / "datos_policia.json",
         "cols": ["numero", "nombre", "entrada", "segundo", "observacion"],
         "areas": [],
         "label_entrada": "ENTRADA",
@@ -64,7 +70,7 @@ SISTEMAS = {
 }
 
 # Compatibilidad: migrar datos antiguos si existen
-_legacy = ROOT / "datos_actuales.json"
+_legacy = SCANNER_ROOT / "datos_actuales.json"
 _talma_data = SISTEMAS["talma"]["data_file"]
 if _legacy.exists() and not _talma_data.exists():
     try:
@@ -628,12 +634,12 @@ def error_handler(error):
     return render_template("error.html", message=str(error), detail=traceback.format_exc()), 500
 
 
-@app.get("/")
+@app.get("/admin/scanners")
 def index():
     return render_template("index.html")
 
 
-@app.get("/<sistema>/")
+@app.get("/admin/<any(talma,policia):sistema>/")
 def system_home(sistema):
     c = cfg(sistema)
     return render_template(
@@ -645,7 +651,7 @@ def system_home(sistema):
     )
 
 
-@app.post("/<sistema>/subir")
+@app.post("/admin/<any(talma,policia):sistema>/subir")
 def upload_image(sistema):
     cfg(sistema)  # valida
     uploaded = request.files.get("imagen")
@@ -660,7 +666,7 @@ def upload_image(sistema):
     return redirect(url_for("calibrate", sistema=sistema, filename=filename))
 
 
-@app.get("/<sistema>/calibrar/<filename>")
+@app.get("/admin/<any(talma,policia):sistema>/calibrar/<filename>")
 def calibrate(sistema, filename):
     c = cfg(sistema)
     image_path = UPLOADS / Path(filename).name
@@ -680,7 +686,7 @@ def calibrate(sistema, filename):
     )
 
 
-@app.get("/imagen/<filename>")
+@app.get("/admin/scanner-imagen/<filename>")
 def uploaded_image(filename):
     image_path = UPLOADS / Path(filename).name
     if not image_path.exists():
@@ -688,7 +694,7 @@ def uploaded_image(filename):
     return send_file(image_path)
 
 
-@app.post("/<sistema>/procesar")
+@app.post("/admin/<any(talma,policia):sistema>/procesar")
 def process_image(sistema):
     c = cfg(sistema)
     filename = Path(request.form.get("filename", "")).name
@@ -715,7 +721,7 @@ def process_image(sistema):
     )
 
 
-@app.post("/<sistema>/guardar")
+@app.post("/admin/<any(talma,policia):sistema>/guardar")
 def save_changes(sistema):
     c = cfg(sistema)
     received = json.loads(request.form.get("rows_json", "[]"))
@@ -948,7 +954,7 @@ def draw_pdf_summary_policia(pdf, rows, page_width, page_height):
         y -= 6 * mm
 
 
-@app.get("/<sistema>/pdf")
+@app.get("/admin/<any(talma,policia):sistema>/pdf")
 def create_pdf(sistema):
     c = cfg(sistema)
     rows = load_rows(sistema)
@@ -1247,7 +1253,7 @@ def prepare_orders_sheet(workbook, headers, preserve_accents=False):
     return main
 
 
-@app.get("/<sistema>/excel")
+@app.get("/admin/<any(talma,policia):sistema>/excel")
 def create_excel(sistema):
     c = cfg(sistema)
     rows = load_rows(sistema)
@@ -1268,7 +1274,7 @@ def create_excel(sistema):
     return send_file(output, as_attachment=True, download_name=output.name)
 
 
-@app.post("/<sistema>/actualizar-excel")
+@app.post("/admin/<any(talma,policia):sistema>/actualizar-excel")
 def update_excel(sistema):
     c = cfg(sistema)
     rows = load_rows(sistema)
@@ -1313,7 +1319,7 @@ def update_excel(sistema):
     return send_file(output, as_attachment=True, download_name=output.name)
 
 
-@app.get("/diagnostico")
+@app.get("/admin/scanner-diagnostico")
 def diagnostic():
     exe = find_tesseract()
     return jsonify({
@@ -1328,35 +1334,82 @@ def diagnostic():
     })
 
 
-# Redirecciones de compatibilidad con rutas antiguas (TALMA)
-@app.post("/subir")
-def legacy_upload():
-    return upload_image("talma")
+# ---------------------------------------------------------------------------
+# Integración con el sistema principal de pedidos
+# ---------------------------------------------------------------------------
+_INTERNAL_ORDERS_PORT = int(os.environ.get("INTERNAL_ORDERS_PORT", "18081"))
+_orders_server = None
+_orders_thread = None
+_orders_lock = threading.Lock()
 
-@app.get("/calibrar/<filename>")
-def legacy_calibrate(filename):
-    return redirect(url_for("calibrate", sistema="talma", filename=filename))
 
-@app.post("/procesar")
-def legacy_process():
-    return process_image("talma")
+def _ensure_orders_server():
+    """Inicia el servidor original de pedidos en localhost una sola vez."""
+    global _orders_server, _orders_thread
+    with _orders_lock:
+        if _orders_thread and _orders_thread.is_alive():
+            return
+        orders_app.init_db()
+        _orders_server = ThreadingHTTPServer(("127.0.0.1", _INTERNAL_ORDERS_PORT), orders_app.AppHandler)
+        _orders_thread = threading.Thread(target=_orders_server.serve_forever, name="pedidos-interno", daemon=True)
+        _orders_thread.start()
 
-@app.post("/guardar")
-def legacy_save():
-    return save_changes("talma")
 
-@app.get("/pdf")
-def legacy_pdf():
-    return create_pdf("talma")
+@app.before_request
+def _protect_scanner_admin():
+    protected = (
+        "/admin/talma",
+        "/admin/policia",
+        "/admin/scanners",
+        "/admin/scanner-imagen",
+        "/admin/scanner-diagnostico",
+    )
+    if request.path.startswith(protected):
+        if not orders_app.valid_session(request.cookies.get("admin_session")):
+            return redirect("/admin")
 
-@app.get("/excel")
-def legacy_excel():
-    return create_excel("talma")
 
-@app.post("/actualizar-excel")
-def legacy_update_excel():
-    return update_excel("talma")
+def _proxy_to_orders(path=""):
+    """Reenvía al sistema de pedidos original cualquier ruta que no sea del scanner."""
+    _ensure_orders_server()
+    target = "/" + path if path else "/"
+    if request.query_string:
+        target += "?" + request.query_string.decode("latin-1")
+
+    body = request.get_data(cache=False)
+    headers = {}
+    skipped = {"connection", "content-length", "transfer-encoding"}
+    for key, value in request.headers.items():
+        if key.lower() not in skipped:
+            headers[key] = value
+    # Mantener el host público para que los enlaces privados se generen con el dominio real.
+    headers["Host"] = request.host
+    headers["X-Forwarded-Proto"] = request.headers.get("X-Forwarded-Proto", request.scheme)
+
+    connection = http.client.HTTPConnection("127.0.0.1", _INTERNAL_ORDERS_PORT, timeout=180)
+    try:
+        connection.request(request.method, target, body=body if body else None, headers=headers)
+        upstream = connection.getresponse()
+        data = upstream.read()
+        response_headers = []
+        for key, value in upstream.getheaders():
+            if key.lower() not in {"connection", "transfer-encoding", "content-length", "server", "date"}:
+                response_headers.append((key, value))
+        return Response(data, status=upstream.status, headers=response_headers)
+    finally:
+        connection.close()
+
+
+@app.route("/", defaults={"path": ""}, methods=["GET", "POST", "HEAD"])
+@app.route("/<path:path>", methods=["GET", "POST", "HEAD"])
+def orders_proxy(path):
+    return _proxy_to_orders(path)
+
+
+# Se inicia también al importar la aplicación (por ejemplo, con Gunicorn).
+_ensure_orders_server()
 
 
 if __name__ == "__main__":
-    app.run(host="127.0.0.1", port=5050, debug=False)
+    public_port = int(os.environ.get("PORT", "8080"))
+    app.run(host="0.0.0.0", port=public_port, debug=False, threaded=True)

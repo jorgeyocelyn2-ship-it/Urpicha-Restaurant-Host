@@ -1,15 +1,13 @@
 services:
   - type: web
     name: pedidos-almuerzos
-    runtime: python
+    runtime: docker
     plan: starter
     region: oregon
-    buildCommand: "python --version"
-    startCommand: "python app.py"
+    dockerfilePath: ./Dockerfile
+    dockerContext: .
     healthCheckPath: /health
     envVars:
-      - key: PYTHON_VERSION
-        value: 3.13.5
       - key: RESTAURANT_NAME
         sync: false
       - key: ADMIN_PASSWORD
@@ -20,6 +18,8 @@ services:
         value: "10:30"
       - key: DATA_DIR
         value: /opt/render/project/src/datos
+      - key: INTERNAL_ORDERS_PORT
+        value: "18081"
     disk:
       name: pedidos-data
       mountPath: /opt/render/project/src/datos
