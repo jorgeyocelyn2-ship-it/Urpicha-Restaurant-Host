@@ -853,7 +853,7 @@ class AppHandler(BaseHTTPRequestHandler):
         main_rows = "".join(f"<li>{esc(r['main_item'])}: <b>{r['qty']}</b></li>" for r in main_summary) or "<li>Sin pedidos</li>"
         export_params = urlencode({"fecha": selected_date, "empresa": selected_company})
         if query.get("ok"):
-            notice = '<div class="notice ok">Cambios guardados.</div>'
+            notice = f'<div class="notice ok">✓ Menú guardado correctamente para <b>{esc(selected_date)}</b>. Se volvió a leer desde la base de datos para comprobar que quedó almacenado.</div>'
         elif query.get("menu_error"):
             notice = f'<div class="notice error">{esc(query["menu_error"])}</div>'
         else:
@@ -873,8 +873,13 @@ class AppHandler(BaseHTTPRequestHandler):
 <form method="post" action="/admin/menu">
 <div class="grid grid2"><div><label>Fecha</label><input type="date" name="fecha" value="{esc(selected_date)}" required></div><div><p class="muted">Escriba un plato por línea. Al guardar, reemplaza el menú de esa fecha.</p></div></div>
 <div class="grid grid2"><div><label>Entradas</label><textarea name="entradas" required>{esc(entries_text)}</textarea></div><div><label>Platos de fondo</label><textarea name="fondos" required>{esc(mains_text)}</textarea></div></div>
-<button>Guardar menú</button>
+<button>Guardar menú de esta fecha</button>
 </form>
+<div class="notice" style="margin-top:10px">
+  <b>Menú cargado para {esc(selected_date)}</b><br>
+  Entradas guardadas: <b>{len(menu["entrada"])}</b> · Platos de fondo guardados: <b>{len(menu["fondo"])}</b>.
+  <a href="/admin/dashboard?fecha={esc(selected_date)}">Volver a cargar esta fecha</a>
+</div>
 </div>
 
 <div class="card no-print">
@@ -922,32 +927,42 @@ class AppHandler(BaseHTTPRequestHandler):
         self.send_html(page("Panel administrador", body))
 
     def save_menu(self) -> None:
+        """Guarda de forma atómica el menú de una fecha y verifica inmediatamente lo almacenado."""
         form = self.read_form()
-        menu_date = form.get("fecha", "").strip()
+        raw_date = form.get("fecha", "").strip()
 
-        try:
-            datetime.strptime(menu_date, "%Y-%m-%d")
-        except ValueError:
-            self.redirect("/admin/dashboard")
+        # Acepta tanto el valor nativo del <input type="date"> como DD/MM/YYYY
+        # por si el navegador/formulario envía una fecha localizada.
+        menu_date = raw_date
+        for fmt in ("%Y-%m-%d", "%d/%m/%Y", "%d-%m-%Y"):
+            try:
+                parsed_date = datetime.strptime(raw_date, fmt)
+                menu_date = parsed_date.strftime("%Y-%m-%d")
+                break
+            except ValueError:
+                continue
+        else:
+            params = urlencode({
+                "fecha": today_iso(),
+                "menu_error": "Fecha inválida. Seleccione una fecha válida del calendario."
+            })
+            self.redirect(f"/admin/dashboard?{params}")
             return
 
         def unique_dishes(raw_text: str) -> list[str]:
-            """Limpia platos vacíos y elimina duplicados sin distinguir mayúsculas."""
             result: list[str] = []
             seen: set[str] = set()
-
-            for line in raw_text.splitlines():
-                dish = re.sub(r"\\s+", " ", line).strip()
-                if not dish:
-                    continue
-
-                dish = dish[:120]
-                key = normalize_key(dish)
-
-                if key and key not in seen:
-                    seen.add(key)
-                    result.append(dish)
-
+            for line in (raw_text or "").splitlines():
+                # También acepta platos separados por ';' o por salto de línea.
+                for part in re.split(r"[;\n]+", line):
+                    dish = re.sub(r"\s+", " ", part).strip()
+                    if not dish:
+                        continue
+                    dish = dish[:120]
+                    key = normalize_key(dish)
+                    if key and key not in seen:
+                        seen.add(key)
+                        result.append(dish)
             return result
 
         entries = unique_dishes(form.get("entradas", ""))
@@ -956,47 +971,54 @@ class AppHandler(BaseHTTPRequestHandler):
         if not entries or not mains:
             params = urlencode({
                 "fecha": menu_date,
-                "menu_error": "Debe ingresar al menos una entrada y un plato de fondo."
+                "menu_error": "Debes ingresar al menos una entrada y un plato de fondo para esa fecha."
             })
             self.redirect(f"/admin/dashboard?{params}")
             return
 
         try:
             with db() as conn:
-                # La operación completa se ejecuta como una sola transacción.
-                conn.execute("BEGIN")
-
-                # Reemplaza por completo el menú de la fecha seleccionada.
-                conn.execute(
-                    "DELETE FROM menu_items WHERE menu_date=?",
-                    (menu_date,),
-                )
-
+                # Una única transacción: nunca queda una fecha parcialmente guardada.
+                conn.execute("BEGIN IMMEDIATE")
+                conn.execute("DELETE FROM menu_items WHERE menu_date=?", (menu_date,))
                 conn.executemany(
-                    """INSERT INTO menu_items(menu_date, category, name)
-                       VALUES (?, 'entrada', ?)""",
+                    "INSERT INTO menu_items(menu_date, category, name) VALUES (?, 'entrada', ?)",
                     [(menu_date, dish) for dish in entries],
                 )
-
                 conn.executemany(
-                    """INSERT INTO menu_items(menu_date, category, name)
-                       VALUES (?, 'fondo', ?)""",
+                    "INSERT INTO menu_items(menu_date, category, name) VALUES (?, 'fondo', ?)",
                     [(menu_date, dish) for dish in mains],
                 )
+
+                # Verificación antes del COMMIT.
+                stored_entries = conn.execute(
+                    "SELECT name FROM menu_items WHERE menu_date=? AND category='entrada' AND active=1 ORDER BY id",
+                    (menu_date,),
+                ).fetchall()
+                stored_mains = conn.execute(
+                    "SELECT name FROM menu_items WHERE menu_date=? AND category='fondo' AND active=1 ORDER BY id",
+                    (menu_date,),
+                ).fetchall()
+
+                saved_entries = [r["name"] for r in stored_entries]
+                saved_mains = [r["name"] for r in stored_mains]
+                if saved_entries != entries or saved_mains != mains:
+                    raise sqlite3.Error("La verificación del menú guardado no coincide con los datos enviados.")
 
                 conn.commit()
 
         except sqlite3.Error as error:
-            print(f"Error al guardar el menú de {menu_date}: {error}", file=sys.stderr)
+            print(f"Error al guardar/verificar el menú de {menu_date}: {error}", file=sys.stderr)
             params = urlencode({
                 "fecha": menu_date,
-                "menu_error": "No se pudo guardar el menú. Revise los platos e inténtelo nuevamente."
+                "menu_error": f"No se pudo guardar el menú del {menu_date}. Inténtelo nuevamente."
             })
             self.redirect(f"/admin/dashboard?{params}")
             return
 
+        # Redirige a la misma fecha y muestra el menú recién guardado.
         self.redirect(
-            f"/admin/dashboard?{urlencode({'fecha': menu_date, 'ok': '1'})}"
+            f"/admin/dashboard?{urlencode({'fecha': menu_date, 'ok': '1', 'menu_guardado': '1'})}"
         )
 
     def create_company(self) -> None:
