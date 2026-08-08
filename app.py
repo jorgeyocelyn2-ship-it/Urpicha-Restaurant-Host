@@ -1,4 +1,6 @@
 from flask import Flask, render_template, request, send_file, jsonify, redirect, url_for, Response
+from jinja2 import ChoiceLoader, FileSystemLoader, DictLoader
+from markupsafe import escape
 from pathlib import Path
 from datetime import datetime
 from PIL import Image, ImageOps, ImageEnhance
@@ -14,10 +16,18 @@ from urllib.parse import urlsplit
 import subprocess, tempfile, csv, io, json, re, uuid, statistics, shutil, os, traceback, unicodedata, threading, http.client
 
 import orders_app
+from scanner_templates import SCANNER_TEMPLATES, SCANNER_CSS
 
-app = Flask(__name__)
-app.secret_key = os.environ.get("SECRET_KEY", "cuponera-v19-dual")
 ROOT = Path(__file__).resolve().parent
+TEMPLATES_DIR = ROOT / "templates"
+STATIC_DIR = ROOT / "static"
+app = Flask(__name__, template_folder=str(TEMPLATES_DIR), static_folder=str(STATIC_DIR))
+# Respaldo embebido: si Render no encuentra/copió templates/, Jinja usa estas plantillas incluidas en Python.
+app.jinja_loader = ChoiceLoader([
+    FileSystemLoader(str(TEMPLATES_DIR)),
+    DictLoader(SCANNER_TEMPLATES),
+])
+app.secret_key = os.environ.get("SECRET_KEY", "cuponera-v19-dual")
 DATA_ROOT = Path(os.environ.get("DATA_DIR", str(ROOT / "datos"))).expanduser().resolve()
 SCANNER_ROOT = DATA_ROOT / "scanners"
 UPLOADS = SCANNER_ROOT / "uploads"
@@ -631,7 +641,26 @@ def load_rows(sistema):
 
 @app.errorhandler(Exception)
 def error_handler(error):
-    return render_template("error.html", message=str(error), detail=traceback.format_exc()), 500
+    detail = traceback.format_exc()
+    try:
+        return render_template("error.html", message=str(error), detail=detail), 500
+    except Exception:
+        # Último recurso para que un fallo de plantilla nunca termine como 502 opaco.
+        return Response(
+            "<!doctype html><html lang='es'><meta charset='utf-8'><title>Error</title>"
+            "<body style='font-family:Arial;padding:24px'><h1>Error del panel</h1><p>"
+            + str(escape(str(error)))
+            + "</p><pre style='white-space:pre-wrap'>"
+            + str(escape(detail))
+            + "</pre><p><a href='/admin/dashboard'>Volver al panel</a></p></body></html>",
+            status=500,
+            mimetype="text/html",
+        )
+
+
+@app.get("/admin/scanner-style.css")
+def scanner_style():
+    return Response(SCANNER_CSS, mimetype="text/css")
 
 
 @app.get("/admin/scanners")
@@ -1323,7 +1352,7 @@ def update_excel(sistema):
 def diagnostic():
     exe = find_tesseract()
     return jsonify({
-        "version": "19.3-dual",
+        "version": "19.4-dual-embedded-templates",
         "sistemas": list(SISTEMAS.keys()),
         "tesseract_encontrado": bool(exe),
         "ruta": exe,
@@ -1331,6 +1360,10 @@ def diagnostic():
         "python": os.sys.version,
         "uploads": str(UPLOADS),
         "outputs": str(OUTPUTS),
+        "templates_dir": str(TEMPLATES_DIR),
+        "templates_dir_existe": TEMPLATES_DIR.exists(),
+        "templates_en_disco": sorted(p.name for p in TEMPLATES_DIR.glob("*.html")) if TEMPLATES_DIR.exists() else [],
+        "templates_embebidas": sorted(SCANNER_TEMPLATES.keys()),
     })
 
 

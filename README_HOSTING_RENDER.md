@@ -43,3 +43,9 @@ Después del despliegue comprueba:
 ## Dominio personalizado
 
 El dominio personalizado se configura en Render sobre el Web Service que esté ejecutando esta versión. Si sustituyes el servicio anterior por uno nuevo, tendrás que asociar el dominio al servicio nuevo.
+
+
+## Corrección v19.4
+Las plantillas TALMA/POLICÍA ahora tienen respaldo embebido en `scanner_templates.py`.
+Aunque Render no encuentre la carpeta `templates`, los paneles `/admin/talma/` y `/admin/policia/` pueden cargar.
+También existe `/admin/scanner-diagnostico` para comprobar plantillas y Tesseract.

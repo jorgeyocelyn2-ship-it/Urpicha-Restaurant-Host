@@ -1,0 +1,11 @@
+SUBE TODOS LOS ARCHIVOS DE ESTA CARPETA A LA RAÍZ DEL REPOSITORIO.
+
+Importantes:
+- app.py
+- orders_app.py
+- scanner_templates.py
+- Dockerfile
+- requirements.txt
+- config.json
+
+Las carpetas templates/ y static/ también pueden subirse, pero v19.4 incluye un respaldo embebido para que TALMA y POLICÍA no fallen si esas carpetas no son copiadas por error.
