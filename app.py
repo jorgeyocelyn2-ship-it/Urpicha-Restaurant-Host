@@ -1494,7 +1494,7 @@ def update_excel(sistema):
 def diagnostic():
     exe = find_tesseract()
     return jsonify({
-        "version": "20.1-portal-talma-scanners-fix",
+        "version": "20.3-talma-dni",
         "sistemas": list(SISTEMAS.keys()),
         "tesseract_encontrado": bool(exe),
         "ruta": exe,
@@ -1575,47 +1575,62 @@ def talma_portal():
     if not _valid_talma_session(request.cookies.get("talma_session")):
         return _talma_login()
     orders_app.init_db()
+    dni_filter = re.sub(r"\D", "", request.args.get("dni", ""))[:8]
     with orders_app.db() as conn:
-        rows = conn.execute(
-            """SELECT o.id, o.order_date, o.employee_name, o.area, o.entry_item,
-                      o.main_item, o.notes, o.created_at
-               FROM orders o JOIN companies c ON c.id=o.company_id
-               WHERE c.slug='talma'
-               ORDER BY o.employee_name COLLATE NOCASE, o.order_date, o.id"""
-        ).fetchall()
+        sql = """SELECT o.id, o.order_date, o.employee_name, o.dni, o.area, o.entry_item,
+                        o.main_item, o.notes, o.created_at
+                 FROM orders o JOIN companies c ON c.id=o.company_id
+                 WHERE c.slug='talma'"""
+        args = []
+        if dni_filter:
+            sql += " AND o.dni=?"
+            args.append(dni_filter)
+        sql += " ORDER BY CASE WHEN o.dni='' THEN 1 ELSE 0 END, o.dni, o.employee_name COLLATE NOCASE, o.order_date, o.id"
+        rows = conn.execute(sql, args).fetchall()
     counts = {}
     for r in rows:
-        key = orders_app.normalize_key(r["employee_name"])
+        key = r["dni"] or f"legacy:{orders_app.normalize_key(r['employee_name'])}"
         counts[key] = counts.get(key, 0) + 1
     running = {}
     table_rows = []
     for r in rows:
-        key = orders_app.normalize_key(r["employee_name"])
+        key = r["dni"] or f"legacy:{orders_app.normalize_key(r['employee_name'])}"
         running[key] = running.get(key, 0) + 1
         table_rows.append(
-            f"<tr><td>{esc(r['order_date'])}</td><td><b>{esc(r['employee_name'])}</b></td>"
+            f"<tr><td>{esc(r['order_date'])}</td><td><b>{esc(r['dni'] or '—')}</b></td><td>{esc(r['employee_name'])}</td>"
             f"<td>{esc(r['area'])}</td><td>{esc(r['entry_item'])}</td><td>{esc(r['main_item'])}</td>"
             f"<td>{running[key]}</td><td>{esc((r['created_at'] or '')[11:16])}</td></tr>"
         )
     summary = []
-    for name_key, total in sorted(counts.items(), key=lambda x: x[0]):
-        label = next((r["employee_name"] for r in rows if orders_app.normalize_key(r["employee_name"]) == name_key), name_key)
-        summary.append(f"<tr><td>{esc(label)}</td><td>{total}</td></tr>")
+    for dni_key, total in sorted(counts.items(), key=lambda x: x[0]):
+        rr = next((r for r in rows if (r["dni"] or f"legacy:{orders_app.normalize_key(r['employee_name'])}") == dni_key), None)
+        label = rr["employee_name"] if rr else dni_key
+        dni_label = rr["dni"] if rr and rr["dni"] else "Sin DNI (registro antiguo)"
+        summary.append(f"<tr><td><b>{esc(dni_label)}</b></td><td>{esc(label)}</td><td>{total}</td></tr>")
     body = f"""
 <div class="grid grid3">
 <div class="stat">Pedidos TALMA<b>{len(rows)}</b></div>
 <div class="stat">Personas<b>{len(counts)}</b></div>
 <div class="stat">Excel<b>Actualizable</b></div>
 </div>
+<div class="card no-print">
+<h2>Buscar por DNI</h2>
+<form method="get" action="/talma" class="actions">
+  <input name="dni" value="{esc(dni_filter)}" inputmode="numeric" pattern="[0-9]{{8}}" maxlength="8" placeholder="DNI de 8 dígitos" style="max-width:260px">
+  <button type="submit">Filtrar</button>
+  <a class="btn secondary" href="/talma">Limpiar</a>
+</form>
+<p class="muted">Para TALMA, el DNI es el identificador principal. Los registros antiguos sin DNI se muestran como "Sin DNI".</p>
+</div>
 <div class="card">
-<h2>Resumen por persona</h2>
-<div class="table-wrap"><table><thead><tr><th>Persona</th><th>Total almuerzos</th></tr></thead>
-<tbody>{''.join(summary) or '<tr><td colspan="2">No hay pedidos.</td></tr>'}</tbody></table></div>
+<h2>Resumen por DNI</h2>
+<div class="table-wrap"><table><thead><tr><th>DNI</th><th>Persona</th><th>Total almuerzos</th></tr></thead>
+<tbody>{''.join(summary) or '<tr><td colspan="3">No hay pedidos.</td></tr>'}</tbody></table></div>
 </div>
 <div class="card">
 <h2>Todos los pedidos TALMA</h2>
-<div class="table-wrap"><table><thead><tr><th>Fecha</th><th>Persona</th><th>Área</th><th>Entrada</th><th>Plato de fondo</th><th>N° Almuerzo</th><th>Hora</th></tr></thead>
-<tbody>{''.join(table_rows) or '<tr><td colspan="7">No hay pedidos.</td></tr>'}</tbody></table></div>
+<div class="table-wrap"><table><thead><tr><th>Fecha</th><th>DNI</th><th>Persona</th><th>Área</th><th>Entrada</th><th>Plato de fondo</th><th>N° Almuerzo</th><th>Hora</th></tr></thead>
+<tbody>{''.join(table_rows) or '<tr><td colspan="8">No hay pedidos.</td></tr>'}</tbody></table></div>
 </div>
 """
     return _talma_page("TALMA", body)
@@ -1647,24 +1662,24 @@ def talma_excel():
     orders_app.init_db()
     with orders_app.db() as conn:
         rows = conn.execute(
-            """SELECT o.order_date, o.employee_name, o.area, o.entry_item,
+            """SELECT o.order_date, o.employee_name, o.dni, o.area, o.entry_item,
                       o.main_item, o.notes, o.created_at
                FROM orders o JOIN companies c ON c.id=o.company_id
                WHERE c.slug='talma'
-               ORDER BY o.employee_name COLLATE NOCASE, o.order_date, o.id"""
+               ORDER BY CASE WHEN o.dni='' THEN 1 ELSE 0 END, o.dni, o.employee_name COLLATE NOCASE, o.order_date, o.id"""
         ).fetchall()
     wb = Workbook()
     ws = wb.active
     ws.title = "Pedidos TALMA"
-    headers = ["Fecha", "Persona", "Área", "Entrada", "Plato de fondo", "Observación", "N° Almuerzo", "Hora"]
+    headers = ["Fecha", "DNI", "Persona", "Área", "Entrada", "Plato de fondo", "Observación", "N° Almuerzo", "Hora"]
     ws.append(headers)
     counts = {}
     for r in rows:
-        key = orders_app.normalize_key(r["employee_name"])
+        key = r["dni"] or f"legacy:{orders_app.normalize_key(r['employee_name'])}"
         counts[key] = counts.get(key, 0) + 1
-        ws.append([r["order_date"], r["employee_name"], r["area"], r["entry_item"], r["main_item"],
+        ws.append([r["order_date"], r["dni"], r["employee_name"], r["area"], r["entry_item"], r["main_item"],
                    r["notes"], counts[key], (r["created_at"] or "")[11:16]])
-    for i, width in enumerate([14, 34, 16, 32, 36, 40, 14, 10], 1):
+    for i, width in enumerate([14, 14, 34, 16, 32, 36, 40, 14, 10], 1):
         ws.column_dimensions[get_column_letter(i)].width = width
     for cell in ws[1]:
         cell.font = Font(bold=True, color="FFFFFF")
@@ -1674,12 +1689,13 @@ def talma_excel():
         for cell in row:
             cell.alignment = Alignment(vertical="top", wrap_text=True)
     summary = wb.create_sheet("Resumen")
-    summary.append(["PERSONA", "TOTAL ALMUERZOS"])
+    summary.append(["DNI", "PERSONA", "TOTAL ALMUERZOS"])
     for key, total in sorted(counts.items()):
-        label = next((r["employee_name"] for r in rows if orders_app.normalize_key(r["employee_name"]) == key), key)
-        summary.append([label, total])
-    summary.column_dimensions["A"].width = 34
-    summary.column_dimensions["B"].width = 20
+        rr = next((r for r in rows if (r["dni"] or f"legacy:{orders_app.normalize_key(r['employee_name'])}") == key), None)
+        summary.append([rr["dni"] if rr and rr["dni"] else "Sin DNI", rr["employee_name"] if rr else key, total])
+    summary.column_dimensions["A"].width = 16
+    summary.column_dimensions["B"].width = 34
+    summary.column_dimensions["C"].width = 20
     output = io.BytesIO()
     wb.save(output)
     output.seek(0)

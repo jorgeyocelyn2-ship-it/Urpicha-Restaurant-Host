@@ -128,6 +128,7 @@ def init_db() -> None:
                 order_date TEXT NOT NULL,
                 employee_name TEXT NOT NULL,
                 employee_key TEXT NOT NULL,
+                dni TEXT NOT NULL DEFAULT '',
                 area TEXT NOT NULL DEFAULT '',
                 entry_item TEXT NOT NULL,
                 main_item TEXT NOT NULL,
@@ -139,6 +140,12 @@ def init_db() -> None:
             );
             """
         )
+
+        # Migración compatible: versiones anteriores no tenían DNI.
+        columns = {row["name"] for row in conn.execute("PRAGMA table_info(orders)").fetchall()}
+        if "dni" not in columns:
+            conn.execute("ALTER TABLE orders ADD COLUMN dni TEXT NOT NULL DEFAULT ''")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_orders_talma_dni ON orders(dni)")
 
         # Elimina el enlace de demostración de versiones anteriores y garantiza
         # los cuatro enlaces predeterminados solicitados.
@@ -629,6 +636,7 @@ class AppHandler(BaseHTTPRequestHandler):
         if not company:
             self.send_html(page("Enlace inválido", '<main class="wrap narrow"><div class="card"><h1>Enlace inválido</h1><p>Solicite a su empresa un enlace actualizado.</p></div></main>'), 403)
             return
+        is_talma = slug.lower() == "talma"
         requested_date = query.get("fecha", today_iso())
         try:
             datetime.strptime(requested_date, "%Y-%m-%d")
@@ -637,7 +645,7 @@ class AppHandler(BaseHTTPRequestHandler):
         menu = get_menu(requested_date)
         with db() as conn:
             public_orders = conn.execute(
-                """SELECT employee_name, created_at FROM orders
+                """SELECT employee_name, dni, created_at FROM orders
                    WHERE company_id=? AND order_date=?
                    ORDER BY created_at DESC, id DESC""",
                 (company["id"], requested_date),
@@ -696,6 +704,7 @@ class AppHandler(BaseHTTPRequestHandler):
 <input type="hidden" name="fecha" value="{esc(requested_date)}">
 <label>Nombre y apellido</label>
 <input name="nombre" required maxlength="100" placeholder="Ejemplo: Juan Pérez">
+{f'<label>DNI <span style="color:#b42318">*</span></label><input name="dni" required inputmode="numeric" pattern="[0-9]{{8}}" maxlength="8" minlength="8" placeholder="8 dígitos">' if is_talma else ''}
 <label>Área o sede (opcional)</label>
 <input name="area" maxlength="80" placeholder="Ejemplo: Contabilidad">
 {menu_html}
@@ -717,6 +726,8 @@ class AppHandler(BaseHTTPRequestHandler):
             return
         order_date = form.get("fecha", today_iso())
         name = form.get("nombre", "").strip()
+        is_talma = slug.lower() == "talma"
+        dni = re.sub(r"\D", "", form.get("dni", "").strip()) if is_talma else ""
         area = form.get("area", "").strip()
         entry = form.get("entrada", "").strip()
         main = form.get("fondo", "").strip()
@@ -729,6 +740,8 @@ class AppHandler(BaseHTTPRequestHandler):
             error = "Fecha inválida."
         if len(name) < 3:
             error = "Ingrese su nombre y apellido."
+        if is_talma and not re.fullmatch(r"\d{8}", dni):
+            error = "Para TALMA, el DNI debe tener exactamente 8 dígitos."
         menu = get_menu(order_date)
         valid_entries = {r["name"] for r in menu["entrada"]}
         valid_mains = {r["name"] for r in menu["fondo"]}
@@ -740,13 +753,14 @@ class AppHandler(BaseHTTPRequestHandler):
             return
         try:
             with db() as conn:
+                employee_key = f"dni:{dni}" if is_talma else normalize_key(name)
                 conn.execute(
-                    """INSERT INTO orders(company_id, order_date, employee_name, employee_key, area, entry_item, main_item, notes, delivery_type, created_at)
-                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-                    (company["id"], order_date, name, normalize_key(name), area, entry, main, notes, delivery, now_iso()),
+                    """INSERT INTO orders(company_id, order_date, employee_name, employee_key, dni, area, entry_item, main_item, notes, delivery_type, created_at)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    (company["id"], order_date, name, employee_key, dni, area, entry, main, notes, delivery, now_iso()),
                 )
         except sqlite3.IntegrityError:
-            params = urlencode({"token": token, "fecha": order_date, "error": "Ya existe un pedido con ese nombre para esta fecha."})
+            params = urlencode({"token": token, "fecha": order_date, "error": "Ya existe un pedido para ese DNI en esta fecha." if is_talma else "Ya existe un pedido con ese nombre para esta fecha."})
             self.redirect(f"/empresa/{quote(slug)}?{params}")
             return
         self.redirect(f"/empresa/{quote(slug)}?{urlencode({'token':token,'fecha':order_date,'ok':'1'})}")
@@ -831,10 +845,10 @@ class AppHandler(BaseHTTPRequestHandler):
             for c in companies
         ) or '<tr><td colspan="4">No hay empresas.</td></tr>'
         order_rows = "".join(
-            f"""<tr><td>{esc(o['company_name'])}</td><td>{esc(o['employee_name'])}</td><td>{esc(o['area'])}</td><td>{esc(o['entry_item'])}</td><td>{esc(o['main_item'])}</td><td>{esc(o['delivery_type'])}</td><td>{esc(o['notes'])}</td><td>{esc(o['created_at'][11:16])}</td>
+            f"""<tr><td>{esc(o['company_name'])}</td><td>{esc(o['dni']) if o['company_name'].lower() == 'talma' and o['dni'] else '—'}</td><td>{esc(o['employee_name'])}</td><td>{esc(o['area'])}</td><td>{esc(o['entry_item'])}</td><td>{esc(o['main_item'])}</td><td>{esc(o['delivery_type'])}</td><td>{esc(o['notes'])}</td><td>{esc(o['created_at'][11:16])}</td>
 <td><form method="post" action="/admin/pedido/eliminar" onsubmit="return confirm('¿Eliminar pedido?')"><input type="hidden" name="id" value="{o['id']}"><input type="hidden" name="fecha" value="{esc(selected_date)}"><button class="btn small danger">Eliminar</button></form></td></tr>"""
             for o in orders
-        ) or '<tr><td colspan="9">No hay pedidos para el filtro seleccionado.</td></tr>'
+        ) or '<tr><td colspan="10">No hay pedidos para el filtro seleccionado.</td></tr>'
         entry_rows = "".join(f"<li>{esc(r['entry_item'])}: <b>{r['qty']}</b></li>" for r in entry_summary) or "<li>Sin pedidos</li>"
         main_rows = "".join(f"<li>{esc(r['main_item'])}: <b>{r['qty']}</b></li>" for r in main_summary) or "<li>Sin pedidos</li>"
         export_params = urlencode({"fecha": selected_date, "empresa": selected_company})
@@ -878,7 +892,7 @@ class AppHandler(BaseHTTPRequestHandler):
 </form>
 <div class="grid grid2"><div><h3>Entradas</h3><ul>{entry_rows}</ul></div><div><h3>Fondos</h3><ul>{main_rows}</ul></div></div>
 <div class="actions no-print" style="margin-bottom:14px"><a class="btn secondary" href="/admin/export.csv?{export_params}">Descargar CSV/Excel</a><a class="btn" target="_blank" href="/admin/cupones?{export_params}">Generar cupones</a></div>
-<div class="table-wrap"><table><thead><tr><th>Empresa</th><th>Empleado</th><th>Área</th><th>Entrada</th><th>Fondo</th><th>Modalidad</th><th>Observación</th><th>Hora</th><th></th></tr></thead><tbody>{order_rows}</tbody></table></div>
+<div class="table-wrap"><table><thead><tr><th>Empresa</th><th>DNI</th><th>Empleado</th><th>Área</th><th>Entrada</th><th>Fondo</th><th>Modalidad</th><th>Observación</th><th>Hora</th><th></th></tr></thead><tbody>{order_rows}</tbody></table></div>
 </div>
 
 <div class="card no-print" id="excel-historico">
@@ -1031,6 +1045,7 @@ class AppHandler(BaseHTTPRequestHandler):
                 "fecha": r["order_date"],
                 "empresa": r["company_name"],
                 "nombre": r["employee_name"],
+                "dni": r["dni"] if "dni" in r.keys() else "",
                 "area": r["area"],
                 "entrada": r["entry_item"],
                 "fondo": r["main_item"],
@@ -1079,9 +1094,10 @@ class AppHandler(BaseHTTPRequestHandler):
         selected_date, rows = self.filtered_orders(query)
         output = io.StringIO(newline="")
         writer = csv.writer(output, delimiter=";")
-        writer.writerow(["Empresa", "Empleado", "Área", "Entrada", "Plato de fondo", "Modalidad", "Observación", "Fecha", "Hora"])
+        writer.writerow(["Empresa", "DNI", "Empleado", "Área", "Entrada", "Plato de fondo", "Modalidad", "Observación", "Fecha", "Hora"])
         for r in rows:
-            writer.writerow([r["company_name"], r["employee_name"], r["area"], r["entry_item"], r["main_item"], r["delivery_type"], r["notes"], r["order_date"], r["created_at"][11:16]])
+            dni = r["dni"] if r["company_name"].lower() == "talma" else ""
+            writer.writerow([r["company_name"], dni, r["employee_name"], r["area"], r["entry_item"], r["main_item"], r["delivery_type"], r["notes"], r["order_date"], r["created_at"][11:16]])
         data = ("\ufeff" + output.getvalue()).encode("utf-8")
         self.send_bytes(data, "text/csv; charset=utf-8", f"pedidos-{selected_date}.csv")
 
