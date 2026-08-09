@@ -5,6 +5,8 @@ No requiere librerías externas: usa solo Python + SQLite.
 """
 from __future__ import annotations
 
+from datetime import datetime, date
+
 import csv
 from collections import Counter
 import hashlib
@@ -703,13 +705,14 @@ class AppHandler(BaseHTTPRequestHandler):
     <input type="hidden" name="token" value="{esc(token)}">
     <div>
       <label>Fecha del pedido</label>
-      <input type="date" name="fecha" value="{esc(requested_date)}" min="{today_iso()}" required>
+      <input type="date" id="fecha-pedido" name="fecha" value="{esc(requested_date)}" min="{today_iso()}" required>
+      <div id="dia-pedido" class="muted" style="margin-top:6px;font-weight:700"></div>
     </div>
     <button type="submit" class="btn secondary">Ver menú de ese día</button>
   </form>
   <p class="muted" style="margin-bottom:0">Puedes elegir hoy o una fecha futura. El pedido quedará registrado para la fecha seleccionada.</p>
 </div>
-<p class="muted">Fecha seleccionada: <b>{esc(requested_date)}</b> · Hora límite referencial: {esc(CONFIG.get('order_deadline',''))}</p>
+<p class="muted">Fecha seleccionada: <b>{esc(fecha_con_dia(requested_date))}</b> · Hora límite referencial: {esc(CONFIG.get('order_deadline',''))}</p>
 {notice}
 <form method="post" action="/pedido/{esc(slug)}">
 <input type="hidden" name="token" value="{esc(token)}">
@@ -894,11 +897,11 @@ class AppHandler(BaseHTTPRequestHandler):
 </form>
 <div class="grid grid2" style="margin-top:14px">
   <div>
-    <h3>Entradas — {esc(selected_date)}</h3>
+    <h3>Entradas — {esc(fecha_con_dia(selected_date))}</h3>
     <ul>{entry_menu_view}</ul>
   </div>
   <div>
-    <h3>Platos de fondo — {esc(selected_date)}</h3>
+    <h3>Platos de fondo — {esc(fecha_con_dia(selected_date))}</h3>
     <ul>{main_menu_view}</ul>
   </div>
 </div>
@@ -1287,3 +1290,15 @@ def run() -> None:
 
 if __name__ == "__main__":
     run()
+
+
+WEEKDAYS_ES = ["lunes", "martes", "miércoles", "jueves", "viernes", "sábado", "domingo"]
+
+def fecha_con_dia(fecha_iso):
+    try:
+        d = datetime.strptime(str(fecha_iso), "%Y-%m-%d").date()
+        meses = ["enero","febrero","marzo","abril","mayo","junio","julio","agosto","septiembre","octubre","noviembre","diciembre"]
+        return f"{WEEKDAYS_ES[d.weekday()]} {d.day} de {meses[d.month-1]} de {d.year}"
+    except Exception:
+        return str(fecha_iso)
+
