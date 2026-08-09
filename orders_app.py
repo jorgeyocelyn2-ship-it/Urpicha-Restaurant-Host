@@ -179,6 +179,8 @@ def init_db() -> None:
             ]
             conn.executemany("INSERT INTO menu_items(menu_date, category, name) VALUES (?, ?, ?)", demo)
 
+    start_backup_worker()
+
 
 LOCAL_TZ = ZoneInfo("America/Lima")
 
@@ -193,6 +195,66 @@ def today_iso() -> str:
 
 def now_iso() -> str:
     return local_now().replace(tzinfo=None, microsecond=0).isoformat(sep=" ")
+
+
+# ---------------------------------------------------------------------------
+# Persistencia y copias de seguridad
+# ---------------------------------------------------------------------------
+BACKUP_DIR = DATA_DIR / "backups"
+BACKUP_DIR.mkdir(parents=True, exist_ok=True)
+
+def backup_database() -> Path | None:
+    """Crea una copia consistente diaria de SQLite y conserva 30 días."""
+    try:
+        target = BACKUP_DIR / f"pedidos_{today_iso()}.db"
+        if target.exists():
+            return target
+        temp = BACKUP_DIR / f".pedidos_{today_iso()}.tmp"
+        if temp.exists():
+            temp.unlink()
+        with db() as source:
+            with sqlite3.connect(temp) as destination:
+                source.backup(destination)
+        os.replace(temp, target)
+        backups = sorted(BACKUP_DIR.glob("pedidos_*.db"), key=lambda x: x.name, reverse=True)
+        for old in backups[30:]:
+            try:
+                old.unlink()
+            except OSError:
+                pass
+        return target
+    except Exception as error:
+        print(f"[BACKUP] No se pudo crear la copia: {error}", file=sys.stderr)
+        return None
+
+def _backup_worker() -> None:
+    while True:
+        try:
+            backup_database()
+            time.sleep(3600)
+        except Exception as error:
+            print(f"[BACKUP] Error en el proceso diario: {error}", file=sys.stderr)
+            time.sleep(300)
+
+_backup_thread_started = False
+_backup_thread_lock = threading.Lock()
+
+def start_backup_worker() -> None:
+    global _backup_thread_started
+    with _backup_thread_lock:
+        if _backup_thread_started:
+            return
+        _backup_thread_started = True
+        backup_database()
+        threading.Thread(target=_backup_worker, name="backup-diario", daemon=True).start()
+
+
+def is_order_closed(order_date: str) -> bool:
+    """Cierra únicamente los pedidos del día actual a las 14:00, hora de Perú."""
+    if order_date != today_iso():
+        return False
+    now = local_now()
+    return (now.hour, now.minute, now.second) >= (14, 0, 0)
 
 
 def normalize_key(text: str) -> str:
@@ -584,6 +646,12 @@ class AppHandler(BaseHTTPRequestHandler):
         elif path == "/admin/dashboard":
             if self.require_admin():
                 self.admin_dashboard(query)
+        elif path == "/admin/personas":
+            if self.require_admin():
+                self.admin_personas(query)
+        elif path == "/admin/resumen":
+            if self.require_admin():
+                self.admin_resumen(query)
         elif path == "/admin/export.csv":
             if self.require_admin():
                 self.export_csv(query)
@@ -658,7 +726,10 @@ class AppHandler(BaseHTTPRequestHandler):
         elif query.get("error"):
             notice = f'<div class="notice error">{esc(query["error"])}</div>'
 
-        if not menu["entrada"] or not menu["fondo"]:
+        if is_order_closed(requested_date):
+            menu_html = f'<div class="notice error"><b>Pedidos cerrados.</b><br>Los pedidos para {esc(fecha_con_dia(requested_date))} se cerraron a las 2:00 p. m. (hora de Perú). Puedes consultar fechas futuras.</div>'
+            submit = ""
+        elif not menu["entrada"] or not menu["fondo"]:
             menu_html = '<div class="notice error">Todavía no se ha publicado un menú completo para esta fecha.</div>'
             submit = ""
         else:
@@ -753,6 +824,10 @@ class AppHandler(BaseHTTPRequestHandler):
             datetime.strptime(order_date, "%Y-%m-%d")
         except ValueError:
             error = "Fecha inválida."
+        if order_date < today_iso():
+            error = "No se pueden registrar pedidos para una fecha pasada."
+        if is_order_closed(order_date):
+            error = "Los pedidos del día actual se cierran a las 2:00 p. m. (hora de Perú). Puede seleccionar una fecha futura."
         if len(name) < 3:
             error = "Ingrese su nombre y apellido."
         if is_talma and not re.fullmatch(r"\d{8}", dni):
@@ -805,6 +880,89 @@ class AppHandler(BaseHTTPRequestHandler):
             self.redirect("/admin/dashboard", f"admin_session={value}; Path=/; Max-Age=28800; HttpOnly; SameSite=Lax{secure}")
         else:
             self.redirect("/admin?error=1")
+
+    def admin_personas(self, query: dict[str, str]) -> None:
+        company_filter = query.get("empresa", "").strip()
+        search = query.get("buscar", "").strip()
+        with db() as conn:
+            companies = conn.execute("SELECT * FROM companies WHERE active=1 ORDER BY name COLLATE NOCASE").fetchall()
+            filters, args = [], []
+            if company_filter.isdigit():
+                filters.append("o.company_id=?"); args.append(int(company_filter))
+            if search:
+                term = f"%{search}%"
+                filters.append("(o.employee_name LIKE ? OR o.dni LIKE ? OR o.area LIKE ?)")
+                args.extend([term, term, term])
+            where = (" WHERE " + " AND ".join(filters)) if filters else ""
+            rows = conn.execute(
+                f"""SELECT c.name AS company_name, o.employee_name, o.dni, MAX(o.area) AS area,
+                           COUNT(*) AS total_consumo, MIN(o.order_date) AS primer_pedido,
+                           MAX(o.order_date) AS ultimo_pedido
+                    FROM orders o JOIN companies c ON c.id=o.company_id
+                    {where}
+                    GROUP BY c.id, o.employee_key, o.employee_name, o.dni
+                    ORDER BY c.name COLLATE NOCASE, o.employee_name COLLATE NOCASE""", args).fetchall()
+
+        options = '<option value="">Todas las empresas</option>' + "".join(
+            f'<option value="{c["id"]}" {"selected" if str(c["id"])==company_filter else ""}>{esc(c["name"])}</option>' for c in companies
+        )
+        rows_html = "".join(
+            f'<tr><td><b>{esc(r["employee_name"])}</b></td><td>{esc(r["company_name"])}</td>'
+            f'<td>{esc(r["dni"]) if r["dni"] else "—"}</td><td>{esc(r["area"]) if r["area"] else "—"}</td>'
+            f'<td><strong>{r["total_consumo"]}</strong></td><td>{esc(r["primer_pedido"])}</td><td>{esc(r["ultimo_pedido"])}</td></tr>'
+            for r in rows
+        ) or '<tr><td colspan="7">No se encontraron personas.</td></tr>'
+
+        body=f"""
+<main class="wrap">
+<div class="actions no-print" style="justify-content:space-between;margin-bottom:16px"><h1 style="margin:0">👥 Base de datos · Personas y consumo</h1><a href="/admin/dashboard">← Pedidos</a></div>
+<div class="card no-print"><h2>Buscar persona</h2>
+<form method="get" action="/admin/personas" class="grid grid3">
+<div><label>Nombre, DNI o área</label><input name="buscar" value="{esc(search)}" placeholder="Ej. Juan, 76543210, RAMPA"></div>
+<div><label>Empresa</label><select name="empresa">{options}</select></div>
+<div style="align-self:end"><button>Buscar</button> <a class="btn secondary" href="/admin/personas">Limpiar</a></div>
+</form></div>
+<div class="grid grid3"><div class="stat">Personas encontradas<b>{len(rows)}</b></div>
+<div class="stat">Empresas<b>{len(companies)}</b></div><div class="stat">Consumo total<b>{sum(int(r["total_consumo"]) for r in rows)}</b></div></div>
+<div class="card"><h2>Consumo por persona</h2>
+<p class="muted">TALMA se identifica principalmente por DNI; las demás empresas por nombre.</p>
+<div class="table-wrap"><table><thead><tr><th>Nombre</th><th>Empresa</th><th>DNI</th><th>Área</th><th>Total almuerzos</th><th>Primer pedido</th><th>Último pedido</th></tr></thead>
+<tbody>{rows_html}</tbody></table></div></div></main>"""
+        self.send_html(page("Base de datos · Personas", body))
+
+    def admin_resumen(self, query: dict[str, str]) -> None:
+        selected_date = query.get("fecha", today_iso())
+        try:
+            datetime.strptime(selected_date, "%Y-%m-%d")
+        except ValueError:
+            selected_date = today_iso()
+        with db() as conn:
+            company_rows = conn.execute(
+                """SELECT c.id, c.name, c.slug, COUNT(o.id) AS total
+                   FROM companies c
+                   LEFT JOIN orders o ON o.company_id=c.id AND o.order_date=?
+                   WHERE c.active=1 GROUP BY c.id
+                   ORDER BY CASE c.slug WHEN 'liderman' THEN 1 WHEN 'aeropuerto' THEN 2
+                   WHEN 'talma' THEN 3 WHEN 'policia' THEN 4 ELSE 5 END, c.name""",
+                (selected_date,)).fetchall()
+        grand_total=sum(int(r["total"]) for r in company_rows)
+        cards="".join(f'<div class="big-company-card"><div class="company-name">{esc(r["name"])}</div><div class="company-total">{r["total"]}</div><div class="company-label">MENÚS / PEDIDOS</div></div>' for r in company_rows)
+        body=f"""
+<main class="wrap">
+<div class="actions no-print" style="justify-content:space-between;margin-bottom:16px"><h1 style="margin:0">📊 Resumen de almuerzos</h1><a href="/admin/dashboard">← Panel</a></div>
+<div class="card no-print"><form method="get" action="/admin/resumen" class="actions" style="align-items:end">
+<div><label>Fecha</label><input type="date" name="fecha" value="{esc(selected_date)}" required></div><button>Actualizar</button>
+<a class="btn secondary" href="/admin/resumen?fecha={today_iso()}">Hoy</a></form></div>
+<div class="hero-total"><div class="hero-kicker">TOTAL GENERAL</div><div class="hero-number">{grand_total}</div><div class="hero-date">{esc(fecha_con_dia(selected_date))}</div></div>
+<div class="company-cards">{cards}</div>
+<div class="card" style="text-align:center"><h2>Resumen de {esc(fecha_con_dia(selected_date))}</h2><p class="muted">Esta pantalla se actualiza automáticamente cada 30 segundos.</p></div>
+</main><script>setTimeout(function(){{ location.reload(); }},30000);</script>"""
+        extra="""<style>
+.hero-total{background:linear-gradient(135deg,#101828,#175cd3);color:white;border-radius:24px;padding:32px;text-align:center;margin-bottom:24px;box-shadow:0 14px 40px rgba(16,24,40,.22)}
+.hero-kicker{font-weight:800;letter-spacing:3px;font-size:14px;opacity:.9}.hero-number{font-size:72px;font-weight:900;line-height:1;margin:10px 0}.hero-date{font-size:20px;font-weight:700}
+.company-cards{display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:20px;margin-bottom:24px}.big-company-card{background:white;border:1px solid #e4e7ec;border-radius:22px;padding:26px;text-align:center;box-shadow:0 8px 24px rgba(16,24,40,.08)}.company-name{font-size:25px;font-weight:900}.company-total{font-size:64px;font-weight:900;margin:12px 0;color:#175cd3}.company-label{font-size:13px;font-weight:800;letter-spacing:1.5px;color:#667085}
+</style>"""
+        self.send_html(page("Resumen de almuerzos", body, extra))
 
     def admin_dashboard(self, query: dict[str, str]) -> None:
         selected_date = query.get("fecha", today_iso())
@@ -879,7 +1037,7 @@ class AppHandler(BaseHTTPRequestHandler):
         body = f"""
 <main class="wrap">
 <div class="actions no-print" style="justify-content:space-between;margin-bottom:16px"><h1 style="margin:0">Panel administrador</h1><a href="/admin/logout">Cerrar sesión</a></div>
-<div class="admin-tabs no-print"><a class="active" href="/admin/dashboard">Pedidos</a><a href="/admin/talma/">TALMA</a><a href="/admin/policia/">POLICÍA</a></div>
+<div class="admin-tabs no-print"><a class="active" href="/admin/dashboard">Pedidos</a><a href="/admin/personas">👥 Personas y consumo</a><a href="/admin/resumen">📊 Resumen visual</a><a href="/admin/talma/">TALMA</a><a href="/admin/policia/">POLICÍA</a></div>
 {notice}
 <div class="grid grid3">
 <div class="stat">Pedidos del día<b>{total_today}</b></div><div class="stat">Empresas activas<b>{company_total}</b></div><div class="stat">Fecha seleccionada<b style="font-size:18px">{esc(selected_date)}</b></div>

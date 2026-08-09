@@ -1,0 +1,22 @@
+Urpicha v21.0
+
+Nuevas funciones:
+1. Base de datos administrativa: /admin/personas
+   - Buscar por nombre, DNI o área.
+   - Empresa.
+   - Total de almuerzos por persona.
+   - Primer y último pedido.
+2. Pantalla visual: /admin/resumen
+   - Total general del día.
+   - Total por empresa.
+   - Selector de fecha.
+   - Actualización automática cada 30 segundos.
+3. Cierre de pedidos:
+   - A las 14:00 (2:00 p. m.) hora de Perú se cierran los pedidos del día actual.
+   - Las fechas futuras continúan disponibles.
+   - La validación existe tanto en la pantalla como en el servidor.
+4. Copias de seguridad:
+   - SQLite se copia diariamente a datos/backups/pedidos_YYYY-MM-DD.db.
+   - Se conservan los últimos 30 backups.
+   - Se crea el backup del día al iniciar si todavía no existe.
+   - Para persistencia en Render, datos/ debe estar en Persistent Disk.

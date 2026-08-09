@@ -49,3 +49,7 @@ El dominio personalizado se configura en Render sobre el Web Service que esté e
 Las plantillas TALMA/POLICÍA ahora tienen respaldo embebido en `scanner_templates.py`.
 Aunque Render no encuentre la carpeta `templates`, los paneles `/admin/talma/` y `/admin/policia/` pueden cargar.
 También existe `/admin/scanner-diagnostico` para comprobar plantillas y Tesseract.
+
+
+## v21.0
+Persistent Disk recomendado: `/opt/render/project/src/datos`. Los backups diarios se guardan en `datos/backups/`.
