@@ -1538,7 +1538,7 @@ def _valid_talma_session(value: str | None) -> bool:
         return False
 
 
-def _talma_page(title: str, body: str) -> str:
+def _talma_page(title: str, body: str, extra: str = "") -> str:
     return page(title, f"""
 <main class="wrap">
 <div class="actions no-print" style="justify-content:space-between;margin-bottom:16px">
@@ -1574,8 +1574,32 @@ def _talma_login(error: bool = False):
 def talma_portal():
     if not _valid_talma_session(request.cookies.get("talma_session")):
         return _talma_login()
+
     orders_app.init_db()
     dni_filter = re.sub(r"\D", "", request.args.get("dni", ""))[:8]
+    fecha_desde = request.args.get("desde", "").strip()
+    fecha_hasta = request.args.get("hasta", "").strip()
+
+    # Si solo se indica una fecha, se usa como fecha única.
+    if fecha_desde and not fecha_hasta:
+        fecha_hasta = fecha_desde
+    if fecha_hasta and not fecha_desde:
+        fecha_desde = fecha_hasta
+
+    def valid_iso(value):
+        try:
+            datetime.strptime(value, "%Y-%m-%d")
+            return True
+        except ValueError:
+            return False
+
+    if fecha_desde and not valid_iso(fecha_desde):
+        fecha_desde = ""
+    if fecha_hasta and not valid_iso(fecha_hasta):
+        fecha_hasta = ""
+    if fecha_desde and fecha_hasta and fecha_desde > fecha_hasta:
+        fecha_desde, fecha_hasta = fecha_hasta, fecha_desde
+
     with orders_app.db() as conn:
         sql = """SELECT o.id, o.order_date, o.employee_name, o.dni, o.area, o.entry_item,
                         o.main_item, o.notes, o.created_at
@@ -1585,12 +1609,22 @@ def talma_portal():
         if dni_filter:
             sql += " AND o.dni=?"
             args.append(dni_filter)
-        sql += " ORDER BY CASE WHEN o.dni='' THEN 1 ELSE 0 END, o.dni, o.employee_name COLLATE NOCASE, o.order_date, o.id"
+        if fecha_desde:
+            sql += " AND o.order_date>=?"
+            args.append(fecha_desde)
+        if fecha_hasta:
+            sql += " AND o.order_date<=?"
+            args.append(fecha_hasta)
+        sql += """ ORDER BY o.order_date DESC,
+                   CASE WHEN o.dni='' THEN 1 ELSE 0 END,
+                   o.dni, o.employee_name COLLATE NOCASE, o.id"""
         rows = conn.execute(sql, args).fetchall()
+
     counts = {}
     for r in rows:
         key = r["dni"] or f"legacy:{orders_app.normalize_key(r['employee_name'])}"
         counts[key] = counts.get(key, 0) + 1
+
     running = {}
     table_rows = []
     for r in rows:
@@ -1601,39 +1635,87 @@ def talma_portal():
             f"<td>{esc(r['area'])}</td><td>{esc(r['entry_item'])}</td><td>{esc(r['main_item'])}</td>"
             f"<td>{running[key]}</td><td>{esc((r['created_at'] or '')[11:16])}</td></tr>"
         )
+
     summary = []
     for dni_key, total in sorted(counts.items(), key=lambda x: x[0]):
         rr = next((r for r in rows if (r["dni"] or f"legacy:{orders_app.normalize_key(r['employee_name'])}") == dni_key), None)
         label = rr["employee_name"] if rr else dni_key
         dni_label = rr["dni"] if rr and rr["dni"] else "Sin DNI (registro antiguo)"
-        summary.append(f"<tr><td><b>{esc(dni_label)}</b></td><td>{esc(label)}</td><td>{total}</td></tr>")
+        summary.append(
+            f"<tr><td><b>{esc(dni_label)}</b></td><td>{esc(label)}</td><td>{total}</td></tr>"
+        )
+
+    if fecha_desde and fecha_hasta:
+        periodo_label = (
+            f"{esc(orders_app.fecha_con_dia(fecha_desde))}"
+            if fecha_desde == fecha_hasta
+            else f"del <b>{esc(orders_app.fecha_con_dia(fecha_desde))}</b> "
+                 f"al <b>{esc(orders_app.fecha_con_dia(fecha_hasta))}</b>"
+        )
+    else:
+        periodo_label = "Todo el historial"
+
     body = f"""
-<div class="grid grid3">
-<div class="stat">Pedidos TALMA<b>{len(rows)}</b></div>
-<div class="stat">Personas<b>{len(counts)}</b></div>
-<div class="stat">Excel<b>Actualizable</b></div>
+<div class="hero-total">
+  <div class="hero-kicker">PEDIDOS TALMA</div>
+  <div class="hero-number">{len(rows)}</div>
+  <div class="hero-date">menús pedidos · {periodo_label}</div>
 </div>
+
+<div class="grid grid3">
+<div class="stat">Menús pedidos<b>{len(rows)}</b></div>
+<div class="stat">Personas<b>{len(counts)}</b></div>
+<div class="stat">Período<b>{periodo_label}</b></div>
+</div>
+
 <div class="card no-print">
-<h2>Buscar por DNI</h2>
+<h2>📅 Filtrar por fecha</h2>
+<form method="get" action="/talma" class="grid grid3">
+  <div>
+    <label>Desde</label>
+    <input type="date" name="desde" value="{esc(fecha_desde)}">
+  </div>
+  <div>
+    <label>Hasta</label>
+    <input type="date" name="hasta" value="{esc(fecha_hasta)}">
+  </div>
+  <div style="align-self:end">
+    <button type="submit">Ver período</button>
+    <a class="btn secondary" href="/talma">Todo el historial</a>
+  </div>
+</form>
+<p class="muted">Ejemplo: selecciona <b>8 de agosto</b> como inicio y <b>10 de agosto</b> como fin para saber cuántos menús se pidieron entre esas fechas.</p>
+</div>
+
+<div class="card no-print">
+<h2>🔎 Buscar por DNI</h2>
 <form method="get" action="/talma" class="actions">
+  <input type="hidden" name="desde" value="{esc(fecha_desde)}">
+  <input type="hidden" name="hasta" value="{esc(fecha_hasta)}">
   <input name="dni" value="{esc(dni_filter)}" inputmode="numeric" pattern="[0-9]{{8}}" maxlength="8" placeholder="DNI de 8 dígitos" style="max-width:260px">
   <button type="submit">Filtrar</button>
-  <a class="btn secondary" href="/talma">Limpiar</a>
+  <a class="btn secondary" href="/talma?desde={esc(fecha_desde)}&hasta={esc(fecha_hasta)}">Limpiar DNI</a>
 </form>
 <p class="muted">Para TALMA, el DNI es el identificador principal. Los registros antiguos sin DNI se muestran como "Sin DNI".</p>
 </div>
+
 <div class="card">
-<h2>Resumen por DNI</h2>
+<h2>Resumen por DNI — {periodo_label}</h2>
 <div class="table-wrap"><table><thead><tr><th>DNI</th><th>Persona</th><th>Total almuerzos</th></tr></thead>
-<tbody>{''.join(summary) or '<tr><td colspan="3">No hay pedidos.</td></tr>'}</tbody></table></div>
+<tbody>{''.join(summary) or '<tr><td colspan="3">No hay pedidos en este período.</td></tr>'}</tbody></table></div>
 </div>
+
 <div class="card">
-<h2>Todos los pedidos TALMA</h2>
+<h2>Pedidos TALMA — {periodo_label}</h2>
 <div class="table-wrap"><table><thead><tr><th>Fecha</th><th>DNI</th><th>Persona</th><th>Área</th><th>Entrada</th><th>Plato de fondo</th><th>N° Almuerzo</th><th>Hora</th></tr></thead>
-<tbody>{''.join(table_rows) or '<tr><td colspan="8">No hay pedidos.</td></tr>'}</tbody></table></div>
+<tbody>{''.join(table_rows) or '<tr><td colspan="8">No hay pedidos en este período.</td></tr>'}</tbody></table></div>
 </div>
 """
-    return _talma_page("TALMA", body)
+    extra = """<style>
+.hero-total{background:linear-gradient(135deg,#0f5132,#198754);color:white;border-radius:24px;padding:28px;text-align:center;margin-bottom:22px;box-shadow:0 14px 40px rgba(15,81,50,.20)}
+.hero-kicker{font-weight:800;letter-spacing:3px;font-size:14px}.hero-number{font-size:68px;font-weight:900;line-height:1;margin:8px 0}.hero-date{font-size:18px;font-weight:700}
+</style>"""
+    return _talma_page("TALMA", body, extra)
 
 
 @app.post("/talma/login")
@@ -1660,14 +1742,38 @@ def talma_excel():
     if not _valid_talma_session(request.cookies.get("talma_session")):
         return _talma_login()
     orders_app.init_db()
+    fecha_desde = request.args.get("desde", "").strip()
+    fecha_hasta = request.args.get("hasta", "").strip()
+    dni_filter = re.sub(r"\D", "", request.args.get("dni", ""))[:8]
+
+    def _valid_iso(value):
+        try:
+            datetime.strptime(value, "%Y-%m-%d")
+            return True
+        except ValueError:
+            return False
+
+    if fecha_desde and not _valid_iso(fecha_desde): fecha_desde = ""
+    if fecha_hasta and not _valid_iso(fecha_hasta): fecha_hasta = ""
+    if fecha_desde and not fecha_hasta: fecha_hasta = fecha_desde
+    if fecha_hasta and not fecha_desde: fecha_desde = fecha_hasta
+    if fecha_desde and fecha_hasta and fecha_desde > fecha_hasta:
+        fecha_desde, fecha_hasta = fecha_hasta, fecha_desde
+
     with orders_app.db() as conn:
-        rows = conn.execute(
-            """SELECT o.order_date, o.employee_name, o.dni, o.area, o.entry_item,
+        sql = """SELECT o.order_date, o.employee_name, o.dni, o.area, o.entry_item,
                       o.main_item, o.notes, o.created_at
                FROM orders o JOIN companies c ON c.id=o.company_id
-               WHERE c.slug='talma'
-               ORDER BY CASE WHEN o.dni='' THEN 1 ELSE 0 END, o.dni, o.employee_name COLLATE NOCASE, o.order_date, o.id"""
-        ).fetchall()
+               WHERE c.slug='talma'"""
+        args = []
+        if dni_filter:
+            sql += " AND o.dni=?"; args.append(dni_filter)
+        if fecha_desde:
+            sql += " AND o.order_date>=?"; args.append(fecha_desde)
+        if fecha_hasta:
+            sql += " AND o.order_date<=?"; args.append(fecha_hasta)
+        sql += " ORDER BY o.order_date, CASE WHEN o.dni='' THEN 1 ELSE 0 END, o.dni, o.employee_name COLLATE NOCASE, o.id"
+        rows = conn.execute(sql, args).fetchall()
     wb = Workbook()
     ws = wb.active
     ws.title = "Pedidos TALMA"
@@ -1699,7 +1805,8 @@ def talma_excel():
     output = io.BytesIO()
     wb.save(output)
     output.seek(0)
-    return send_file(output, as_attachment=True, download_name=f"pedidos_talma_{datetime.now():%Y_%m_%d}.xlsx",
+    suffix = f"_{fecha_desde}_a_{fecha_hasta}" if fecha_desde and fecha_hasta else "_historial_completo"
+    return send_file(output, as_attachment=True, download_name=f"pedidos_talma{suffix}.xlsx",
                      mimetype="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
 
 
