@@ -1,0 +1,11 @@
+Urpicha v21.2 FIXED
+Correcciones verificadas:
+- Error crítico NameError `countdown_html` en todos los portales de empresa.
+- Contador de cierre 11:30 a. m. se inicializa correctamente.
+- Portales de Liderman, Aeropuerto, Talma y Policía probados con sus tokens.
+- Descarga Excel por fecha probada en las 4 empresas.
+- Descarga PDF por fecha probada en las 4 empresas.
+- Panel admin, Personas, Resumen y CSV probados con sesión administrativa.
+- /health probado.
+- Se corrigió el uso del CSS extra del portal TALMA.
+- Todos los archivos Python compilan correctamente.

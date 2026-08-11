@@ -1548,6 +1548,7 @@ def _talma_page(title: str, body: str, extra: str = "") -> str:
 </div>
 {body}
 </main>
+{extra}
 """)
 
 

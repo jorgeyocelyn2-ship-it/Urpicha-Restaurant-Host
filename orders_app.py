@@ -698,23 +698,6 @@ class AppHandler(BaseHTTPRequestHandler):
             self.send_html(page("No encontrado", '<main class="wrap narrow"><div class="card"><h1>404</h1></div></main>'), 404)
 
     def home(self) -> None:
-        if requested_date == today_iso() and not is_order_closed(requested_date):
-            remaining=seconds_until_close()
-            countdown_html=f"""<div class="countdown-box" style="background:#fff7ed;border:2px solid #f79009;border-radius:14px;padding:14px;text-align:center;margin:14px 0;color:#7a2e0e"><b>⏳ Quedan <span id="countdown"></span> para el cierre de pedidos de hoy a las 11:30 a. m.</b></div>
-<script>
-(function(){{
- const end=Date.now()+{remaining}*1000, out=document.getElementById("countdown");
- function tick(){{
-  let n=Math.max(0,Math.floor((end-Date.now())/1000));
-  let h=Math.floor(n/3600),m=Math.floor((n%3600)/60),sec=n%60;
-  out.textContent=(h?String(h).padStart(2,"0")+" h ":"")+String(m).padStart(2,"0")+" min "+String(sec).padStart(2,"0")+" s";
-  if(n<=0) location.reload(); else setTimeout(tick,1000);
- }}
- tick();
-}})();
-</script>"""
-        else:
-            countdown_html=""
 
         body = f"""
 <main class="wrap narrow">
@@ -803,6 +786,26 @@ class AppHandler(BaseHTTPRequestHandler):
 <h2>Pedidos registrados</h2>
 <p class="muted">Todavía no hay pedidos registrados para esta fecha.</p>
 </div>"""
+
+        if requested_date == today_iso() and not is_order_closed(requested_date):
+            remaining = seconds_until_close()
+            countdown_html = f"""<div class="countdown-box" style="background:#fff7ed;border:2px solid #f79009;border-radius:14px;padding:14px;text-align:center;margin:14px 0;color:#7a2e0e">
+<b>⏳ Quedan <span id="countdown"></span> para el cierre de pedidos de hoy a las 11:30 a. m.</b>
+</div>
+<script>
+(function(){{
+ const end=Date.now()+{remaining}*1000, out=document.getElementById("countdown");
+ function tick(){{
+  let n=Math.max(0,Math.floor((end-Date.now())/1000));
+  let h=Math.floor(n/3600),m=Math.floor((n%3600)/60),sec=n%60;
+  out.textContent=(h?String(h).padStart(2,"0")+" h ":"")+String(m).padStart(2,"0")+" min "+String(sec).padStart(2,"0")+" s";
+  if(n<=0) location.reload(); else setTimeout(tick,1000);
+ }}
+ tick();
+}})();
+</script>"""
+        else:
+            countdown_html = ""
 
         body = f"""
 <main class="wrap narrow">
