@@ -826,10 +826,6 @@ class AppHandler(BaseHTTPRequestHandler):
 </div>
 <p class="muted">Fecha seleccionada: <b>{esc(fecha_con_dia(requested_date))}</b> · Hora límite: <b>11:30 a. m.</b> (hora de Perú)</p>
 {countdown_html}
-<div class="actions no-print" style="margin:12px 0;flex-wrap:wrap">
-<a class="btn secondary" href="/empresa/{esc(slug)}/excel?token={esc(token)}&fecha={esc(requested_date)}"> Excel de esta fecha</a>
-<a class="btn secondary" href="/empresa/{esc(slug)}/pdf?token={esc(token)}&fecha={esc(requested_date)}"> PDF de esta fecha</a>
-</div>
 {notice}
 <form method="post" action="/pedido/{esc(slug)}">
 <input type="hidden" name="token" value="{esc(token)}">
@@ -848,11 +844,11 @@ class AppHandler(BaseHTTPRequestHandler):
 {public_orders_html}
 
 <div class="card no-print" style="margin-top:24px">
-<h3>Historial completo</h3>
-<p class="muted">Descarga el registro completo de pedidos de esta empresa.</p>
+<h3>Reporte del día</h3>
+<p class="muted">Descarga los pedidos de la fecha seleccionada.</p>
 <div class="actions">
-<a class="btn secondary" href="/empresa/{esc(slug)}/excel?token={esc(token)}">Excel historial completo</a>
-<a class="btn secondary" href="/empresa/{esc(slug)}/pdf?token={esc(token)}">PDF historial completo</a>
+<a class="btn secondary" href="/empresa/{esc(slug)}/excel?token={esc(token)}&fecha={esc(requested_date)}">Excel del día</a>
+<a class="btn secondary" href="/empresa/{esc(slug)}/pdf?token={esc(token)}&fecha={esc(requested_date)}">PDF del día</a>
 </div>
 </div>
 </main>"""
@@ -928,6 +924,9 @@ class AppHandler(BaseHTTPRequestHandler):
         if not company:
             self.send_html(page("Enlace inválido",'<main class="wrap narrow"><div class="card"><h1>Enlace inválido</h1></div></main>'),403); return
         requested_date=query.get("fecha","").strip()
+        if not requested_date:
+            self.send_html(page("Fecha requerida", '<main class="wrap narrow"><div class="card"><h1>Fecha requerida</h1><p>Selecciona una fecha para descargar el reporte.</p></div></main>'), 400)
+            return
         rows=self._company_orders(company["id"],requested_date)
         wb=Workbook(); ws=wb.active; ws.title="Pedidos"
         headers=["Fecha","Nombre","DNI","Área / sede","Entrada","Plato de fondo","Observación","Tipo entrega","Hora"]
@@ -940,7 +939,7 @@ class AppHandler(BaseHTTPRequestHandler):
         for row in ws.iter_rows(min_row=2):
             for c in row: c.alignment=Alignment(vertical="top",wrap_text=True)
         out=io.BytesIO(); wb.save(out)
-        suffix=f"_{requested_date}" if requested_date else "_historial"
+        suffix=f"_{requested_date}"
         self.send_bytes(out.getvalue(),"application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",f"pedidos_{company['slug']}{suffix}.xlsx")
 
     def company_export_pdf(self, slug: str, query: dict[str,str]) -> None:
@@ -949,6 +948,9 @@ class AppHandler(BaseHTTPRequestHandler):
         if not company:
             self.send_html(page("Enlace inválido",'<main class="wrap narrow"><div class="card"><h1>Enlace inválido</h1></div></main>'),403); return
         requested_date=query.get("fecha","").strip()
+        if not requested_date:
+            self.send_html(page("Fecha requerida", '<main class="wrap narrow"><div class="card"><h1>Fecha requerida</h1><p>Selecciona una fecha para descargar el reporte.</p></div></main>'), 400)
+            return
         rows=self._company_orders(company["id"],requested_date)
         from reportlab.lib import colors
         from reportlab.lib.pagesizes import A4, landscape
@@ -961,7 +963,7 @@ class AppHandler(BaseHTTPRequestHandler):
         title=ParagraphStyle("ExportTitle",parent=styles["Title"],alignment=TA_CENTER,fontSize=18)
         small=ParagraphStyle("Small",parent=styles["BodyText"],fontSize=7,leading=9)
         story=[Paragraph(f"Pedidos — {html.escape(company['name'])}",title),
-               Paragraph(f"Fecha: {html.escape(requested_date)}" if requested_date else "Historial completo",styles["Normal"]),Spacer(1,8)]
+               Paragraph(f"Fecha: {html.escape(requested_date)}",styles["Normal"]),Spacer(1,8)]
         data=[["Fecha","Nombre","DNI","Área / sede","Entrada","Plato de fondo","Observación","Entrega","Hora"]]
         for r in rows:
             data.append([Paragraph(str(r["order_date"]),small),Paragraph(str(r["employee_name"]),small),Paragraph(str(r["dni"] or ""),small),Paragraph(str(r["area"] or ""),small),Paragraph(str(r["entry_item"]),small),Paragraph(str(r["main_item"]),small),Paragraph(str(r["notes"] or ""),small),Paragraph(str(r["delivery_type"] or ""),small),Paragraph(str((r["created_at"] or "")[11:16]),small)])

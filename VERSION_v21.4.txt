@@ -1,0 +1,6 @@
+Urpicha v21.4
+- Se eliminó completamente la opción de historial completo de los portales de empresa.
+- Se eliminó la exportación sin fecha: Excel/PDF requieren una fecha.
+- Los botones Excel del día y PDF del día están únicamente al final del portal.
+- Los reportes corresponden exclusivamente a la fecha seleccionada.
+- Se mantuvo el resto del sistema sin cambios.
