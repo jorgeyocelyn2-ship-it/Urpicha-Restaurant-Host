@@ -1,0 +1,9 @@
+Urpicha v21.3 CLEAN
+- Se eliminaron los emojis de la interfaz del sistema.
+- Se mantuvieron tildes, ñ y caracteres normales del español.
+- En todos los portales de empresa, Excel/PDF de la fecha quedan arriba.
+- Excel/PDF del historial completo se movieron al final de la página.
+- Se probaron los 4 portales: Liderman, Aeropuerto, Talma y Policía.
+- Se probaron Excel y PDF de los 4 portales.
+- Se probaron dashboard, personas, resumen y CSV del administrador.
+- 24/24 comprobaciones de regresión correctas.

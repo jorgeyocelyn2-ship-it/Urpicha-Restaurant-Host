@@ -742,10 +742,10 @@ class AppHandler(BaseHTTPRequestHandler):
 
         if is_order_closed(requested_date):
             wa=self.whatsapp_link(f"Hola, necesito realizar un pedido fuera de horario para {company['name']}.")
-            wa_button=(f'<a class="btn" target="_blank" rel="noopener" href="{esc(wa)}">💬 Comunicarme por WhatsApp</a>'
+            wa_button=(f'<a class="btn" target="_blank" rel="noopener" href="{esc(wa)}"> Comunicarme por WhatsApp</a>'
                        if wa else '<p><b>Comunícate por WhatsApp con el responsable de la empresa para coordinar la entrega.</b></p>')
             menu_html=f"""<div class="notice error">
-<b>🔒 Pedidos cerrados</b>
+<b> Pedidos cerrados</b>
 <p>Los pedidos para <b>{esc(fecha_con_dia(requested_date))}</b> se cerraron a las <b>11:30 a. m.</b> (hora de Perú).</p>
 {wa_button}
 </div>"""
@@ -790,7 +790,7 @@ class AppHandler(BaseHTTPRequestHandler):
         if requested_date == today_iso() and not is_order_closed(requested_date):
             remaining = seconds_until_close()
             countdown_html = f"""<div class="countdown-box" style="background:#fff7ed;border:2px solid #f79009;border-radius:14px;padding:14px;text-align:center;margin:14px 0;color:#7a2e0e">
-<b>⏳ Quedan <span id="countdown"></span> para el cierre de pedidos de hoy a las 11:30 a. m.</b>
+<b> Quedan <span id="countdown"></span> para el cierre de pedidos de hoy a las 11:30 a. m.</b>
 </div>
 <script>
 (function(){{
@@ -827,10 +827,8 @@ class AppHandler(BaseHTTPRequestHandler):
 <p class="muted">Fecha seleccionada: <b>{esc(fecha_con_dia(requested_date))}</b> · Hora límite: <b>11:30 a. m.</b> (hora de Perú)</p>
 {countdown_html}
 <div class="actions no-print" style="margin:12px 0;flex-wrap:wrap">
-<a class="btn secondary" href="/empresa/{esc(slug)}/excel?token={esc(token)}&fecha={esc(requested_date)}">📊 Excel de esta fecha</a>
-<a class="btn secondary" href="/empresa/{esc(slug)}/pdf?token={esc(token)}&fecha={esc(requested_date)}">📄 PDF de esta fecha</a>
-<a class="btn secondary" href="/empresa/{esc(slug)}/excel?token={esc(token)}">📚 Excel historial completo</a>
-<a class="btn secondary" href="/empresa/{esc(slug)}/pdf?token={esc(token)}">📚 PDF historial completo</a>
+<a class="btn secondary" href="/empresa/{esc(slug)}/excel?token={esc(token)}&fecha={esc(requested_date)}"> Excel de esta fecha</a>
+<a class="btn secondary" href="/empresa/{esc(slug)}/pdf?token={esc(token)}&fecha={esc(requested_date)}"> PDF de esta fecha</a>
 </div>
 {notice}
 <form method="post" action="/pedido/{esc(slug)}">
@@ -848,6 +846,15 @@ class AppHandler(BaseHTTPRequestHandler):
 </form>
 </div>
 {public_orders_html}
+
+<div class="card no-print" style="margin-top:24px">
+<h3>Historial completo</h3>
+<p class="muted">Descarga el registro completo de pedidos de esta empresa.</p>
+<div class="actions">
+<a class="btn secondary" href="/empresa/{esc(slug)}/excel?token={esc(token)}">Excel historial completo</a>
+<a class="btn secondary" href="/empresa/{esc(slug)}/pdf?token={esc(token)}">PDF historial completo</a>
+</div>
+</div>
 </main>"""
         self.send_html(page("Realizar pedido", body))
 
@@ -1025,7 +1032,7 @@ class AppHandler(BaseHTTPRequestHandler):
 
         body=f"""
 <main class="wrap">
-<div class="actions no-print" style="justify-content:space-between;margin-bottom:16px"><h1 style="margin:0">👥 Base de datos · Personas y consumo</h1><a href="/admin/dashboard">← Pedidos</a></div>
+<div class="actions no-print" style="justify-content:space-between;margin-bottom:16px"><h1 style="margin:0"> Base de datos · Personas y consumo</h1><a href="/admin/dashboard">← Pedidos</a></div>
 <div class="card no-print"><h2>Buscar persona</h2>
 <form method="get" action="/admin/personas" class="grid grid3">
 <div><label>Nombre, DNI o área</label><input name="buscar" value="{esc(search)}" placeholder="Ej. Juan, 76543210, RAMPA"></div>
@@ -1059,7 +1066,7 @@ class AppHandler(BaseHTTPRequestHandler):
         cards="".join(f'<div class="big-company-card"><div class="company-name">{esc(r["name"])}</div><div class="company-total">{r["total"]}</div><div class="company-label">MENÚS / PEDIDOS</div></div>' for r in company_rows)
         body=f"""
 <main class="wrap">
-<div class="actions no-print" style="justify-content:space-between;margin-bottom:16px"><h1 style="margin:0">📊 Resumen de almuerzos</h1><a href="/admin/dashboard">← Panel</a></div>
+<div class="actions no-print" style="justify-content:space-between;margin-bottom:16px"><h1 style="margin:0"> Resumen de almuerzos</h1><a href="/admin/dashboard">← Panel</a></div>
 <div class="card no-print"><form method="get" action="/admin/resumen" class="actions" style="align-items:end">
 <div><label>Fecha</label><input type="date" name="fecha" value="{esc(selected_date)}" required></div><button>Actualizar</button>
 <a class="btn secondary" href="/admin/resumen?fecha={today_iso()}">Hoy</a></form></div>
@@ -1138,7 +1145,7 @@ class AppHandler(BaseHTTPRequestHandler):
         main_rows = "".join(f"<li>{esc(r['main_item'])}: <b>{r['qty']}</b></li>" for r in main_summary) or "<li>Sin pedidos</li>"
         export_params = urlencode({"fecha": selected_date, "empresa": selected_company})
         if query.get("ok"):
-            notice = f'<div class="notice ok">✓ Menú guardado correctamente para <b>{esc(selected_date)}</b>. Se volvió a leer desde la base de datos para comprobar que quedó almacenado.</div>'
+            notice = f'<div class="notice ok"> Menú guardado correctamente para <b>{esc(selected_date)}</b>. Se volvió a leer desde la base de datos para comprobar que quedó almacenado.</div>'
         elif query.get("menu_error"):
             notice = f'<div class="notice error">{esc(query["menu_error"])}</div>'
         else:
@@ -1147,14 +1154,14 @@ class AppHandler(BaseHTTPRequestHandler):
         body = f"""
 <main class="wrap">
 <div class="actions no-print" style="justify-content:space-between;margin-bottom:16px"><h1 style="margin:0">Panel administrador</h1><a href="/admin/logout">Cerrar sesión</a></div>
-<div class="admin-tabs no-print"><a class="active" href="/admin/dashboard">Pedidos</a><a href="/admin/personas">👥 Personas y consumo</a><a href="/admin/resumen">📊 Resumen visual</a><a href="/admin/talma/">TALMA</a><a href="/admin/policia/">POLICÍA</a></div>
+<div class="admin-tabs no-print"><a class="active" href="/admin/dashboard">Pedidos</a><a href="/admin/personas"> Personas y consumo</a><a href="/admin/resumen"> Resumen visual</a><a href="/admin/talma/">TALMA</a><a href="/admin/policia/">POLICÍA</a></div>
 {notice}
 <div class="grid grid3">
 <div class="stat">Pedidos del día<b>{total_today}</b></div><div class="stat">Empresas activas<b>{company_total}</b></div><div class="stat">Fecha seleccionada<b style="font-size:18px">{esc(selected_date)}</b></div>
 </div>
 
 <div class="card no-print">
-<h2>🔎 Consultar menú de cualquier día</h2>
+<h2> Consultar menú de cualquier día</h2>
 <form method="get" action="/admin/dashboard" class="actions" style="align-items:end;gap:12px;flex-wrap:wrap">
   <div>
     <label>Selecciona una fecha</label>
@@ -1209,7 +1216,7 @@ class AppHandler(BaseHTTPRequestHandler):
 </div>
 
 <div class="card no-print" id="excel-historico">
-<h2>📊 Actualizar un Excel pasado / reporte histórico</h2>
+<h2> Actualizar un Excel pasado / reporte histórico</h2>
 <p class="muted">Esta opción está dentro del panel de <b>Pedidos</b>. Sube aquí un Excel de días o meses anteriores y el sistema lo combinará con los pedidos que ya están registrados actualmente.</p>
 <div class="grid grid2">
   <div>

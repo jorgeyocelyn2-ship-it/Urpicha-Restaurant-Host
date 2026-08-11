@@ -1670,7 +1670,7 @@ def talma_portal():
 </div>
 
 <div class="card no-print">
-<h2>📅 Filtrar por fecha</h2>
+<h2> Filtrar por fecha</h2>
 <form method="get" action="/talma" class="grid grid3">
   <div>
     <label>Desde</label>
@@ -1689,7 +1689,7 @@ def talma_portal():
 </div>
 
 <div class="card no-print">
-<h2>🔎 Buscar por DNI</h2>
+<h2> Buscar por DNI</h2>
 <form method="get" action="/talma" class="actions">
   <input type="hidden" name="desde" value="{esc(fecha_desde)}">
   <input type="hidden" name="hasta" value="{esc(fecha_hasta)}">
