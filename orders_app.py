@@ -50,7 +50,7 @@ DEFAULT_CONFIG = {
     "restaurant_name": "Mi Restaurante",
     "admin_password": "cambiar123",
     "secret_key": secrets.token_hex(32),
-    "order_deadline": "10:30",
+    "order_deadline": "11:30",
 }
 
 # Empresas que siempre deben existir en el sistema.
@@ -250,11 +250,16 @@ def start_backup_worker() -> None:
 
 
 def is_order_closed(order_date: str) -> bool:
-    """Cierra únicamente los pedidos del día actual a las 14:00, hora de Perú."""
+    """Cierra los pedidos del día actual a las 11:30, hora de Perú."""
     if order_date != today_iso():
         return False
     now = local_now()
-    return (now.hour, now.minute, now.second) >= (14, 0, 0)
+    return (now.hour, now.minute, now.second) >= (11, 30, 0)
+
+def seconds_until_close() -> int:
+    now = local_now()
+    close = now.replace(hour=11, minute=30, second=0, microsecond=0)
+    return max(0, int((close-now).total_seconds()))
 
 
 def normalize_key(text: str) -> str:
@@ -658,6 +663,10 @@ class AppHandler(BaseHTTPRequestHandler):
         elif path == "/admin/cupones":
             if self.require_admin():
                 self.coupons(query)
+        elif path.startswith("/empresa/") and path.endswith("/excel"):
+            self.company_export_excel(path.split("/")[2], query)
+        elif path.startswith("/empresa/") and path.endswith("/pdf"):
+            self.company_export_pdf(path.split("/")[2], query)
         elif path.startswith("/empresa/"):
             self.employee_form(path.split("/", 2)[2], query)
         else:
@@ -689,6 +698,24 @@ class AppHandler(BaseHTTPRequestHandler):
             self.send_html(page("No encontrado", '<main class="wrap narrow"><div class="card"><h1>404</h1></div></main>'), 404)
 
     def home(self) -> None:
+        if requested_date == today_iso() and not is_order_closed(requested_date):
+            remaining=seconds_until_close()
+            countdown_html=f"""<div class="countdown-box" style="background:#fff7ed;border:2px solid #f79009;border-radius:14px;padding:14px;text-align:center;margin:14px 0;color:#7a2e0e"><b>⏳ Quedan <span id="countdown"></span> para el cierre de pedidos de hoy a las 11:30 a. m.</b></div>
+<script>
+(function(){{
+ const end=Date.now()+{remaining}*1000, out=document.getElementById("countdown");
+ function tick(){{
+  let n=Math.max(0,Math.floor((end-Date.now())/1000));
+  let h=Math.floor(n/3600),m=Math.floor((n%3600)/60),sec=n%60;
+  out.textContent=(h?String(h).padStart(2,"0")+" h ":"")+String(m).padStart(2,"0")+" min "+String(sec).padStart(2,"0")+" s";
+  if(n<=0) location.reload(); else setTimeout(tick,1000);
+ }}
+ tick();
+}})();
+</script>"""
+        else:
+            countdown_html=""
+
         body = f"""
 <main class="wrap narrow">
 <div class="card">
@@ -699,6 +726,10 @@ class AppHandler(BaseHTTPRequestHandler):
 </div>
 </main>"""
         self.send_html(page("Inicio", body))
+
+    def whatsapp_link(self, message: str = "") -> str:
+        number=re.sub(r"\D","",os.environ.get("WHATSAPP_NUMBER",str(CONFIG.get("whatsapp_number",""))))
+        return f"https://wa.me/{number}?text={quote(message)}" if number else ""
 
     def employee_form(self, slug: str, query: dict[str, str]) -> None:
         token = query.get("token", "")
@@ -727,8 +758,15 @@ class AppHandler(BaseHTTPRequestHandler):
             notice = f'<div class="notice error">{esc(query["error"])}</div>'
 
         if is_order_closed(requested_date):
-            menu_html = f'<div class="notice error"><b>Pedidos cerrados.</b><br>Los pedidos para {esc(fecha_con_dia(requested_date))} se cerraron a las 2:00 p. m. (hora de Perú). Puedes consultar fechas futuras.</div>'
-            submit = ""
+            wa=self.whatsapp_link(f"Hola, necesito realizar un pedido fuera de horario para {company['name']}.")
+            wa_button=(f'<a class="btn" target="_blank" rel="noopener" href="{esc(wa)}">💬 Comunicarme por WhatsApp</a>'
+                       if wa else '<p><b>Comunícate por WhatsApp con el responsable de la empresa para coordinar la entrega.</b></p>')
+            menu_html=f"""<div class="notice error">
+<b>🔒 Pedidos cerrados</b>
+<p>Los pedidos para <b>{esc(fecha_con_dia(requested_date))}</b> se cerraron a las <b>11:30 a. m.</b> (hora de Perú).</p>
+{wa_button}
+</div>"""
+            submit=""
         elif not menu["entrada"] or not menu["fondo"]:
             menu_html = '<div class="notice error">Todavía no se ha publicado un menú completo para esta fecha.</div>'
             submit = ""
@@ -783,7 +821,14 @@ class AppHandler(BaseHTTPRequestHandler):
   </form>
   <p class="muted" style="margin-bottom:0">Puedes elegir hoy o una fecha futura. El pedido quedará registrado para la fecha seleccionada.</p>
 </div>
-<p class="muted">Fecha seleccionada: <b>{esc(fecha_con_dia(requested_date))}</b> · Hora límite referencial: {esc(CONFIG.get('order_deadline',''))}</p>
+<p class="muted">Fecha seleccionada: <b>{esc(fecha_con_dia(requested_date))}</b> · Hora límite: <b>11:30 a. m.</b> (hora de Perú)</p>
+{countdown_html}
+<div class="actions no-print" style="margin:12px 0;flex-wrap:wrap">
+<a class="btn secondary" href="/empresa/{esc(slug)}/excel?token={esc(token)}&fecha={esc(requested_date)}">📊 Excel de esta fecha</a>
+<a class="btn secondary" href="/empresa/{esc(slug)}/pdf?token={esc(token)}&fecha={esc(requested_date)}">📄 PDF de esta fecha</a>
+<a class="btn secondary" href="/empresa/{esc(slug)}/excel?token={esc(token)}">📚 Excel historial completo</a>
+<a class="btn secondary" href="/empresa/{esc(slug)}/pdf?token={esc(token)}">📚 PDF historial completo</a>
+</div>
 {notice}
 <form method="post" action="/pedido/{esc(slug)}">
 <input type="hidden" name="token" value="{esc(token)}">
@@ -827,7 +872,7 @@ class AppHandler(BaseHTTPRequestHandler):
         if order_date < today_iso():
             error = "No se pueden registrar pedidos para una fecha pasada."
         if is_order_closed(order_date):
-            error = "Los pedidos del día actual se cierran a las 2:00 p. m. (hora de Perú). Puede seleccionar una fecha futura."
+            error = "Los pedidos del día actual se cierran a las 11:30 a. m. (hora de Perú). Si necesita un pedido fuera de horario, comuníquese por WhatsApp para coordinar la entrega."
         if len(name) < 3:
             error = "Ingrese su nombre y apellido."
         if is_talma and not re.fullmatch(r"\d{8}", dni):
@@ -854,6 +899,68 @@ class AppHandler(BaseHTTPRequestHandler):
             self.redirect(f"/empresa/{quote(slug)}?{params}")
             return
         self.redirect(f"/empresa/{quote(slug)}?{urlencode({'token':token,'fecha':order_date,'ok':'1'})}")
+
+    def _company_orders(self, company_id: int, order_date: str = ""):
+        with db() as conn:
+            sql = """SELECT o.id,o.order_date,o.employee_name,o.dni,o.area,o.entry_item,
+                            o.main_item,o.notes,o.delivery_type,o.created_at
+                     FROM orders o WHERE o.company_id=?"""
+            args=[company_id]
+            if order_date:
+                sql += " AND o.order_date=?"
+                args.append(order_date)
+            sql += " ORDER BY o.order_date DESC,o.employee_name COLLATE NOCASE,o.id"
+            return conn.execute(sql,args).fetchall()
+
+    def company_export_excel(self, slug: str, query: dict[str,str]) -> None:
+        token=query.get("token","")
+        company=get_company(slug,token)
+        if not company:
+            self.send_html(page("Enlace inválido",'<main class="wrap narrow"><div class="card"><h1>Enlace inválido</h1></div></main>'),403); return
+        requested_date=query.get("fecha","").strip()
+        rows=self._company_orders(company["id"],requested_date)
+        wb=Workbook(); ws=wb.active; ws.title="Pedidos"
+        headers=["Fecha","Nombre","DNI","Área / sede","Entrada","Plato de fondo","Observación","Tipo entrega","Hora"]
+        ws.append(headers)
+        for r in rows:
+            ws.append([r["order_date"],r["employee_name"],r["dni"] or "",r["area"] or "",r["entry_item"],r["main_item"],r["notes"] or "",r["delivery_type"] or "",(r["created_at"] or "")[11:16]])
+        for i,w in enumerate([14,32,15,20,34,38,45,22,10],1): ws.column_dimensions[get_column_letter(i)].width=w
+        for c in ws[1]:
+            c.font=Font(bold=True,color="FFFFFF"); c.fill=PatternFill("solid",fgColor="176B43"); c.alignment=Alignment(horizontal="center")
+        for row in ws.iter_rows(min_row=2):
+            for c in row: c.alignment=Alignment(vertical="top",wrap_text=True)
+        out=io.BytesIO(); wb.save(out)
+        suffix=f"_{requested_date}" if requested_date else "_historial"
+        self.send_bytes(out.getvalue(),"application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",f"pedidos_{company['slug']}{suffix}.xlsx")
+
+    def company_export_pdf(self, slug: str, query: dict[str,str]) -> None:
+        token=query.get("token","")
+        company=get_company(slug,token)
+        if not company:
+            self.send_html(page("Enlace inválido",'<main class="wrap narrow"><div class="card"><h1>Enlace inválido</h1></div></main>'),403); return
+        requested_date=query.get("fecha","").strip()
+        rows=self._company_orders(company["id"],requested_date)
+        from reportlab.lib import colors
+        from reportlab.lib.pagesizes import A4, landscape
+        from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+        from reportlab.lib.enums import TA_CENTER
+        from reportlab.platypus import SimpleDocTemplate,Table,TableStyle,Paragraph,Spacer
+        out=io.BytesIO()
+        doc=SimpleDocTemplate(out,pagesize=landscape(A4),rightMargin=20,leftMargin=20,topMargin=20,bottomMargin=20)
+        styles=getSampleStyleSheet()
+        title=ParagraphStyle("ExportTitle",parent=styles["Title"],alignment=TA_CENTER,fontSize=18)
+        small=ParagraphStyle("Small",parent=styles["BodyText"],fontSize=7,leading=9)
+        story=[Paragraph(f"Pedidos — {html.escape(company['name'])}",title),
+               Paragraph(f"Fecha: {html.escape(requested_date)}" if requested_date else "Historial completo",styles["Normal"]),Spacer(1,8)]
+        data=[["Fecha","Nombre","DNI","Área / sede","Entrada","Plato de fondo","Observación","Entrega","Hora"]]
+        for r in rows:
+            data.append([Paragraph(str(r["order_date"]),small),Paragraph(str(r["employee_name"]),small),Paragraph(str(r["dni"] or ""),small),Paragraph(str(r["area"] or ""),small),Paragraph(str(r["entry_item"]),small),Paragraph(str(r["main_item"]),small),Paragraph(str(r["notes"] or ""),small),Paragraph(str(r["delivery_type"] or ""),small),Paragraph(str((r["created_at"] or "")[11:16]),small)])
+        table=Table(data,repeatRows=1,colWidths=[48,95,55,65,100,105,125,65,35])
+        table.setStyle(TableStyle([("BACKGROUND",(0,0),(-1,0),colors.HexColor("#176B43")),("TEXTCOLOR",(0,0),(-1,0),colors.white),("FONTNAME",(0,0),(-1,0),"Helvetica-Bold"),("GRID",(0,0),(-1,-1),.35,colors.HexColor("#D0D5DD")),("VALIGN",(0,0),(-1,-1),"TOP"),("FONTSIZE",(0,0),(-1,-1),7)]))
+        story += [table,Spacer(1,8),Paragraph(f"Total de pedidos: {len(rows)}",styles["Heading3"])]
+        doc.build(story); out.seek(0)
+        suffix=requested_date or "historial"
+        self.send_bytes(out.getvalue(),"application/pdf",f"pedidos_{company['slug']}_{suffix}.pdf")
 
     def admin_login(self, error: str | None) -> None:
         if self.is_admin():

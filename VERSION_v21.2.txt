@@ -1,0 +1,7 @@
+Urpicha v21.2
+- Excel y PDF descargables desde cada enlace de empresa.
+- Exportaciones con todos los campos: fecha, nombre, DNI, área/sede, entrada, fondo, observación, entrega y hora.
+- Exportación por fecha seleccionada o historial completo.
+- Cierre del día a las 11:30 a. m. hora de Perú.
+- Contador regresivo en los pedidos del día.
+- Al cerrar, se muestra opción de WhatsApp si WHATSAPP_NUMBER/config whatsapp_number está configurado.
