@@ -1,0 +1,8 @@
+Urpicha v23.0 - reparación integral de TALMA
+
+Correcciones:
+- Los usuarios manuales ahora mantienen la sesión después de iniciar sesión.
+- La administración de personas está dentro de /talma/usuarios, accesible desde /talma.
+- Se pueden listar usuarios del Excel y manuales, añadir, editar y desactivar.
+- El enlace de pedidos sigue separado en /empresa/talma y usa el acceso por correo + código.
+- Cuponera/tickets se conserva.

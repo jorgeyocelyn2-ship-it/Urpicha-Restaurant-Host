@@ -484,7 +484,7 @@ def valid_talma_employee_session(value: str | None) -> dict | None:
         expected = hmac.new(CONFIG["secret_key"].encode(), payload.encode(), hashlib.sha256).hexdigest()
         if not hmac.compare_digest(sig, expected):
             return None
-        return TALMA_ROSTER.get(f"{email.lower()}|{codigo}")
+        return resolve_talma_login(email, codigo)
     except (ValueError, TypeError):
         return None
 
