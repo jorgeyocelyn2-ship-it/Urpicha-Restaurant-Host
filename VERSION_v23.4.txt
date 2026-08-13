@@ -1,0 +1,9 @@
+Urpicha v23.4
+- Portal administrativo TALMA: filtro individual cambiado de DNI a Código.
+- Resumen por persona ahora agrupa por Código.
+- Tabla de pedidos TALMA muestra Código.
+- Exportación Excel TALMA mantiene el mismo formato, filtros por fecha y resumen,
+  pero sustituye DNI por Código.
+- La actualización/reporte diario mantiene su estructura, cantidades, entradas,
+  platos de fondo, observaciones y horas.
+- Se mantiene el cierre de pedidos, login TALMA y cuponera sin cambios.

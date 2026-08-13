@@ -1783,7 +1783,7 @@ def talma_portal():
         return _talma_login()
 
     orders_app.init_db()
-    dni_filter = re.sub(r"\D", "", request.args.get("dni", ""))[:8]
+    codigo_filter = request.args.get("codigo", "").strip()[:40]
     fecha_desde = request.args.get("desde", "").strip()
     fecha_hasta = request.args.get("hasta", "").strip()
 
@@ -1808,14 +1808,15 @@ def talma_portal():
         fecha_desde, fecha_hasta = fecha_hasta, fecha_desde
 
     with orders_app.db() as conn:
-        sql = """SELECT o.id, o.order_date, o.employee_name, o.dni, o.area, o.entry_item,
-                        o.main_item, o.notes, o.created_at
+        sql = """SELECT o.id, o.order_date, o.employee_name,
+                        COALESCE(NULLIF(o.login_code, ''), NULLIF(o.employee_key, '')) AS codigo,
+                        o.area, o.entry_item, o.main_item, o.notes, o.created_at
                  FROM orders o JOIN companies c ON c.id=o.company_id
                  WHERE c.slug='talma'"""
         args = []
-        if dni_filter:
-            sql += " AND o.dni=?"
-            args.append(dni_filter)
+        if codigo_filter:
+            sql += " AND o.login_code=?"
+            args.append(codigo_filter)
         if fecha_desde:
             sql += " AND o.order_date>=?"
             args.append(fecha_desde)
@@ -1823,33 +1824,33 @@ def talma_portal():
             sql += " AND o.order_date<=?"
             args.append(fecha_hasta)
         sql += """ ORDER BY o.order_date DESC,
-                   CASE WHEN o.dni='' THEN 1 ELSE 0 END,
-                   o.dni, o.employee_name COLLATE NOCASE, o.id"""
+                   CASE WHEN o.login_code='' THEN 1 ELSE 0 END,
+                   o.login_code, o.employee_name COLLATE NOCASE, o.id"""
         rows = conn.execute(sql, args).fetchall()
 
     counts = {}
     for r in rows:
-        key = r["dni"] or f"legacy:{orders_app.normalize_key(r['employee_name'])}"
+        key = r["codigo"] or f"legacy:{orders_app.normalize_key(r['employee_name'])}"
         counts[key] = counts.get(key, 0) + 1
 
     running = {}
     table_rows = []
     for r in rows:
-        key = r["dni"] or f"legacy:{orders_app.normalize_key(r['employee_name'])}"
+        key = r["codigo"] or f"legacy:{orders_app.normalize_key(r['employee_name'])}"
         running[key] = running.get(key, 0) + 1
         table_rows.append(
-            f"<tr><td>{esc(r['order_date'])}</td><td><b>{esc(r['dni'] or '—')}</b></td><td>{esc(r['employee_name'])}</td>"
+            f"<tr><td>{esc(r['order_date'])}</td><td><b>{esc(r['codigo'] or '—')}</b></td><td>{esc(r['employee_name'])}</td>"
             f"<td>{esc(r['area'])}</td><td>{esc(r['entry_item'])}</td><td>{esc(r['main_item'])}</td>"
             f"<td>{running[key]}</td><td>{esc((r['created_at'] or '')[11:16])}</td></tr>"
         )
 
     summary = []
-    for dni_key, total in sorted(counts.items(), key=lambda x: x[0]):
-        rr = next((r for r in rows if (r["dni"] or f"legacy:{orders_app.normalize_key(r['employee_name'])}") == dni_key), None)
-        label = rr["employee_name"] if rr else dni_key
-        dni_label = rr["dni"] if rr and rr["dni"] else "Sin DNI (registro antiguo)"
+    for codigo_key, total in sorted(counts.items(), key=lambda x: x[0]):
+        rr = next((r for r in rows if (r["codigo"] or f"legacy:{orders_app.normalize_key(r['employee_name'])}") == codigo_key), None)
+        label = rr["employee_name"] if rr else codigo_key
+        codigo_label = rr["codigo"] if rr and rr["codigo"] else "Sin código (registro antiguo)"
         summary.append(
-            f"<tr><td><b>{esc(dni_label)}</b></td><td>{esc(label)}</td><td>{total}</td></tr>"
+            f"<tr><td><b>{esc(codigo_label)}</b></td><td>{esc(label)}</td><td>{total}</td></tr>"
         )
 
     if fecha_desde and fecha_hasta:
@@ -1895,26 +1896,26 @@ def talma_portal():
 </div>
 
 <div class="card no-print">
-<h2> Buscar por DNI</h2>
+<h2>Buscar por código</h2>
 <form method="get" action="/talma" class="actions">
   <input type="hidden" name="desde" value="{esc(fecha_desde)}">
   <input type="hidden" name="hasta" value="{esc(fecha_hasta)}">
-  <input name="dni" value="{esc(dni_filter)}" inputmode="numeric" pattern="[0-9]{{8}}" maxlength="8" placeholder="DNI de 8 dígitos" style="max-width:260px">
+  <input name="codigo" value="{esc(codigo_filter)}" maxlength="40" placeholder="Código del trabajador" style="max-width:260px">
   <button type="submit">Filtrar</button>
-  <a class="btn secondary" href="/talma?desde={esc(fecha_desde)}&hasta={esc(fecha_hasta)}">Limpiar DNI</a>
+  <a class="btn secondary" href="/talma?desde={esc(fecha_desde)}&hasta={esc(fecha_hasta)}">Limpiar código</a>
 </form>
-<p class="muted">Para TALMA, el DNI es el identificador principal. Los registros antiguos sin DNI se muestran como "Sin DNI".</p>
+<p class="muted">Para TALMA, el código del trabajador es el identificador principal. Los registros antiguos sin código se muestran como "Sin código".</p>
 </div>
 
 <div class="card">
-<h2>Resumen por DNI — {periodo_label}</h2>
-<div class="table-wrap"><table><thead><tr><th>DNI</th><th>Persona</th><th>Total almuerzos</th></tr></thead>
+<h2>Resumen por código — {periodo_label}</h2>
+<div class="table-wrap"><table><thead><tr><th>Código</th><th>Persona</th><th>Total almuerzos</th></tr></thead>
 <tbody>{''.join(summary) or '<tr><td colspan="3">No hay pedidos en este período.</td></tr>'}</tbody></table></div>
 </div>
 
 <div class="card">
 <h2>Pedidos TALMA — {periodo_label}</h2>
-<div class="table-wrap"><table><thead><tr><th>Fecha</th><th>DNI</th><th>Persona</th><th>Área</th><th>Entrada</th><th>Plato de fondo</th><th>N° Almuerzo</th><th>Hora</th></tr></thead>
+<div class="table-wrap"><table><thead><tr><th>Fecha</th><th>Código</th><th>Persona</th><th>Área</th><th>Entrada</th><th>Plato de fondo</th><th>N° Almuerzo</th><th>Hora</th></tr></thead>
 <tbody>{''.join(table_rows) or '<tr><td colspan="8">No hay pedidos en este período.</td></tr>'}</tbody></table></div>
 </div>
 """
@@ -2133,7 +2134,7 @@ def talma_excel():
     orders_app.init_db()
     fecha_desde = request.args.get("desde", "").strip()
     fecha_hasta = request.args.get("hasta", "").strip()
-    dni_filter = re.sub(r"\D", "", request.args.get("dni", ""))[:8]
+    codigo_filter = request.args.get("codigo", "").strip()[:40]
 
     def _valid_iso(value):
         try:
@@ -2150,29 +2151,30 @@ def talma_excel():
         fecha_desde, fecha_hasta = fecha_hasta, fecha_desde
 
     with orders_app.db() as conn:
-        sql = """SELECT o.order_date, o.employee_name, o.dni, o.area, o.entry_item,
-                      o.main_item, o.notes, o.created_at
+        sql = """SELECT o.order_date, o.employee_name,
+                      COALESCE(NULLIF(o.login_code, ''), NULLIF(o.employee_key, '')) AS codigo,
+                      o.area, o.entry_item, o.main_item, o.notes, o.created_at
                FROM orders o JOIN companies c ON c.id=o.company_id
                WHERE c.slug='talma'"""
         args = []
-        if dni_filter:
-            sql += " AND o.dni=?"; args.append(dni_filter)
+        if codigo_filter:
+            sql += " AND o.login_code=?"; args.append(codigo_filter)
         if fecha_desde:
             sql += " AND o.order_date>=?"; args.append(fecha_desde)
         if fecha_hasta:
             sql += " AND o.order_date<=?"; args.append(fecha_hasta)
-        sql += " ORDER BY o.order_date, CASE WHEN o.dni='' THEN 1 ELSE 0 END, o.dni, o.employee_name COLLATE NOCASE, o.id"
+        sql += " ORDER BY o.order_date, CASE WHEN o.login_code='' THEN 1 ELSE 0 END, o.login_code, o.employee_name COLLATE NOCASE, o.id"
         rows = conn.execute(sql, args).fetchall()
     wb = Workbook()
     ws = wb.active
     ws.title = "Pedidos TALMA"
-    headers = ["Fecha", "DNI", "Persona", "Área", "Entrada", "Plato de fondo", "Observación", "N° Almuerzo", "Hora"]
+    headers = ["Fecha", "Código", "Persona", "Área", "Entrada", "Plato de fondo", "Observación", "N° Almuerzo", "Hora"]
     ws.append(headers)
     counts = {}
     for r in rows:
-        key = r["dni"] or f"legacy:{orders_app.normalize_key(r['employee_name'])}"
+        key = r["codigo"] or f"legacy:{orders_app.normalize_key(r['employee_name'])}"
         counts[key] = counts.get(key, 0) + 1
-        ws.append([r["order_date"], r["dni"], r["employee_name"], r["area"], r["entry_item"], r["main_item"],
+        ws.append([r["order_date"], r["codigo"], r["employee_name"], r["area"], r["entry_item"], r["main_item"],
                    r["notes"], counts[key], (r["created_at"] or "")[11:16]])
     for i, width in enumerate([14, 14, 34, 16, 32, 36, 40, 14, 10], 1):
         ws.column_dimensions[get_column_letter(i)].width = width
@@ -2184,10 +2186,10 @@ def talma_excel():
         for cell in row:
             cell.alignment = Alignment(vertical="top", wrap_text=True)
     summary = wb.create_sheet("Resumen")
-    summary.append(["DNI", "PERSONA", "TOTAL ALMUERZOS"])
+    summary.append(["CÓDIGO", "PERSONA", "TOTAL ALMUERZOS"])
     for key, total in sorted(counts.items()):
-        rr = next((r for r in rows if (r["dni"] or f"legacy:{orders_app.normalize_key(r['employee_name'])}") == key), None)
-        summary.append([rr["dni"] if rr and rr["dni"] else "Sin DNI", rr["employee_name"] if rr else key, total])
+        rr = next((r for r in rows if (r["codigo"] or f"legacy:{orders_app.normalize_key(r['employee_name'])}") == key), None)
+        summary.append([rr["codigo"] if rr and rr["codigo"] else "Sin código", rr["employee_name"] if rr else key, total])
     summary.column_dimensions["A"].width = 16
     summary.column_dimensions["B"].width = 34
     summary.column_dimensions["C"].width = 20
