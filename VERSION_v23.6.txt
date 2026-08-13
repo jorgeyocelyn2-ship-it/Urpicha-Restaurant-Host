@@ -1,0 +1,7 @@
+Urpicha v23.6
+- Restaurados los campos Nombre y apellido y Área o sede en los portales de pedidos de:
+  Liderman, Aeropuerto y Policía.
+- TALMA mantiene su login por correo + código y NO muestra esos campos manuales.
+- El filtro administrativo de TALMA por Código se mantiene.
+- No se modificó orders_app más allá del formulario de empresas no-TALMA.
+- Cierre 11:30, fechas, reportes, Excel/PDF y cuponera se mantienen.

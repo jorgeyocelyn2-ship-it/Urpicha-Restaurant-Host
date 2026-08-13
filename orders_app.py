@@ -1040,6 +1040,7 @@ class AppHandler(BaseHTTPRequestHandler):
 <input type="hidden" name="token" value="{esc(token)}">
 <input type="hidden" name="fecha" value="{esc(requested_date)}">
 {f'<div class="notice ok talma-welcome">Acceso correcto. Hola de nuevo, <b>{esc(talma_employee["nombre"])}</b>.<br><span>Área: {esc(self.display_area("talma", talma_employee["area"]))}</span></div>' if is_talma else ''}
+{'' if is_talma else '<div class="grid grid2">\n<div>\n<label>Nombre y apellido</label>\n<input name="nombre" required maxlength="100" placeholder="Ejemplo: Juan Pérez">\n</div>\n<div>\n<label>Área o sede</label>\n<input name="area" required maxlength="80" placeholder="Ejemplo: RAMPA">\n</div>\n</div>'}
 {menu_html}
 <label>Observación (opcional)</label>
 <textarea name="observaciones" maxlength="300" placeholder="Ejemplo: sin cebolla, poco arroz..."></textarea>
