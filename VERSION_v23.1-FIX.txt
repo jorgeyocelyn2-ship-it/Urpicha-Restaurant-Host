@@ -1,0 +1,9 @@
+Urpicha v23.1 - FIX CRITICO TALMA
+
+Corrección:
+- Se corrigió el NameError `name 'text' is not defined` causado por llaves CSS
+  no escapadas dentro del f-string de la plantilla base de Flask.
+- Se verificó la sintaxis de app.py y orders_app.py.
+- Se comprobó el flujo del enlace de pedidos TALMA: sin sesión redirige al login
+  y la pantalla de login carga correctamente.
+- Se mantiene la gestión de personas TALMA y el resto del sistema.
