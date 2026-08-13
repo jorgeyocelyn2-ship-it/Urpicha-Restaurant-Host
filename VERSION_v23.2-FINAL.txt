@@ -1,0 +1,11 @@
+Urpicha v23.2 FINAL
+
+Correcciones críticas:
+- Añadido `quote` a los imports de app.py para las URLs de administración TALMA.
+- Corregido el CSS del footer dentro del f-string de `page()` para evitar NameError.
+- Verificado el portal de pedidos TALMA y su login.
+- Añadida y verificada la opción "Cerrar sesión" en el enlace de pedidos TALMA.
+- Verificados los portales de Liderman, Aeropuerto y Policía.
+- Verificados dashboard, personas y resumen administrativos.
+- Verificadas descargas Excel y PDF de las cuatro empresas.
+- Se mantiene la gestión de personas TALMA.

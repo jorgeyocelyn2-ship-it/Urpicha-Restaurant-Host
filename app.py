@@ -12,7 +12,7 @@ from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
 from openpyxl.utils import get_column_letter
 from collections import Counter
 from http.server import ThreadingHTTPServer
-from urllib.parse import urlsplit
+from urllib.parse import quote, urlsplit
 import subprocess, tempfile, csv, io, json, re, uuid, statistics, shutil, os, traceback, unicodedata, threading, http.client, time, hmac, hashlib
 
 import orders_app
