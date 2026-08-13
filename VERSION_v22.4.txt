@@ -1,0 +1,16 @@
+Urpicha v22.4
+
+FOOTER:
+- Añadido al pie de todos los apartados:
+  Soporte del sistema
+  931099267 | 927314911 | sebasoa0711@gmail.com
+  Todos los derechos reservados · Urpicha Restaurante
+
+TALMA:
+- Administración de personas completa.
+- Lista de todas las personas provenientes del Excel y añadidas manualmente.
+- Añadir persona: correo, código, nombre y área.
+- Editar persona.
+- Eliminar/desactivar persona.
+- Los cambios sobre usuarios del Excel se guardan como sobrescrituras locales y afectan el login de TALMA.
+- La cuponera se conserva.

@@ -63,7 +63,15 @@ def page(title: str, body: str) -> str:
 @media(max-width:800px){{.grid3{{grid-template-columns:1fr}}}}
 </style>
 </head>
-<body>{body}</body>
+<body>{body}
+<footer class="site-footer">
+<strong>Soporte del sistema</strong><br>
+Cualquier duda o sugerencia respecto al sistema, comunicarse por:<br>
+931099267 &nbsp;|&nbsp; 927314911 &nbsp;|&nbsp; sebasoa0711@gmail.com
+<br><span>Todos los derechos reservados · Urpicha Restaurante</span>
+</footer>
+<style>.site-footer{text-align:center;color:#667085;padding:28px 16px;font-size:13px;line-height:1.6;border-top:1px solid #d8dfe6;margin-top:28px;background:#fff}</style>
+</body>
 </html>"""
 DATA_ROOT = Path(os.environ.get("DATA_DIR", str(ROOT / "datos"))).expanduser().resolve()
 SCANNER_ROOT = DATA_ROOT / "scanners"
@@ -700,117 +708,200 @@ def scanner_style():
     return Response(SCANNER_CSS, mimetype="text/css")
 
 
+
 @app.get("/admin/talma/usuarios")
 def talma_users():
     orders_app.init_db()
+    edit_id=request.args.get("editar","").strip()
+    edit_source=request.args.get("origen","").strip()
+
     with orders_app.db() as conn:
-        users = conn.execute(
-            "SELECT id, email, code, employee_name, area, active, created_at FROM talma_manual_users ORDER BY employee_name COLLATE NOCASE"
-        ).fetchall()
-    rows = "".join(
-        f"""<tr>
-<td>{orders_app.esc(r["employee_name"])}</td>
-<td>{orders_app.esc(r["email"])}</td>
-<td>{orders_app.esc(r["area"])}</td>
-<td><b>{orders_app.esc(r["code"])}</b></td>
-<td>{"Activo" if r["active"] else "Inactivo"}</td>
-<td>{orders_app.esc(r["created_at"])}</td>
-<td><form method="post" action="/admin/talma/usuarios/eliminar" onsubmit="return confirm('¿Eliminar este usuario manual?');">
-<input type="hidden" name="id" value="{r["id"]}">
-<button class="danger" type="submit">Eliminar</button>
-</form></td>
-</tr>"""
-        for r in users
-    ) or '<tr><td colspan="7">No hay usuarios manuales registrados.</td></tr>'
+        manual_rows=conn.execute("SELECT id,email,code,employee_name,area,active,created_at FROM talma_manual_users ORDER BY employee_name COLLATE NOCASE").fetchall()
 
-    feedback = ""
-    if request.args.get("ok") == "1":
-        feedback = '<div class="notice success">Usuario creado correctamente.</div>'
-    elif request.args.get("ok") == "deleted":
-        feedback = '<div class="notice success">Usuario eliminado correctamente.</div>'
-    elif request.args.get("error"):
-        feedback = f'<div class="notice error">{orders_app.esc(request.args.get("error"))}</div>'
+    manual_by_key={(str(r["email"]).lower(),str(r["code"])):r for r in manual_rows}
+    combined=[]
+    seen=set()
 
-    body=f"""
-<div class="admin-page">
-{feedback}
-<div class="admin-head">
-  <div><div class="kicker">TALMA</div><h1>Usuarios de acceso</h1><p>Agrega usuarios manualmente cuando no estén en el Excel principal.</p></div>
-  <a class="secondary" href="/admin/talma/">Volver a TALMA</a>
-</div>
-<div class="grid2">
-<section class="card">
-<h2>Agregar nuevo usuario</h2>
-<form method="post" action="/admin/talma/usuarios">
-<label>Correo electrónico</label>
-<input type="email" name="email" maxlength="180" required placeholder="correo@empresa.com">
-<label>Código</label>
-<input name="codigo" maxlength="40" required placeholder="Código de acceso">
-<label>Nombre y apellidos</label>
-<input name="nombre" maxlength="120" required placeholder="Nombre completo">
-<label>Área</label>
-<input name="area" maxlength="80" required placeholder="RAMPA, PAX, CARGA, OMA...">
-<button type="submit">Agregar usuario</button>
-</form>
-<p class="help">El usuario podrá entrar con este correo y código.</p>
-</section>
-<section class="card">
-<h2>Usuarios manuales</h2>
-<div class="table-wrap"><table>
-<thead><tr><th>Nombre</th><th>Correo</th><th>Área</th><th>Código</th><th>Estado</th><th>Creado</th><th></th></tr></thead>
-<tbody>{rows}</tbody>
-</table></div>
-</section>
-</div>
-</div>"""
-    extra="""<style>
-.admin-page{max-width:1180px;margin:30px auto;padding:0 18px}.admin-head{display:flex;justify-content:space-between;gap:20px;align-items:flex-start;margin-bottom:18px}.admin-head h1{margin:4px 0 6px}.kicker{font-size:12px;font-weight:800;letter-spacing:2px;color:#006b78}
-.grid2{display:grid;grid-template-columns:minmax(320px,420px) 1fr;gap:18px}.card{background:#fff;border:1px solid #d8dfe6;border-radius:15px;padding:22px;box-shadow:0 5px 18px rgba(16,24,40,.05)}
-label{display:block;font-weight:700;margin:12px 0 6px}input{width:100%;padding:11px 12px;border:1px solid #cfd8dc;border-radius:9px;font:inherit}.card button{margin-top:16px;border:0;border-radius:9px;padding:11px 15px;background:#006b78;color:#fff;font-weight:700;cursor:pointer}.card button.danger{background:#b42318}.notice{padding:12px 14px;border-radius:10px;margin-bottom:16px}.notice.success{background:#ecfdf3;color:#067647;border:1px solid #abefc6}.notice.error{background:#fef3f2;color:#b42318;border:1px solid #fecdca}.secondary{display:inline-block;padding:10px 14px;border-radius:9px;background:#eef3f5;color:#17323a;text-decoration:none;font-weight:700}.help{font-size:12px;color:#667085;line-height:1.5}.table-wrap{overflow:auto}table{width:100%;border-collapse:collapse}th,td{padding:10px;border-bottom:1px solid #e4e7ec;text-align:left;vertical-align:top}
-@media(max-width:800px){.grid2{grid-template-columns:1fr}.admin-head{flex-direction:column}}
-</style>"""
+    for key,record in sorted(orders_app.TALMA_ROSTER.items(), key=lambda x:x[1]["nombre"].lower()):
+        email,code=key.split("|",1)
+        override=manual_by_key.get((email,code))
+        combined.append({
+            "source":"excel","id":override["id"] if override else "",
+            "email":override["email"] if override else email,
+            "code":override["code"] if override else code,
+            "name":override["employee_name"] if override else record["nombre"],
+            "area":override["area"] if override else record["area"],
+            "active":bool(override["active"]) if override else True,
+            "created":override["created_at"] if override else "Excel",
+        })
+        seen.add((email,code))
+
+    for r in manual_rows:
+        key=(str(r["email"]).lower(),str(r["code"]))
+        if key not in seen:
+            combined.append({
+                "source":"manual","id":r["id"],"email":r["email"],"code":r["code"],
+                "name":r["employee_name"],"area":r["area"],"active":bool(r["active"]),
+                "created":r["created_at"],
+            })
+    combined.sort(key=lambda r:r["name"].lower())
+
+    edit_data=None
+    for r in combined:
+        if edit_source=="excel" and edit_id and "|" in edit_id:
+            e,c=edit_id.split("|",1)
+            if r["source"]=="excel" and r["email"].lower()==e.lower() and r["code"]==c:
+                edit_data=r; break
+        elif edit_source=="manual" and str(r["id"])==edit_id:
+            edit_data=r; break
+
+    rows=[]
+    for r in combined:
+        if r["source"]=="excel" and not r["id"]:
+            edit_href=f'/admin/talma/usuarios?editar={quote(r["email"]+"|"+r["code"])}&origen=excel'
+        else:
+            edit_href=f'/admin/talma/usuarios?editar={quote(str(r["id"]))}&origen=manual'
+        delete_href=f'/admin/talma/usuarios/eliminar?origen={r["source"]}&id={quote(str(r["id"]))}&email={quote(r["email"])}&codigo={quote(r["code"])}'
+        origin="Excel" if r["source"]=="excel" and not r["id"] else ("Editado" if r["source"]=="excel" else "Manual")
+        status="Activo" if r["active"] else "Inactivo"
+        rows.append(f'''<tr>
+<td>{orders_app.esc(r["name"])}</td><td>{orders_app.esc(r["email"])}</td><td>{orders_app.esc(r["area"])}</td>
+<td><b>{orders_app.esc(r["code"])}</b></td><td>{origin}</td><td>{status}</td><td>{orders_app.esc(r["created"])}</td>
+<td><a class="small-action" href="{edit_href}">Editar</a> &nbsp; <a class="small-action danger-text" href="{delete_href}" onclick="return confirm('¿Eliminar o desactivar este usuario?');">Eliminar</a></td>
+</tr>''')
+    rows="".join(rows) or '<tr><td colspan="8">No hay personas registradas.</td></tr>'
+
+    feedback=""
+    if request.args.get("ok")=="1": feedback='<div class="notice success">Usuario guardado correctamente.</div>'
+    elif request.args.get("ok")=="deleted": feedback='<div class="notice success">Usuario eliminado o desactivado correctamente.</div>'
+    elif request.args.get("error"): feedback=f'<div class="notice error">{orders_app.esc(request.args.get("error"))}</div>'
+
+    if edit_data:
+        title="Editar persona"; action="/admin/talma/usuarios/editar"; submit="Guardar cambios"
+        hidden=f'<input type="hidden" name="origen" value="{orders_app.esc(edit_data["source"])}"><input type="hidden" name="original_email" value="{orders_app.esc(edit_data["email"])}"><input type="hidden" name="original_codigo" value="{orders_app.esc(edit_data["code"])}">'
+        cancel='<a class="secondary" href="/admin/talma/usuarios">Cancelar</a>'
+    else:
+        title="Añadir persona"; action="/admin/talma/usuarios"; submit="Añadir persona"; hidden=""; cancel=""
+
+    body=f'''
+<div class="admin-page">{feedback}
+<div class="admin-head"><div><div class="kicker">TALMA</div><h1>Personas y accesos</h1><p>Consulta, agrega, modifica o elimina las personas autorizadas.</p></div><a class="secondary" href="/admin/talma/">Volver a TALMA</a></div>
+<section class="card"><h2>{title}</h2>
+<form method="post" action="{action}" class="user-form">{hidden}
+<label>Correo electrónico</label><input type="email" name="email" maxlength="180" required value="{orders_app.esc(edit_data["email"] if edit_data else "")}">
+<label>Código</label><input name="codigo" maxlength="40" required value="{orders_app.esc(edit_data["code"] if edit_data else "")}">
+<label>Nombre y apellidos</label><input name="nombre" maxlength="120" required value="{orders_app.esc(edit_data["name"] if edit_data else "")}">
+<label>Área</label><input name="area" maxlength="80" required value="{orders_app.esc(edit_data["area"] if edit_data else "")}">
+<div class="actions"><button type="submit">{submit}</button>{cancel}</div></form>
+<p class="help">Los usuarios del Excel y los añadidos manualmente usan correo y código para acceder. Los cambios aquí se aplican al acceso del portal TALMA.</p></section>
+<section class="card"><h2>Personas registradas ({len(combined)})</h2>
+<div class="table-wrap"><table><thead><tr><th>Nombre</th><th>Correo</th><th>Área</th><th>Código</th><th>Origen</th><th>Estado</th><th>Registro</th><th>Acciones</th></tr></thead>
+<tbody>{rows}</tbody></table></div></section></div>'''
+    extra='''<style>
+.admin-page{max-width:1240px;margin:30px auto;padding:0 18px}.admin-head{display:flex;justify-content:space-between;gap:20px;align-items:flex-start;margin-bottom:18px}.admin-head h1{margin:4px 0 6px}.kicker{font-size:12px;font-weight:800;letter-spacing:2px;color:#006b78}
+.card{background:#fff;border:1px solid #d8dfe6;border-radius:15px;padding:22px;margin-bottom:18px;box-shadow:0 5px 18px rgba(16,24,40,.05)}
+.user-form{max-width:720px}.user-form label{display:block;font-weight:700;margin:12px 0 6px}.user-form input{width:100%;padding:11px 12px;border:1px solid #cfd8dc;border-radius:9px;font:inherit}.user-form button{margin-top:16px;border:0;border-radius:9px;padding:11px 15px;background:#006b78;color:#fff;font-weight:700;cursor:pointer}
+.actions{display:flex;gap:10px;flex-wrap:wrap;align-items:center}.secondary{display:inline-block;padding:10px 14px;border-radius:9px;background:#eef3f5;color:#17323a;text-decoration:none;font-weight:700}.help{font-size:12px;color:#667085;line-height:1.5}
+.notice{padding:12px 14px;border-radius:10px;margin-bottom:16px}.notice.success{background:#ecfdf3;color:#067647;border:1px solid #abefc6}.notice.error{background:#fef3f2;color:#b42318;border:1px solid #fecdca}
+.table-wrap{overflow:auto}table{width:100%;border-collapse:collapse}th,td{padding:10px;border-bottom:1px solid #e4e7ec;text-align:left;vertical-align:top;white-space:nowrap}.small-action{color:#006b78;font-weight:700;text-decoration:none}.danger-text{color:#b42318}
+@media(max-width:800px){.admin-head{flex-direction:column}}
+</style>'''
     return render_template_string(page_like_admin(body, extra))
 
 
 @app.post("/admin/talma/usuarios")
 def talma_users_create():
     orders_app.init_db()
-    email=request.form.get("email","").strip().lower()
-    name=request.form.get("nombre","").strip()
-    area=request.form.get("area","").strip()
-    code=request.form.get("codigo","").strip()
-    if not re.fullmatch(r"[^@\s]+@[^@\s]+\.[^@\s]+", email) or len(name)<3 or len(area)<1 or len(code)<2:
+    email=request.form.get("email","").strip().lower(); name=request.form.get("nombre","").strip()
+    area=request.form.get("area","").strip(); code=request.form.get("codigo","").strip()
+    if not re.fullmatch(r"[^@\s]+@[^@\s]+\.[^@\s]+",email) or len(name)<3 or not area or len(code)<2:
         return redirect("/admin/talma/usuarios?error=Datos+incompletos")
-    if code in orders_app.TALMA_ROSTER:
-        pass
     with orders_app.db() as conn:
-        exists_excel = any(code == str(r.get("codigo","")).strip() and email == str(r.get("email","")).strip().lower() for r in orders_app.TALMA_ROSTER.values())
-        exists_manual = conn.execute("SELECT id FROM talma_manual_users WHERE code=? OR lower(email)=?", (code,email)).fetchone()
-        if exists_excel or exists_manual:
+        collision=conn.execute("SELECT id FROM talma_manual_users WHERE code=? OR lower(email)=?",(code,email)).fetchone()
+        excel_collision=any(str(r["codigo"])==code and str(r["email"]).lower()==email for r in orders_app.TALMA_ROSTER.values())
+        if collision or excel_collision:
             return redirect("/admin/talma/usuarios?error=Ese+correo+o+código+ya+existe")
-        # Manual users authenticate with email + code; legacy password columns remain empty for migration compatibility.
-        conn.execute(
-            """INSERT INTO talma_manual_users(email,code,password_hash,password_salt,employee_name,area,active,created_at)
-               VALUES(?,?,?,?,?,?,1,?)""",
-            (email,code,"","",name,area,orders_app.now_iso()),
-        )
+        conn.execute("INSERT INTO talma_manual_users(email,code,password_hash,password_salt,employee_name,area,active,created_at) VALUES(?,?,?,?,?,?,1,?)",
+                     (email,code,"","",name,area,orders_app.now_iso()))
     return redirect("/admin/talma/usuarios?ok=1")
 
 
-@app.post("/admin/talma/usuarios/eliminar")
+@app.post("/admin/talma/usuarios/editar")
+def talma_users_edit():
+    orders_app.init_db()
+    email=request.form.get("email","").strip().lower(); code=request.form.get("codigo","").strip()
+    name=request.form.get("nombre","").strip(); area=request.form.get("area","").strip()
+    origin=request.form.get("origen","").strip()
+    original_email=request.form.get("original_email","").strip().lower()
+    original_code=request.form.get("original_codigo","").strip()
+    if not re.fullmatch(r"[^@\s]+@[^@\s]+\.[^@\s]+",email) or len(code)<2 or len(name)<3 or not area:
+        return redirect("/admin/talma/usuarios?error=Datos+incompletos")
+    with orders_app.db() as conn:
+        existing=conn.execute("SELECT id FROM talma_manual_users WHERE lower(email)=? AND code=?",(original_email,original_code)).fetchone()
+        collision=conn.execute("SELECT id FROM talma_manual_users WHERE (code=? OR lower(email)=?) AND NOT (lower(email)=? AND code=?)",(code,email,original_email,original_code)).fetchone()
+        excel_collision=any(
+            str(r["codigo"])==code and str(r["email"]).lower()==email
+            and not (original_email==email and original_code==code)
+            for r in orders_app.TALMA_ROSTER.values()
+        )
+        if collision or excel_collision:
+            return redirect("/admin/talma/usuarios?error=Ese+correo+o+código+ya+existe")
+
+        old_is_excel = origin=="excel" and f"{original_email}|{original_code}" in orders_app.TALMA_ROSTER
+
+        if existing:
+            conn.execute(
+                "UPDATE talma_manual_users SET email=?,code=?,employee_name=?,area=?,active=1 WHERE id=?",
+                (email,code,name,area,existing["id"]),
+            )
+        elif old_is_excel and (original_email!=email or original_code!=code):
+            # Disable the original Excel identity, then create the new active override.
+            roster=orders_app.TALMA_ROSTER[f"{original_email}|{original_code}"]
+            conn.execute(
+                "INSERT INTO talma_manual_users(email,code,password_hash,password_salt,employee_name,area,active,created_at) VALUES(?,?,?,?,?,?,0,?)",
+                (original_email,original_code,"","",roster["nombre"],roster["area"],orders_app.now_iso()),
+            )
+            conn.execute(
+                "INSERT INTO talma_manual_users(email,code,password_hash,password_salt,employee_name,area,active,created_at) VALUES(?,?,?,?,?,?,1,?)",
+                (email,code,"","",name,area,orders_app.now_iso()),
+            )
+        else:
+            conn.execute(
+                "INSERT INTO talma_manual_users(email,code,password_hash,password_salt,employee_name,area,active,created_at) VALUES(?,?,?,?,?,?,1,?)",
+                (email,code,"","",name,area,orders_app.now_iso()),
+            )
+    return redirect("/admin/talma/usuarios?ok=1")
+
+
+@app.get("/admin/talma/usuarios/eliminar")
 def talma_users_delete():
     orders_app.init_db()
-    user_id=request.form.get("id","")
+    origin=request.args.get("origen",""); email=request.args.get("email","").strip().lower(); code=request.args.get("codigo","").strip(); user_id=request.args.get("id","")
     with orders_app.db() as conn:
-        conn.execute("UPDATE talma_manual_users SET active=0 WHERE id=?", (user_id,))
+        if origin=="excel":
+            roster=orders_app.TALMA_ROSTER.get(f"{email}|{code}",{})
+            existing=conn.execute("SELECT id FROM talma_manual_users WHERE lower(email)=? AND code=?",(email,code)).fetchone()
+            if existing:
+                conn.execute("UPDATE talma_manual_users SET active=0 WHERE id=?",(existing["id"],))
+            else:
+                conn.execute("INSERT INTO talma_manual_users(email,code,password_hash,password_salt,employee_name,area,active,created_at) VALUES(?,?,?,?,?,?,0,?)",
+                             (email,code,"","",roster.get("nombre",""),roster.get("area",""),orders_app.now_iso()))
+        elif user_id:
+            conn.execute("UPDATE talma_manual_users SET active=0 WHERE id=?",(user_id,))
     return redirect("/admin/talma/usuarios?ok=deleted")
 
 
 def page_like_admin(body, extra=""):
     # Reuse the clean visual shell used by the scanner admin templates.
     restaurant="Urpicha Restaurante"
-    return f"""<!doctype html><html lang="es"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>TALMA · Usuarios</title><style>
-body{{margin:0;font-family:Inter,Segoe UI,Arial,sans-serif;background:#f4f7f8;color:#1f2d33}}a{{color:#006b78}}.top{{background:#11353b;color:#fff;padding:14px 20px;font-weight:800}}.top a{{color:#fff;text-decoration:none}}{extra}</style></head><body><div class="top"><a href="/admin/talma/">TALMA</a> &nbsp;|&nbsp; Gestión de usuarios</div>{body}</body></html>"""
+    return f"""<!doctype html><html lang="es"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>TALMA · Usuarios</title><style>
+body{{margin:0;font-family:Inter,Segoe UI,Arial,sans-serif;background:#f4f7f8;color:#1f2d33}}a{{color:#006b78}}.top{{background:#11353b;color:#fff;padding:14px 20px;font-weight:800}}.top a{{color:#fff;text-decoration:none}}{extra}</style></head><body><div class="top"><a href="/admin/talma/">TALMA</a> &nbsp;|&nbsp; Gestión de usuarios</div>{body}
+<footer style="text-align:center;color:#667085;padding:28px 16px;font-size:13px;line-height:1.6;border-top:1px solid #d8dfe6;margin-top:28px;background:#fff">
+<strong>Soporte del sistema</strong><br>
+Cualquier duda o sugerencia respecto al sistema, comunicarse por:<br>
+931099267 &nbsp;|&nbsp; 927314911 &nbsp;|&nbsp; sebasoa0711@gmail.com
+<br><span>Todos los derechos reservados · Urpicha Restaurante</span>
+</footer></body></html>"""
 
 
 @app.get("/admin/scanners")

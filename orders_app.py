@@ -151,12 +151,13 @@ def verify_talma_password(password: str, password_hash: str, password_salt: str)
         return False
 
 
-def get_talma_manual_user(email: str, code: str):
+def get_talma_manual_user(email: str, code: str, include_inactive: bool = False):
     with db() as conn:
-        return conn.execute(
-            "SELECT * FROM talma_manual_users WHERE lower(email)=? AND code=? AND active=1",
-            (email.strip().lower(), code.strip()),
-        ).fetchone()
+        query = "SELECT * FROM talma_manual_users WHERE lower(email)=? AND code=?"
+        params = (email.strip().lower(), code.strip())
+        if not include_inactive:
+            query += " AND active=1"
+        return conn.execute(query, params).fetchone()
 
 
 def init_db() -> None:
@@ -377,7 +378,7 @@ table{{width:100%;border-collapse:collapse;font-size:14px}} th,td{{border-bottom
 .stat{{padding:16px;border:1px solid var(--line);border-radius:12px;background:#fff}} .stat b{{display:block;font-size:26px;margin-top:5px}}
 .menu-choice{{border:1px solid var(--line);border-radius:10px;padding:12px;margin:8px 0}} .menu-choice input{{width:auto;margin-right:8px}} .ticket{{border:2px dashed #333;padding:12px;margin:0 0 12px;break-inside:avoid;background:#fff}} .ticket h3{{margin-bottom:8px}}
 .registered-orders{{margin:0;padding-left:22px}} .registered-orders li{{padding:8px 0;border-bottom:1px solid var(--line)}} .registered-orders li:last-child{{border-bottom:0}}
-footer{{text-align:center;color:var(--muted);padding:25px}}
+footer{{text-align:center;color:var(--muted);padding:28px 16px;font-size:13px;line-height:1.6;border-top:1px solid var(--line);margin-top:28px}} .support-footer{{max-width:1180px;margin:0 auto}}
 .admin-tabs{{display:flex;gap:8px;flex-wrap:wrap;background:#fff;border:1px solid var(--line);border-radius:12px;padding:8px;margin:0 0 18px;box-shadow:0 2px 10px rgba(16,24,40,.04)}}
 .admin-tabs a{{padding:10px 16px;border-radius:9px;font-weight:800;color:#344054}} .admin-tabs a:hover{{background:#f2f4f7}} .admin-tabs a.active{{background:var(--brand);color:#fff}}
 @media(max-width:760px){{.grid2,.grid3{{grid-template-columns:1fr}} .topbar{{align-items:flex-start;flex-direction:column}}}}
@@ -388,7 +389,14 @@ footer{{text-align:center;color:var(--muted);padding:25px}}
 <body>
 <div class="topbar"><strong>{restaurant}</strong><span><a href="/">Inicio</a></span></div>
 {body}
-<footer>Sistema de pedidos de almuerzos</footer>
+<footer>
+<div class="support-footer">
+<strong>Soporte del sistema</strong><br>
+Cualquier duda o sugerencia respecto al sistema, comunicarse por:<br>
+931099267 &nbsp;|&nbsp; 927314911 &nbsp;|&nbsp; sebasoa0711@gmail.com
+<br><span>Todos los derechos reservados · Urpicha Restaurante</span>
+</div>
+</footer>
 </body></html>"""
 
 
@@ -439,20 +447,22 @@ def resolve_talma_login(email: str, codigo: str):
     codigo = codigo.strip()
     if not email or not codigo:
         return None
+    override = get_talma_manual_user(email, codigo, include_inactive=True)
+    if override is not None:
+        if not override["active"]:
+            return None
+        return {
+            "email": override["email"],
+            "codigo": override["code"],
+            "nombre": override["employee_name"],
+            "area": override["area"],
+            "manual": True,
+        }
     record = TALMA_ROSTER.get(f"{email}|{codigo}")
     if record:
         result = dict(record)
         result["manual"] = False
         return result
-    user = get_talma_manual_user(email, codigo)
-    if user:
-        return {
-            "email": user["email"],
-            "codigo": user["code"],
-            "nombre": user["employee_name"],
-            "area": user["area"],
-            "manual": True,
-        }
     return None
 
 
