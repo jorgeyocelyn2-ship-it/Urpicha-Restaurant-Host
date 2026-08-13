@@ -1,0 +1,7 @@
+Urpicha v23.5
+- Restaurada la versión base v23.3 para no alterar los demás paneles de pedidos.
+- Único cambio funcional adicional: en el panel administrativo TALMA (/talma) y su Excel,
+  el filtro individual pasó de DNI a Código.
+- Los paneles de Liderman, Aeropuerto y Policía conservan exactamente el código anterior.
+- Verificado que los otros tres portales continúan mostrando los nombres de los pedidos.
+- Se mantiene el mismo Excel diario, fechas, entradas, fondos, observaciones, horas y formato.

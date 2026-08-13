@@ -2189,7 +2189,7 @@ def talma_excel():
     summary.append(["CÓDIGO", "PERSONA", "TOTAL ALMUERZOS"])
     for key, total in sorted(counts.items()):
         rr = next((r for r in rows if (r["codigo"] or f"legacy:{orders_app.normalize_key(r['employee_name'])}") == key), None)
-        summary.append([rr["codigo"] if rr and rr["codigo"] else "Sin código", rr["employee_name"] if rr else key, total])
+        summary.append([rr["dni"] if rr and rr["dni"] else "Sin DNI", rr["employee_name"] if rr else key, total])
     summary.column_dimensions["A"].width = 16
     summary.column_dimensions["B"].width = 34
     summary.column_dimensions["C"].width = 20
