@@ -1,0 +1,16 @@
+Urpicha v22.2
+
+NUEVO EN ADMIN TALMA:
+- Gestión de usuarios manuales en /admin/talma/usuarios.
+- Crear usuario con nombre, área, código y contraseña.
+- Contraseña almacenada mediante PBKDF2-HMAC-SHA256 con salt.
+- Listado y desactivación de usuarios manuales.
+- Enlace "Usuarios TALMA" dentro del panel administrativo de TALMA.
+
+LOGIN TALMA:
+- Los usuarios del Excel siguen entrando con correo + código.
+- Los usuarios creados manualmente entran con código + contraseña.
+- El sistema identifica automáticamente nombre y área.
+- Se mantiene la bienvenida y el formulario sin nombre/área.
+
+La cuponera/ticket existente se conserva sin cambios.

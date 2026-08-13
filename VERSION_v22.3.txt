@@ -1,0 +1,7 @@
+Urpicha v22.3
+- Usuarios manuales TALMA: correo + código + nombre + área.
+- Sin contraseña.
+- Login TALMA usa únicamente correo y código.
+- Los usuarios del Excel y los usuarios manuales usan el mismo flujo.
+- Nombre y área se cargan automáticamente.
+- Mantiene la cuponera existente.

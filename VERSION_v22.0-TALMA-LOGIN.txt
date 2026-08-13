@@ -1,0 +1,11 @@
+Urpicha v22.0 - Acceso TALMA por correo y código
+
+- Solo TALMA usa el nuevo login.
+- Credenciales validadas directamente contra talma_personas.xlsx.
+- La base proviene del archivo BASE APP.xlsx proporcionado.
+- 42 registros cargados.
+- El nombre y el área se obtienen automáticamente.
+- El formulario de pedido de TALMA solo muestra Entrada, Plato de fondo y Observaciones.
+- Mensaje de bienvenida "Acceso correcto. Hola de nuevo, Nombre".
+- Sesión TALMA durante 12 horas, con opción de cerrar sesión.
+- Las demás empresas mantienen su formulario anterior.

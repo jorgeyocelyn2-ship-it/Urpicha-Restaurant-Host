@@ -94,12 +94,69 @@ def load_config() -> dict:
 
 CONFIG = load_config()
 
+TALMA_ROSTER_PATH = BASE_DIR / "talma_personas.xlsx"
+
+def load_talma_roster() -> dict:
+    roster = {}
+    try:
+        workbook = load_workbook(TALMA_ROSTER_PATH, read_only=True, data_only=True)
+        sheet = workbook.active
+        rows = sheet.iter_rows(values_only=True)
+        headers = [str(v or "").strip().upper() for v in next(rows)]
+        code_idx = headers.index("CODIGO ESTACION") if "CODIGO ESTACION" in headers else headers.index("CODIGO")
+        name_idx = headers.index("NOMBRE_APELLIDOS")
+        area_idx = headers.index("AREA")
+        email_idx = headers.index("EMAIL")
+        for row in rows:
+            if not row:
+                continue
+            code = str(row[code_idx] or "").strip()
+            name = str(row[name_idx] or "").strip()
+            area = str(row[area_idx] or "").strip()
+            email = str(row[email_idx] or "").strip().lower()
+            if code and email:
+                roster[f"{email}|{code}"] = {
+                    "email": email,
+                    "codigo": code,
+                    "nombre": name,
+                    "area": area,
+                }
+        workbook.close()
+    except Exception as error:
+        print(f"[TALMA] No se pudo leer la base Excel: {error}", file=sys.stderr)
+    return roster
+
+TALMA_ROSTER = load_talma_roster()
+
+
 
 def db() -> sqlite3.Connection:
     conn = sqlite3.connect(DB_PATH, timeout=15)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA foreign_keys = ON")
     return conn
+
+
+def hash_talma_password(password: str, salt_hex: str | None = None) -> tuple[str, str]:
+    salt = bytes.fromhex(salt_hex) if salt_hex else os.urandom(16)
+    digest = hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"), salt, 180_000)
+    return digest.hex(), salt.hex()
+
+
+def verify_talma_password(password: str, password_hash: str, password_salt: str) -> bool:
+    try:
+        digest, _ = hash_talma_password(password, password_salt)
+        return hmac.compare_digest(digest, password_hash)
+    except Exception:
+        return False
+
+
+def get_talma_manual_user(email: str, code: str):
+    with db() as conn:
+        return conn.execute(
+            "SELECT * FROM talma_manual_users WHERE lower(email)=? AND code=? AND active=1",
+            (email.strip().lower(), code.strip()),
+        ).fetchone()
 
 
 def init_db() -> None:
@@ -140,6 +197,18 @@ def init_db() -> None:
                 FOREIGN KEY(company_id) REFERENCES companies(id) ON DELETE CASCADE,
                 UNIQUE(company_id, order_date, employee_key)
             );
+
+            CREATE TABLE IF NOT EXISTS talma_manual_users (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                email TEXT NOT NULL DEFAULT '',
+                code TEXT NOT NULL UNIQUE,
+                password_hash TEXT NOT NULL DEFAULT '',
+                password_salt TEXT NOT NULL DEFAULT '',
+                employee_name TEXT NOT NULL,
+                area TEXT NOT NULL,
+                active INTEGER NOT NULL DEFAULT 1,
+                created_at TEXT NOT NULL
+            );
             """
         )
 
@@ -147,7 +216,17 @@ def init_db() -> None:
         columns = {row["name"] for row in conn.execute("PRAGMA table_info(orders)").fetchall()}
         if "dni" not in columns:
             conn.execute("ALTER TABLE orders ADD COLUMN dni TEXT NOT NULL DEFAULT ''")
+        if "login_code" not in columns:
+            conn.execute("ALTER TABLE orders ADD COLUMN login_code TEXT NOT NULL DEFAULT ''")
+        if "login_email" not in columns:
+            conn.execute("ALTER TABLE orders ADD COLUMN login_email TEXT NOT NULL DEFAULT ''")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_orders_talma_dni ON orders(dni)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_orders_talma_code ON orders(login_code)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_orders_talma_email ON orders(login_email)")
+        manual_cols = {row["name"] for row in conn.execute("PRAGMA table_info(talma_manual_users)").fetchall()}
+        if "email" not in manual_cols:
+            conn.execute("ALTER TABLE talma_manual_users ADD COLUMN email TEXT NOT NULL DEFAULT ''")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_talma_manual_email ON talma_manual_users(email)")
 
         # Elimina el enlace de demostración de versiones anteriores y garantiza
         # los cuatro enlaces predeterminados solicitados.
@@ -352,6 +431,84 @@ def valid_session(value: str | None) -> bool:
         return False
 
 
+
+
+
+def resolve_talma_login(email: str, codigo: str):
+    email = email.strip().lower()
+    codigo = codigo.strip()
+    if not email or not codigo:
+        return None
+    record = TALMA_ROSTER.get(f"{email}|{codigo}")
+    if record:
+        result = dict(record)
+        result["manual"] = False
+        return result
+    user = get_talma_manual_user(email, codigo)
+    if user:
+        return {
+            "email": user["email"],
+            "codigo": user["code"],
+            "nombre": user["employee_name"],
+            "area": user["area"],
+            "manual": True,
+        }
+    return None
+
+
+def talma_employee_session_value(record: dict) -> str:
+    expires = str(int(time.time()) + 12 * 3600)
+    payload = f"talma_employee:{record['email']}:{record['codigo']}:{expires}"
+    sig = hmac.new(CONFIG["secret_key"].encode(), payload.encode(), hashlib.sha256).hexdigest()
+    return f"{payload}:{sig}"
+
+
+def valid_talma_employee_session(value: str | None) -> dict | None:
+    if not value:
+        return None
+    try:
+        user, email, codigo, expires, sig = value.split(":", 4)
+        if user != "talma_employee" or int(expires) < time.time():
+            return None
+        payload = f"{user}:{email}:{codigo}:{expires}"
+        expected = hmac.new(CONFIG["secret_key"].encode(), payload.encode(), hashlib.sha256).hexdigest()
+        if not hmac.compare_digest(sig, expected):
+            return None
+        return TALMA_ROSTER.get(f"{email.lower()}|{codigo}")
+    except (ValueError, TypeError):
+        return None
+
+
+def talma_employee_login_page(token: str, error: str = "") -> str:
+    notice = f'<div class="notice error">{esc(error)}</div>' if error else ""
+    body = f"""
+<main class="talma-login-shell">
+<div class="talma-login-card">
+<div class="talma-brand">TALMA</div>
+<div class="talma-line"></div>
+<h1>Acceso a pedidos</h1>
+<p class="talma-subtitle">Ingresa con tu correo y código registrados.</p>
+{notice}
+<form method="post" action="/empresa/talma/login">
+<input type="hidden" name="token" value="{esc(token)}">
+<label>Correo electrónico</label>
+<input type="email" name="email" autocomplete="username" required placeholder="correo@empresa.com">
+<label>Código</label>
+<input type="text" name="codigo" autocomplete="one-time-code" required placeholder="Código">
+<p class="talma-help">El sistema valida ambos datos y carga automáticamente tu nombre y área.</p>
+<button type="submit">Ingresar</button>
+</form>
+</div>
+</main>"""
+    extra="""<style>
+.talma-login-shell{min-height:100vh;display:flex;align-items:center;justify-content:center;padding:30px;background:linear-gradient(145deg,#f4f8fb 0%,#eef6f7 100%)}
+.talma-login-card{width:min(440px,100%);background:#fff;border:1px solid #d5e1e5;border-radius:18px;padding:34px;box-shadow:0 18px 50px rgba(19,60,70,.12)}
+.talma-brand{font-size:28px;font-weight:900;letter-spacing:4px;color:#006b78}.talma-line{height:4px;width:62px;background:#00a7b5;border-radius:6px;margin:10px 0 24px}
+.talma-login-card h1{font-size:25px;margin-bottom:8px;color:#18343b}.talma-subtitle{color:#667085;margin-top:0;margin-bottom:22px}
+.talma-login-card input{margin-bottom:6px}.talma-login-card button{width:100%;margin-top:12px;background:#006b78}.talma-login-card button:hover{background:#005761}
+.talma-help{font-size:12px;color:#7b8794;margin-top:10px;line-height:1.45}
+</style>"""
+    return page("Acceso TALMA", body, extra)
 
 def normalize_report_header(value: object) -> str:
     text = unicodedata.normalize("NFKD", str(value or "")).encode("ascii", "ignore").decode("ascii")
@@ -665,6 +822,10 @@ class AppHandler(BaseHTTPRequestHandler):
                 self.coupons(query)
         elif path.startswith("/empresa/") and path.endswith("/excel"):
             self.company_export_excel(path.split("/")[2], query)
+        elif path == "/empresa/talma/login":
+            self.send_html(talma_employee_login_page(query.get("token", ""), query.get("error", "")))
+        elif path == "/empresa/talma/logout":
+            self.redirect(f"/empresa/talma/login?{urlencode({'token':query.get('token','')})}", "talma_employee_session=; Path=/; Max-Age=0; HttpOnly; SameSite=Lax")
         elif path.startswith("/empresa/") and path.endswith("/pdf"):
             self.company_export_pdf(path.split("/")[2], query)
         elif path.startswith("/empresa/"):
@@ -692,6 +853,8 @@ class AppHandler(BaseHTTPRequestHandler):
         elif path == "/admin/historico-excel":
             if self.require_admin():
                 self.update_historical_excel()
+        elif path == "/empresa/talma/login":
+            self.talma_employee_login()
         elif path.startswith("/pedido/"):
             self.submit_order(path.split("/", 2)[2])
         else:
@@ -714,6 +877,30 @@ class AppHandler(BaseHTTPRequestHandler):
         number=re.sub(r"\D","",os.environ.get("WHATSAPP_NUMBER",str(CONFIG.get("whatsapp_number",""))))
         return f"https://wa.me/{number}?text={quote(message)}" if number else ""
 
+    def talma_employee_login(self) -> None:
+        form = self.read_form()
+        token = form.get("token", "").strip()
+        email = form.get("email", "").strip().lower()
+        codigo = form.get("codigo", "").strip()
+        record = resolve_talma_login(email, codigo)
+        company = get_company("talma", token)
+        if not company:
+            self.send_html(page("Enlace inválido", '<main class="wrap narrow"><div class="card"><h1>Enlace inválido</h1><p>El enlace de TALMA no es válido.</p></div></main>'), 403)
+            return
+        if not record:
+            self.redirect(f"/empresa/talma/login?{urlencode({'token':token,'error':'Correo o código incorrecto.'})}")
+            return
+        value = talma_employee_session_value(record)
+        secure = "; Secure" if self.headers.get("X-Forwarded-Proto") == "https" else ""
+        location = f"/empresa/talma?{urlencode({'token':token,'ok_login':'1'})}"
+        self.redirect(location, f"talma_employee_session={value}; Path=/; Max-Age=43200; HttpOnly; SameSite=Lax{secure}")
+
+    def display_area(self, company_slug: str, area: str) -> str:
+        value = str(area or "").strip()
+        if company_slug.lower() == "talma" and value.upper() == "PAXHANDLING":
+            return "PAX"
+        return value
+
     def employee_form(self, slug: str, query: dict[str, str]) -> None:
         token = query.get("token", "")
         company = get_company(slug, token)
@@ -721,6 +908,12 @@ class AppHandler(BaseHTTPRequestHandler):
             self.send_html(page("Enlace inválido", '<main class="wrap narrow"><div class="card"><h1>Enlace inválido</h1><p>Solicite a su empresa un enlace actualizado.</p></div></main>'), 403)
             return
         is_talma = slug.lower() == "talma"
+        talma_employee = None
+        if is_talma:
+            talma_employee = valid_talma_employee_session(self.parse_cookies().get("talma_employee_session").value if self.parse_cookies().get("talma_employee_session") else None)
+            if not talma_employee:
+                self.redirect(f"/empresa/talma/login?{urlencode({'token':token})}")
+                return
         requested_date = query.get("fecha", today_iso())
         try:
             datetime.strptime(requested_date, "%Y-%m-%d")
@@ -830,11 +1023,7 @@ class AppHandler(BaseHTTPRequestHandler):
 <form method="post" action="/pedido/{esc(slug)}">
 <input type="hidden" name="token" value="{esc(token)}">
 <input type="hidden" name="fecha" value="{esc(requested_date)}">
-<label>Nombre y apellido</label>
-<input name="nombre" required maxlength="100" placeholder="Ejemplo: Juan Pérez">
-{f'<label>DNI <span style="color:#b42318">*</span></label><input name="dni" required inputmode="numeric" pattern="[0-9]{{8}}" maxlength="8" minlength="8" placeholder="8 dígitos">' if is_talma else ''}
-<label>Área o sede (opcional)</label>
-<input name="area" maxlength="80" placeholder="Ejemplo: Contabilidad">
+{f'<div class="notice ok talma-welcome">Acceso correcto. Hola de nuevo, <b>{esc(talma_employee["nombre"])}</b>.<br><span>Área: {esc(self.display_area("talma", talma_employee["area"]))}</span><br><a href="/empresa/talma/logout?token={esc(token)}" style="font-size:13px">Cerrar sesión</a></div>' if is_talma else ''}
 {menu_html}
 <label>Observación (opcional)</label>
 <textarea name="observaciones" maxlength="300" placeholder="Ejemplo: sin cebolla, poco arroz..."></textarea>
@@ -862,10 +1051,25 @@ class AppHandler(BaseHTTPRequestHandler):
             self.send_html(page("No autorizado", '<main class="wrap narrow"><div class="card"><h1>No autorizado</h1></div></main>'), 403)
             return
         order_date = form.get("fecha", today_iso()).strip()
-        name = form.get("nombre", "").strip()
         is_talma = slug.lower() == "talma"
-        dni = re.sub(r"\D", "", form.get("dni", "").strip()) if is_talma else ""
-        area = form.get("area", "").strip()
+        talma_employee = None
+        if is_talma:
+            cookie = self.parse_cookies().get("talma_employee_session")
+            talma_employee = valid_talma_employee_session(cookie.value if cookie else None)
+            if not talma_employee:
+                self.redirect(f"/empresa/talma/login?{urlencode({'token':token})}")
+                return
+            name = talma_employee["nombre"]
+            area = talma_employee["area"]
+            dni = ""
+            login_code = talma_employee["codigo"]
+            login_email = talma_employee["email"]
+        else:
+            name = form.get("nombre", "").strip()
+            dni = ""
+            area = form.get("area", "").strip()
+            login_code = ""
+            login_email = ""
         entry = form.get("entrada", "").strip()
         main = form.get("fondo", "").strip()
         notes = form.get("observaciones", "").strip()
@@ -881,8 +1085,6 @@ class AppHandler(BaseHTTPRequestHandler):
             error = "Los pedidos del día actual se cierran a las 11:30 a. m. (hora de Perú). Si necesita un pedido fuera de horario, comuníquese por WhatsApp para coordinar la entrega."
         if len(name) < 3:
             error = "Ingrese su nombre y apellido."
-        if is_talma and not re.fullmatch(r"\d{8}", dni):
-            error = "Para TALMA, el DNI debe tener exactamente 8 dígitos."
         menu = get_menu(order_date)
         valid_entries = {r["name"] for r in menu["entrada"]}
         valid_mains = {r["name"] for r in menu["fondo"]}
@@ -894,14 +1096,14 @@ class AppHandler(BaseHTTPRequestHandler):
             return
         try:
             with db() as conn:
-                employee_key = f"dni:{dni}" if is_talma else normalize_key(name)
+                employee_key = f"talma:{login_code}" if is_talma else normalize_key(name)
                 conn.execute(
-                    """INSERT INTO orders(company_id, order_date, employee_name, employee_key, dni, area, entry_item, main_item, notes, delivery_type, created_at)
-                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-                    (company["id"], order_date, name, employee_key, dni, area, entry, main, notes, delivery, now_iso()),
+                    """INSERT INTO orders(company_id, order_date, employee_name, employee_key, dni, area, entry_item, main_item, notes, delivery_type, created_at, login_code, login_email)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    (company["id"], order_date, name, employee_key, dni, area, entry, main, notes, delivery, now_iso(), login_code, login_email),
                 )
         except sqlite3.IntegrityError:
-            params = urlencode({"token": token, "fecha": order_date, "error": "Ya existe un pedido para ese DNI en la fecha seleccionada." if is_talma else "Ya existe un pedido con ese nombre en la fecha seleccionada."})
+            params = urlencode({"token": token, "fecha": order_date, "error": "Ya existe un pedido para ese usuario en la fecha seleccionada." if is_talma else "Ya existe un pedido con ese nombre en la fecha seleccionada."})
             self.redirect(f"/empresa/{quote(slug)}?{params}")
             return
         self.redirect(f"/empresa/{quote(slug)}?{urlencode({'token':token,'fecha':order_date,'ok':'1'})}")
@@ -1465,7 +1667,7 @@ class AppHandler(BaseHTTPRequestHandler):
                 f"""<section class="ticket">
 <div class="ticket-top"><div class="ticket-number">TICKET {idx:03d}</div><div class="ticket-company">{esc((r['company_name'] or '').upper())}</div></div>
 <div class="ticket-head">
-  <div class="ticket-area">{esc((r['area'] or 'Sin área').upper())}</div>
+  <div class="ticket-area">{esc(self.display_area((r['company_name'] or ''), (r['area'] or 'Sin área')).upper())}</div>
   <div class="ticket-person">{esc((r['employee_name'] or '').upper())}</div>
 </div>
 <div class="dish-entry" style="{dish_style(r['entry_item'], 'entry')}">{esc(r['entry_item'])}</div>

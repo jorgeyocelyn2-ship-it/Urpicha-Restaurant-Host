@@ -1,4 +1,4 @@
-from flask import Flask, render_template, request, send_file, jsonify, redirect, url_for, Response
+from flask import Flask, render_template, render_template_string, request, send_file, jsonify, redirect, url_for, Response
 from jinja2 import ChoiceLoader, FileSystemLoader, DictLoader
 from markupsafe import escape
 from pathlib import Path
@@ -700,6 +700,119 @@ def scanner_style():
     return Response(SCANNER_CSS, mimetype="text/css")
 
 
+@app.get("/admin/talma/usuarios")
+def talma_users():
+    orders_app.init_db()
+    with orders_app.db() as conn:
+        users = conn.execute(
+            "SELECT id, email, code, employee_name, area, active, created_at FROM talma_manual_users ORDER BY employee_name COLLATE NOCASE"
+        ).fetchall()
+    rows = "".join(
+        f"""<tr>
+<td>{orders_app.esc(r["employee_name"])}</td>
+<td>{orders_app.esc(r["email"])}</td>
+<td>{orders_app.esc(r["area"])}</td>
+<td><b>{orders_app.esc(r["code"])}</b></td>
+<td>{"Activo" if r["active"] else "Inactivo"}</td>
+<td>{orders_app.esc(r["created_at"])}</td>
+<td><form method="post" action="/admin/talma/usuarios/eliminar" onsubmit="return confirm('¿Eliminar este usuario manual?');">
+<input type="hidden" name="id" value="{r["id"]}">
+<button class="danger" type="submit">Eliminar</button>
+</form></td>
+</tr>"""
+        for r in users
+    ) or '<tr><td colspan="7">No hay usuarios manuales registrados.</td></tr>'
+
+    feedback = ""
+    if request.args.get("ok") == "1":
+        feedback = '<div class="notice success">Usuario creado correctamente.</div>'
+    elif request.args.get("ok") == "deleted":
+        feedback = '<div class="notice success">Usuario eliminado correctamente.</div>'
+    elif request.args.get("error"):
+        feedback = f'<div class="notice error">{orders_app.esc(request.args.get("error"))}</div>'
+
+    body=f"""
+<div class="admin-page">
+{feedback}
+<div class="admin-head">
+  <div><div class="kicker">TALMA</div><h1>Usuarios de acceso</h1><p>Agrega usuarios manualmente cuando no estén en el Excel principal.</p></div>
+  <a class="secondary" href="/admin/talma/">Volver a TALMA</a>
+</div>
+<div class="grid2">
+<section class="card">
+<h2>Agregar nuevo usuario</h2>
+<form method="post" action="/admin/talma/usuarios">
+<label>Correo electrónico</label>
+<input type="email" name="email" maxlength="180" required placeholder="correo@empresa.com">
+<label>Código</label>
+<input name="codigo" maxlength="40" required placeholder="Código de acceso">
+<label>Nombre y apellidos</label>
+<input name="nombre" maxlength="120" required placeholder="Nombre completo">
+<label>Área</label>
+<input name="area" maxlength="80" required placeholder="RAMPA, PAX, CARGA, OMA...">
+<button type="submit">Agregar usuario</button>
+</form>
+<p class="help">El usuario podrá entrar con este correo y código.</p>
+</section>
+<section class="card">
+<h2>Usuarios manuales</h2>
+<div class="table-wrap"><table>
+<thead><tr><th>Nombre</th><th>Correo</th><th>Área</th><th>Código</th><th>Estado</th><th>Creado</th><th></th></tr></thead>
+<tbody>{rows}</tbody>
+</table></div>
+</section>
+</div>
+</div>"""
+    extra="""<style>
+.admin-page{max-width:1180px;margin:30px auto;padding:0 18px}.admin-head{display:flex;justify-content:space-between;gap:20px;align-items:flex-start;margin-bottom:18px}.admin-head h1{margin:4px 0 6px}.kicker{font-size:12px;font-weight:800;letter-spacing:2px;color:#006b78}
+.grid2{display:grid;grid-template-columns:minmax(320px,420px) 1fr;gap:18px}.card{background:#fff;border:1px solid #d8dfe6;border-radius:15px;padding:22px;box-shadow:0 5px 18px rgba(16,24,40,.05)}
+label{display:block;font-weight:700;margin:12px 0 6px}input{width:100%;padding:11px 12px;border:1px solid #cfd8dc;border-radius:9px;font:inherit}.card button{margin-top:16px;border:0;border-radius:9px;padding:11px 15px;background:#006b78;color:#fff;font-weight:700;cursor:pointer}.card button.danger{background:#b42318}.notice{padding:12px 14px;border-radius:10px;margin-bottom:16px}.notice.success{background:#ecfdf3;color:#067647;border:1px solid #abefc6}.notice.error{background:#fef3f2;color:#b42318;border:1px solid #fecdca}.secondary{display:inline-block;padding:10px 14px;border-radius:9px;background:#eef3f5;color:#17323a;text-decoration:none;font-weight:700}.help{font-size:12px;color:#667085;line-height:1.5}.table-wrap{overflow:auto}table{width:100%;border-collapse:collapse}th,td{padding:10px;border-bottom:1px solid #e4e7ec;text-align:left;vertical-align:top}
+@media(max-width:800px){.grid2{grid-template-columns:1fr}.admin-head{flex-direction:column}}
+</style>"""
+    return render_template_string(page_like_admin(body, extra))
+
+
+@app.post("/admin/talma/usuarios")
+def talma_users_create():
+    orders_app.init_db()
+    email=request.form.get("email","").strip().lower()
+    name=request.form.get("nombre","").strip()
+    area=request.form.get("area","").strip()
+    code=request.form.get("codigo","").strip()
+    if not re.fullmatch(r"[^@\s]+@[^@\s]+\.[^@\s]+", email) or len(name)<3 or len(area)<1 or len(code)<2:
+        return redirect("/admin/talma/usuarios?error=Datos+incompletos")
+    if code in orders_app.TALMA_ROSTER:
+        pass
+    with orders_app.db() as conn:
+        exists_excel = any(code == str(r.get("codigo","")).strip() and email == str(r.get("email","")).strip().lower() for r in orders_app.TALMA_ROSTER.values())
+        exists_manual = conn.execute("SELECT id FROM talma_manual_users WHERE code=? OR lower(email)=?", (code,email)).fetchone()
+        if exists_excel or exists_manual:
+            return redirect("/admin/talma/usuarios?error=Ese+correo+o+código+ya+existe")
+        # Manual users authenticate with email + code; legacy password columns remain empty for migration compatibility.
+        conn.execute(
+            """INSERT INTO talma_manual_users(email,code,password_hash,password_salt,employee_name,area,active,created_at)
+               VALUES(?,?,?,?,?,?,1,?)""",
+            (email,code,"","",name,area,orders_app.now_iso()),
+        )
+    return redirect("/admin/talma/usuarios?ok=1")
+
+
+@app.post("/admin/talma/usuarios/eliminar")
+def talma_users_delete():
+    orders_app.init_db()
+    user_id=request.form.get("id","")
+    with orders_app.db() as conn:
+        conn.execute("UPDATE talma_manual_users SET active=0 WHERE id=?", (user_id,))
+    return redirect("/admin/talma/usuarios?ok=deleted")
+
+
+def page_like_admin(body, extra=""):
+    # Reuse the clean visual shell used by the scanner admin templates.
+    restaurant="Urpicha Restaurante"
+    return f"""<!doctype html><html lang="es"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>TALMA · Usuarios</title><style>
+body{{margin:0;font-family:Inter,Segoe UI,Arial,sans-serif;background:#f4f7f8;color:#1f2d33}}a{{color:#006b78}}.top{{background:#11353b;color:#fff;padding:14px 20px;font-weight:800}}.top a{{color:#fff;text-decoration:none}}{extra}</style></head><body><div class="top"><a href="/admin/talma/">TALMA</a> &nbsp;|&nbsp; Gestión de usuarios</div>{body}</body></html>"""
+
+
 @app.get("/admin/scanners")
 def index():
     return render_template("index.html")
@@ -714,6 +827,7 @@ def system_home(sistema):
         titulo=c["titulo"],
         subtitulo=c["subtitulo"],
         ayuda=c["ayuda"],
+        usuarios_url=url_for("talma_users") if sistema == "talma" else "",
     )
 
 

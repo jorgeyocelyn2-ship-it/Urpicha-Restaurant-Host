@@ -1,0 +1,4 @@
+Urpicha v22.1
+- En TALMA, el área PAXHANDLING se muestra como PAX.
+- Se mantiene intacto el formato de cupones: 8 por hoja, empresa en esquina, nombre/área y platos grandes.
+- La normalización afecta la visualización del área; no modifica el dato original de la base.
