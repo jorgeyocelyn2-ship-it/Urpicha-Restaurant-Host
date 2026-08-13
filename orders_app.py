@@ -387,7 +387,7 @@ footer{{text-align:center;color:var(--muted);padding:28px 16px;font-size:13px;li
 {extra_head}
 </head>
 <body>
-<div class="topbar"><strong>{restaurant}</strong><span><a href="/">Inicio</a></span></div>
+<div class="topbar"><strong>{restaurant}</strong></div>
 {body}
 <footer>
 <div class="support-footer">
@@ -1016,7 +1016,10 @@ class AppHandler(BaseHTTPRequestHandler):
         body = f"""
 <main class="wrap narrow">
 <div class="card">
-<h1>Menú de {esc(company['name'])}</h1>
+<div class="actions" style="justify-content:space-between;align-items:center">
+<h1 style="margin:0">Menú de {esc(company['name'])}</h1>
+{f'<a class="btn secondary" href="/empresa/talma/logout?token={esc(token)}">Cerrar sesión</a>' if is_talma else ''}
+</div>
 <div class="notice" style="margin:12px 0">
   <b>¿Para qué día quieres hacer tu pedido?</b>
   <form method="get" action="/empresa/{esc(slug)}" style="display:flex;gap:10px;align-items:end;flex-wrap:wrap;margin-top:10px">
@@ -1036,7 +1039,7 @@ class AppHandler(BaseHTTPRequestHandler):
 <form method="post" action="/pedido/{esc(slug)}">
 <input type="hidden" name="token" value="{esc(token)}">
 <input type="hidden" name="fecha" value="{esc(requested_date)}">
-{f'<div class="notice ok talma-welcome">Acceso correcto. Hola de nuevo, <b>{esc(talma_employee["nombre"])}</b>.<br><span>Área: {esc(self.display_area("talma", talma_employee["area"]))}</span><br><a href="/empresa/talma/logout?token={esc(token)}" style="font-size:13px">Cerrar sesión</a></div>' if is_talma else ''}
+{f'<div class="notice ok talma-welcome">Acceso correcto. Hola de nuevo, <b>{esc(talma_employee["nombre"])}</b>.<br><span>Área: {esc(self.display_area("talma", talma_employee["area"]))}</span></div>' if is_talma else ''}
 {menu_html}
 <label>Observación (opcional)</label>
 <textarea name="observaciones" maxlength="300" placeholder="Ejemplo: sin cebolla, poco arroz..."></textarea>

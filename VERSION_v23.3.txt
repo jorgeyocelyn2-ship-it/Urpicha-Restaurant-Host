@@ -1,0 +1,5 @@
+Urpicha v23.3
+- En el portal de pedidos TALMA se añadió Cerrar sesión en la parte superior del formulario.
+- Se eliminó el botón Inicio de la barra superior del sistema de pedidos.
+- Se mantuvo el saludo de acceso correcto y el resto del formulario.
+- Verificado el portal TALMA con sesión: HTTP 200, saludo presente, Cerrar sesión presente e Inicio ausente.
