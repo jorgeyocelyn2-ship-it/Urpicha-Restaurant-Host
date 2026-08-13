@@ -893,7 +893,9 @@ class AppHandler(BaseHTTPRequestHandler):
         email = form.get("email", "").strip().lower()
         codigo = form.get("codigo", "").strip()
         record = resolve_talma_login(email, codigo)
-        company = get_company("talma", token)
+        company = get_company("talma", token) if token else get_company("talma")
+        if company:
+            token = company["token"]
         if not company:
             self.send_html(page("Enlace inválido", '<main class="wrap narrow"><div class="card"><h1>Enlace inválido</h1><p>El enlace de TALMA no es válido.</p></div></main>'), 403)
             return
@@ -912,11 +914,12 @@ class AppHandler(BaseHTTPRequestHandler):
         return value
 
     def employee_form(self, slug: str, query: dict[str, str]) -> None:
-        token = query.get("token", "")
-        company = get_company(slug, token)
+        token = query.get("token", "").strip()
+        company = get_company(slug, token) if token else get_company(slug)
         if not company:
             self.send_html(page("Enlace inválido", '<main class="wrap narrow"><div class="card"><h1>Enlace inválido</h1><p>Solicite a su empresa un enlace actualizado.</p></div></main>'), 403)
             return
+        token = company["token"]
         is_talma = slug.lower() == "talma"
         talma_employee = None
         if is_talma:

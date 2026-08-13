@@ -1,0 +1,10 @@
+Urpicha v22.5 - FIX ACCESO TALMA
+
+Corrección principal:
+- /empresa/talma ahora funciona incluso sin escribir manualmente el token en la URL.
+- El sistema redirige al login TALMA y usa automáticamente el token almacenado.
+- Login con correo + código verificado contra el Excel TALMA.
+- Usuarios manuales con correo + código.
+- Nombre y área se cargan automáticamente.
+- Se mantiene la gestión de usuarios, footer y cuponera.
+- Se probaron 8 flujos TALMA: acceso sin sesión, login, rechazo de credenciales, acceso correcto, menú futuro, pedido e identificación, además del flujo sin token.
