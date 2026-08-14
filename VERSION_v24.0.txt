@@ -1,0 +1,8 @@
+Urpicha v24.0 — Resumen TALMA compacto
+
+- Se redujo el espacio vertical del bloque "Resumen por código".
+- Se redujo el tamaño del título y el padding de la tarjeta.
+- Se redujo el padding y tamaño de texto de las filas.
+- Se distribuyeron las 3 columnas para que Código, Persona y Total almuerzos entren en la pantalla.
+- Los nombres largos se muestran con truncamiento visual sin alterar los datos.
+- El cambio es exclusivo del resumen administrativo TALMA.

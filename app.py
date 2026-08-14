@@ -1937,9 +1937,9 @@ def talma_portal():
 </form>
 </div>
 
-<div class="card">
+<div class="card talma-summary-card">
 <h2>Resumen por código — {periodo_label}</h2>
-<div class="table-wrap"><table><thead><tr><th>Código</th><th>Persona</th><th>Total almuerzos</th></tr></thead>
+<div class="table-wrap"><table class="talma-summary-table"><thead><tr><th>Código</th><th>Persona</th><th>Total almuerzos</th></tr></thead>
 <tbody>{''.join(summary) or '<tr><td colspan="3">No hay pedidos en este período.</td></tr>'}</tbody></table></div>
 </div>
 
@@ -1953,6 +1953,14 @@ def talma_portal():
 .hero-total{background:linear-gradient(135deg,#0f5132,#198754);color:white;border-radius:24px;padding:24px;text-align:center;margin-bottom:20px;box-shadow:0 14px 40px rgba(15,81,50,.20)}
 .hero-kicker{font-weight:800;letter-spacing:3px;font-size:14px}.hero-number{font-size:64px;font-weight:900;line-height:1;margin:7px 0}.hero-date{font-size:17px;font-weight:700}
 .highlight-stat b{font-size:34px}.period-stat b{font-size:20px;line-height:1.25;font-weight:750}.period-stat{min-height:0}
+.talma-summary-card{padding:14px 18px;margin-bottom:16px}
+.talma-summary-card h2{font-size:20px;line-height:1.25;margin:0 0 10px}
+.talma-summary-table{table-layout:fixed;font-size:14px}
+.talma-summary-table th,.talma-summary-table td{padding:6px 9px;line-height:1.25}
+.talma-summary-table th:nth-child(1){width:24%}
+.talma-summary-table th:nth-child(2){width:51%}
+.talma-summary-table th:nth-child(3){width:25%}
+.talma-summary-table td{white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
 </style>"""
     return _talma_page("TALMA", body, extra)
 
