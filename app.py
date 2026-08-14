@@ -1227,12 +1227,18 @@ def draw_pdf_summary_policia(pdf, rows, page_width, page_height):
 
 @app.get("/admin/<any(talma,policia):sistema>/pdf")
 def create_pdf(sistema):
-    c = cfg(sistema)
     rows = load_rows(sistema)
     if not rows:
         raise RuntimeError("No hay pedidos guardados para generar el PDF.")
+    return create_pdf_from_rows(sistema, rows)
+
+
+def create_pdf_from_rows(sistema, rows, suffix=""):
+    c = cfg(sistema)
+    if not rows:
+        raise RuntimeError("No hay pedidos guardados para generar el PDF.")
     OUTPUTS.mkdir(parents=True, exist_ok=True)
-    output = OUTPUTS / f"cuponera_{c['pdf_prefix']}_{datetime.now():%Y%m%d_%H%M%S}.pdf"
+    output = OUTPUTS / f"cuponera_{c['pdf_prefix']}{suffix}_{datetime.now():%Y%m%d_%H%M%S}.pdf"
 
     pdf = canvas.Canvas(str(output), pagesize=A4)
     page_width, page_height = A4
@@ -1744,12 +1750,16 @@ def _valid_talma_session(value: str | None) -> bool:
 
 
 def _talma_page(title: str, body: str, extra: str = "") -> str:
+    query = request.query_string.decode("latin-1") if request.query_string else ""
+    suffix = f"?{query}" if query else ""
     return page(title, f"""
 <main class="wrap">
 <div class="actions no-print" style="justify-content:space-between;margin-bottom:16px">
   <h1 style="margin:0">Portal TALMA</h1>
-  <span class="actions"><a class="btn secondary" href="/talma/usuarios">Personas TALMA</a>
-  <a class="btn secondary" href="/talma/excel">Descargar Excel</a>
+  <span class="actions"><a class="btn secondary" href="/talma">Panel principal</a>
+  <a class="btn secondary" href="/talma/usuarios">Personas TALMA</a>
+  <a class="btn secondary" href="/talma/excel{suffix}">Descargar Excel</a>
+  <a class="btn secondary" href="/talma/cupones{suffix}">Generar cupones</a>
   <a class="btn secondary" href="/talma/logout">Cerrar sesión</a></span>
 </div>
 {body}
@@ -1833,6 +1843,23 @@ def talma_portal():
         key = r["codigo"] or f"legacy:{orders_app.normalize_key(r['employee_name'])}"
         counts[key] = counts.get(key, 0) + 1
 
+    today = orders_app.local_now().date()
+    month_names = ("enero", "febrero", "marzo", "abril", "mayo", "junio", "julio", "agosto", "septiembre", "octubre", "noviembre", "diciembre")
+    month_name = month_names[today.month - 1]
+    month_start = today.replace(day=1).isoformat()
+    today_iso = today.isoformat()
+    with orders_app.db() as conn:
+        monthly_total = conn.execute(
+            """SELECT COUNT(*) FROM orders o JOIN companies c ON c.id=o.company_id
+               WHERE c.slug='talma' AND o.order_date>=? AND o.order_date<=?""",
+            (month_start, today_iso),
+        ).fetchone()[0]
+        daily_total = conn.execute(
+            """SELECT COUNT(*) FROM orders o JOIN companies c ON c.id=o.company_id
+               WHERE c.slug='talma' AND o.order_date=?""",
+            (today_iso,),
+        ).fetchone()[0]
+
     running = {}
     table_rows = []
     for r in rows:
@@ -1865,19 +1892,22 @@ def talma_portal():
 
     body = f"""
 <div class="hero-total">
-  <div class="hero-kicker">PEDIDOS TALMA</div>
-  <div class="hero-number">{len(rows)}</div>
-  <div class="hero-date">menús pedidos · {periodo_label}</div>
+  <div class="hero-kicker">PEDIDOS TALMA — MES ACTUAL</div>
+  <div class="hero-number">{monthly_total}</div>
+  <div class="hero-date">menús pedidos en {month_name} de {today.year}</div>
 </div>
 
 <div class="grid grid3">
-<div class="stat">Menús pedidos<b>{len(rows)}</b></div>
-<div class="stat">Personas<b>{len(counts)}</b></div>
-<div class="stat">Período<b>{periodo_label}</b></div>
+<div class="stat highlight-stat">Pedidos del mes<b>{monthly_total}</b></div>
+<div class="stat highlight-stat">Pedidos de hoy<b>{daily_total}</b></div>
+<div class="stat period-stat">Período consultado<b>{periodo_label}</b></div>
 </div>
 
 <div class="card no-print">
-<h2> Filtrar por fecha</h2>
+<div class="actions" style="justify-content:space-between;align-items:center">
+  <h2 style="margin:0">Resumen por fechas</h2>
+  <a class="btn secondary" href="/talma">Volver al panel principal</a>
+</div>
 <form method="get" action="/talma" class="grid grid3">
   <div>
     <label>Desde</label>
@@ -1920,8 +1950,9 @@ def talma_portal():
 </div>
 """
     extra = """<style>
-.hero-total{background:linear-gradient(135deg,#0f5132,#198754);color:white;border-radius:24px;padding:28px;text-align:center;margin-bottom:22px;box-shadow:0 14px 40px rgba(15,81,50,.20)}
-.hero-kicker{font-weight:800;letter-spacing:3px;font-size:14px}.hero-number{font-size:68px;font-weight:900;line-height:1;margin:8px 0}.hero-date{font-size:18px;font-weight:700}
+.hero-total{background:linear-gradient(135deg,#0f5132,#198754);color:white;border-radius:24px;padding:24px;text-align:center;margin-bottom:20px;box-shadow:0 14px 40px rgba(15,81,50,.20)}
+.hero-kicker{font-weight:800;letter-spacing:3px;font-size:14px}.hero-number{font-size:64px;font-weight:900;line-height:1;margin:7px 0}.hero-date{font-size:17px;font-weight:700}
+.highlight-stat b{font-size:34px}.period-stat b{font-size:20px;line-height:1.25;font-weight:750}.period-stat{min-height:0}
 </style>"""
     return _talma_page("TALMA", body, extra)
 
@@ -2127,6 +2158,38 @@ def talma_admin_users_delete():
     return redirect("/talma/usuarios?ok=deleted")
 
 
+@app.get("/talma/cupones")
+def talma_cupones():
+    if not _valid_talma_session(request.cookies.get("talma_session")):
+        return _talma_login()
+    orders_app.init_db()
+    fecha_desde = request.args.get("desde", "").strip()
+    fecha_hasta = request.args.get("hasta", "").strip()
+    codigo_filter = request.args.get("codigo", "").strip()[:40]
+    def valid(value):
+        try: datetime.strptime(value, "%Y-%m-%d"); return True
+        except ValueError: return False
+    if fecha_desde and not valid(fecha_desde): fecha_desde = ""
+    if fecha_hasta and not valid(fecha_hasta): fecha_hasta = ""
+    if fecha_desde and not fecha_hasta: fecha_hasta = fecha_desde
+    if fecha_hasta and not fecha_desde: fecha_desde = fecha_hasta
+    if fecha_desde and fecha_hasta and fecha_desde > fecha_hasta: fecha_desde, fecha_hasta = fecha_hasta, fecha_desde
+    with orders_app.db() as conn:
+        sql = """SELECT o.order_date, o.employee_name, COALESCE(NULLIF(o.login_code, ''), NULLIF(o.employee_key, '')) AS codigo,
+                        o.area, o.entry_item, o.main_item, o.notes, o.created_at
+                 FROM orders o JOIN companies c ON c.id=o.company_id WHERE c.slug='talma'"""
+        args=[]
+        if codigo_filter: sql += " AND o.login_code=?"; args.append(codigo_filter)
+        if fecha_desde: sql += " AND o.order_date>=?"; args.append(fecha_desde)
+        if fecha_hasta: sql += " AND o.order_date<=?"; args.append(fecha_hasta)
+        sql += " ORDER BY o.order_date, o.employee_name COLLATE NOCASE, o.id"
+        db_rows=conn.execute(sql,args).fetchall()
+    rows=[{"nombre":r["employee_name"],"area":r["area"],"fecha":r["order_date"],"entrada":r["entry_item"],"segundo":r["main_item"],"observacion":r["notes"]} for r in db_rows]
+    if not rows: raise RuntimeError("No hay pedidos TALMA en el rango seleccionado para generar cupones.")
+    suffix=f"_{fecha_desde}_a_{fecha_hasta}" if fecha_desde and fecha_hasta else "_historial_completo"
+    return create_pdf_from_rows("talma", rows, suffix=suffix)
+
+
 @app.get("/talma/excel")
 def talma_excel():
     if not _valid_talma_session(request.cookies.get("talma_session")):
@@ -2189,7 +2252,7 @@ def talma_excel():
     summary.append(["CÓDIGO", "PERSONA", "TOTAL ALMUERZOS"])
     for key, total in sorted(counts.items()):
         rr = next((r for r in rows if (r["codigo"] or f"legacy:{orders_app.normalize_key(r['employee_name'])}") == key), None)
-        summary.append([rr["dni"] if rr and rr["dni"] else "Sin DNI", rr["employee_name"] if rr else key, total])
+        summary.append([rr["codigo"] if rr and rr["codigo"] else "Sin código", rr["employee_name"] if rr else key, total])
     summary.column_dimensions["A"].width = 16
     summary.column_dimensions["B"].width = 34
     summary.column_dimensions["C"].width = 20

@@ -1,0 +1,8 @@
+Urpicha v23.7
+- Panel administrativo TALMA: indicador principal mensual y contador independiente de pedidos de hoy.
+- El bloque de período/resumen por fechas ahora usa tipografía compacta.
+- Se añadió botón Volver al panel principal.
+- Excel conserva automáticamente el rango de fechas y código seleccionado.
+- Se añadió Generar cupones para el rango seleccionado, usando el mismo formato de cuponera TALMA.
+- Se corrigió el error IndexError de Excel: se estaba leyendo DNI aunque la consulta usa Código.
+- No se modificaron los formularios de pedidos de las otras empresas.
