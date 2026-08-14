@@ -1,0 +1,10 @@
+Urpicha v23.8 — Panel administrativo TALMA limpio
+
+- Se eliminó el botón redundante "Volver al panel principal".
+- Se eliminó el botón "Panel principal" del encabezado de TALMA.
+- Se unificaron fecha desde/hasta y código en un solo bloque "Consultar pedidos".
+- Se añadió "Generar reporte Excel" que conserva exactamente el rango de fechas y código seleccionado.
+- "Generar cupones" también conserva el rango y código seleccionados.
+- Se redujo el tamaño visual del período para evitar textos enormes y mejorar la lectura.
+- Se mantiene el contador mensual, contador diario y el resto de la lógica TALMA.
+- No se modificó orders_app.py ni los portales de otras empresas.

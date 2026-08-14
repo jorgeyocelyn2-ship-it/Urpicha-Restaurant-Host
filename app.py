@@ -1756,7 +1756,7 @@ def _talma_page(title: str, body: str, extra: str = "") -> str:
 <main class="wrap">
 <div class="actions no-print" style="justify-content:space-between;margin-bottom:16px">
   <h1 style="margin:0">Portal TALMA</h1>
-  <span class="actions"><a class="btn secondary" href="/talma">Panel principal</a>
+  <span class="actions">
   <a class="btn secondary" href="/talma/usuarios">Personas TALMA</a>
   <a class="btn secondary" href="/talma/excel{suffix}">Descargar Excel</a>
   <a class="btn secondary" href="/talma/cupones{suffix}">Generar cupones</a>
@@ -1764,6 +1764,14 @@ def _talma_page(title: str, body: str, extra: str = "") -> str:
 </div>
 {body}
 </main>
+<style>
+.talma-filters{padding:20px 22px}
+.talma-filters .filter-title{font-size:20px;font-weight:800;margin-bottom:14px;color:#17212b}
+.talma-filters label{font-size:14px}
+.talma-filters input{margin-top:5px}
+.talma-filters .filter-actions{margin-top:16px}
+.talma-filters .filter-actions .btn,.talma-filters .filter-actions button{white-space:nowrap}
+</style>
 {extra}
 """)
 
@@ -1900,41 +1908,33 @@ def talma_portal():
 <div class="grid grid3">
 <div class="stat highlight-stat">Pedidos del mes<b>{monthly_total}</b></div>
 <div class="stat highlight-stat">Pedidos de hoy<b>{daily_total}</b></div>
-<div class="stat period-stat">Período consultado<b>{periodo_label}</b></div>
+<div class="stat period-stat">Período consultado<b style="font-size:18px;line-height:1.3">{periodo_label}</b></div>
 </div>
 
-<div class="card no-print">
-<div class="actions" style="justify-content:space-between;align-items:center">
-  <h2 style="margin:0">Resumen por fechas</h2>
-  <a class="btn secondary" href="/talma">Volver al panel principal</a>
-</div>
-<form method="get" action="/talma" class="grid grid3">
-  <div>
-    <label>Desde</label>
-    <input type="date" name="desde" value="{esc(fecha_desde)}">
+<div class="card no-print talma-filters">
+<div class="filter-title">Consultar pedidos</div>
+<form method="get" action="/talma">
+  <div class="grid grid3">
+    <div>
+      <label>Desde</label>
+      <input type="date" name="desde" value="{esc(fecha_desde)}">
+    </div>
+    <div>
+      <label>Hasta</label>
+      <input type="date" name="hasta" value="{esc(fecha_hasta)}">
+    </div>
+    <div>
+      <label>Código del trabajador <span class="muted">(opcional)</span></label>
+      <input name="codigo" value="{esc(codigo_filter)}" maxlength="40" placeholder="Ej. TL001">
+    </div>
   </div>
-  <div>
-    <label>Hasta</label>
-    <input type="date" name="hasta" value="{esc(fecha_hasta)}">
-  </div>
-  <div style="align-self:end">
-    <button type="submit">Ver período</button>
-    <a class="btn secondary" href="/talma">Todo el historial</a>
+  <div class="actions filter-actions">
+    <button type="submit">Ver resultados</button>
+    <a class="btn secondary" href="/talma/excel?desde={esc(fecha_desde)}&hasta={esc(fecha_hasta)}&codigo={esc(codigo_filter)}">Generar reporte Excel</a>
+    <a class="btn secondary" href="/talma/cupones?desde={esc(fecha_desde)}&hasta={esc(fecha_hasta)}&codigo={esc(codigo_filter)}">Generar cupones</a>
+    <a class="btn secondary" href="/talma">Limpiar filtros</a>
   </div>
 </form>
-<p class="muted">Ejemplo: selecciona <b>8 de agosto</b> como inicio y <b>10 de agosto</b> como fin para saber cuántos menús se pidieron entre esas fechas.</p>
-</div>
-
-<div class="card no-print">
-<h2>Buscar por código</h2>
-<form method="get" action="/talma" class="actions">
-  <input type="hidden" name="desde" value="{esc(fecha_desde)}">
-  <input type="hidden" name="hasta" value="{esc(fecha_hasta)}">
-  <input name="codigo" value="{esc(codigo_filter)}" maxlength="40" placeholder="Código del trabajador" style="max-width:260px">
-  <button type="submit">Filtrar</button>
-  <a class="btn secondary" href="/talma?desde={esc(fecha_desde)}&hasta={esc(fecha_hasta)}">Limpiar código</a>
-</form>
-<p class="muted">Para TALMA, el código del trabajador es el identificador principal. Los registros antiguos sin código se muestran como "Sin código".</p>
 </div>
 
 <div class="card">
