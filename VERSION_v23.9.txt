@@ -1,0 +1,11 @@
+Urpicha v23.9 — Corrección de errores TALMA
+
+Corrección principal:
+- Se corrigió el NameError `padding is not defined` causado por llaves CSS sin escapar dentro del f-string de _talma_page.
+
+Auditoría:
+- Todos los archivos Python compilan correctamente.
+- Se revisó específicamente el helper HTML/CSS del portal TALMA.
+- Se mantiene el panel administrativo limpio de v23.8.
+- Se mantienen los reportes por rango, Excel, cupones y filtros de TALMA.
+- No se modificó orders_app.py ni la lógica de los portales de pedidos de las demás empresas.

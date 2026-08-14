@@ -1765,12 +1765,12 @@ def _talma_page(title: str, body: str, extra: str = "") -> str:
 {body}
 </main>
 <style>
-.talma-filters{padding:20px 22px}
-.talma-filters .filter-title{font-size:20px;font-weight:800;margin-bottom:14px;color:#17212b}
-.talma-filters label{font-size:14px}
-.talma-filters input{margin-top:5px}
-.talma-filters .filter-actions{margin-top:16px}
-.talma-filters .filter-actions .btn,.talma-filters .filter-actions button{white-space:nowrap}
+.talma-filters{{padding:20px 22px}}
+.talma-filters .filter-title{{font-size:20px;font-weight:800;margin-bottom:14px;color:#17212b}}
+.talma-filters label{{font-size:14px}}
+.talma-filters input{{margin-top:5px}}
+.talma-filters .filter-actions{{margin-top:16px}}
+.talma-filters .filter-actions .btn,.talma-filters .filter-actions button{{white-space:nowrap}}
 </style>
 {extra}
 """)
