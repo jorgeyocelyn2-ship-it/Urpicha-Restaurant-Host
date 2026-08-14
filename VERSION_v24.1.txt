@@ -1,0 +1,12 @@
+Urpicha v24.1
+
+Cambios TALMA:
+- El botón "Volver a TALMA" del apartado Personas TALMA ahora apunta directamente a /talma.
+- El botón Excel del apartado Personas TALMA ahora se llama "Descargar Excel de personas".
+- Ese botón genera un .xlsx con TODAS las personas combinadas:
+  * personas del Excel predeterminado de TALMA;
+  * personas añadidas manualmente en la base de datos;
+  * personas modificadas manualmente que sobrescriben un registro del Excel sin duplicarlo.
+- El Excel incluye: Nombre y apellidos, Correo, Código, Área, Origen, Estado y Registro.
+- El Excel tiene filtros, encabezado y columnas ajustadas.
+- El botón Excel del panel principal de TALMA sigue generando el Excel de pedidos y no fue cambiado.

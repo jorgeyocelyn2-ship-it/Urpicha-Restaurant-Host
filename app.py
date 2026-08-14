@@ -785,7 +785,7 @@ def talma_users():
 
     body=f'''
 <div class="admin-page">{feedback}
-<div class="admin-head"><div><div class="kicker">TALMA</div><h1>Personas y accesos</h1><p>Consulta, agrega, modifica o elimina las personas autorizadas.</p></div><a class="secondary" href="/admin/talma/">Volver a TALMA</a></div>
+<div class="admin-head"><div><div class="kicker">TALMA</div><h1>Personas y accesos</h1><p>Consulta, agrega, modifica o elimina las personas autorizadas.</p></div><a class="secondary" href="/talma">Volver a TALMA</a></div>
 <section class="card"><h2>{title}</h2>
 <form method="post" action="{action}" class="user-form">{hidden}
 <label>Correo electrónico</label><input type="email" name="email" maxlength="180" required value="{orders_app.esc(edit_data["email"] if edit_data else "")}">
@@ -1758,7 +1758,7 @@ def _talma_page(title: str, body: str, extra: str = "") -> str:
   <h1 style="margin:0">Portal TALMA</h1>
   <span class="actions">
   <a class="btn secondary" href="/talma/usuarios">Personas TALMA</a>
-  <a class="btn secondary" href="/talma/excel{suffix}">Descargar Excel</a>
+  <a class="btn secondary" href="{"/talma/usuarios/excel" if title == "Personas TALMA" else "/talma/excel"+suffix}">{'Descargar Excel de personas' if title == "Personas TALMA" else 'Descargar Excel'}</a>
   <a class="btn secondary" href="/talma/cupones{suffix}">Generar cupones</a>
   <a class="btn secondary" href="/talma/logout">Cerrar sesión</a></span>
 </div>
@@ -2082,6 +2082,90 @@ def talma_admin_users():
 @media(max-width:800px){.admin-head{flex-direction:column}}
 </style>'''
     return _talma_page("Personas TALMA", body, extra)
+
+
+@app.get("/talma/usuarios/excel")
+def talma_admin_users_excel():
+    if not _valid_talma_session(request.cookies.get("talma_session")):
+        return _talma_login()
+
+    orders_app.init_db()
+    with orders_app.db() as conn:
+        manual_rows=conn.execute(
+            """SELECT id,email,code,employee_name,area,active,created_at
+               FROM talma_manual_users
+               ORDER BY employee_name COLLATE NOCASE"""
+        ).fetchall()
+
+    manual_by_key={(str(r["email"]).lower(),str(r["code"])):r for r in manual_rows}
+    combined=[]
+    seen=set()
+
+    for key,record in sorted(orders_app.TALMA_ROSTER.items(), key=lambda x:x[1]["nombre"].lower()):
+        email,code=key.split("|",1)
+        override=manual_by_key.get((email,code))
+        combined.append({
+            "source":"Excel",
+            "email":override["email"] if override else email,
+            "code":override["code"] if override else code,
+            "name":override["employee_name"] if override else record["nombre"],
+            "area":override["area"] if override else record["area"],
+            "active":bool(override["active"]) if override else True,
+            "created":override["created_at"] if override else "Excel",
+        })
+        seen.add((email,code))
+
+    for r in manual_rows:
+        key=(str(r["email"]).lower(),str(r["code"]))
+        if key not in seen:
+            combined.append({
+                "source":"Manual",
+                "email":r["email"],
+                "code":r["code"],
+                "name":r["employee_name"],
+                "area":r["area"],
+                "active":bool(r["active"]),
+                "created":r["created_at"],
+            })
+
+    combined.sort(key=lambda r:r["name"].lower())
+
+    wb=Workbook()
+    ws=wb.active
+    ws.title="Personas TALMA"
+    headers=["Nombre y apellidos","Correo","Código","Área","Origen","Estado","Registro"]
+    ws.append(headers)
+
+    for r in combined:
+        ws.append([
+            r["name"],r["email"],r["code"],r["area"],r["source"],
+            "Activo" if r["active"] else "Inactivo",r["created"]
+        ])
+
+    widths=[34,36,18,22,14,14,22]
+    for i,width in enumerate(widths,1):
+        ws.column_dimensions[get_column_letter(i)].width=width
+
+    header_fill=PatternFill("solid",fgColor="176B43")
+    for cell in ws[1]:
+        cell.font=Font(bold=True,color="FFFFFF")
+        cell.fill=header_fill
+        cell.alignment=Alignment(horizontal="center",vertical="center")
+    ws.freeze_panes="A2"
+    ws.auto_filter.ref=ws.dimensions
+
+    for row in ws.iter_rows(min_row=2):
+        for cell in row:
+            cell.alignment=Alignment(vertical="top",wrap_text=True)
+
+    output=io.BytesIO()
+    wb.save(output)
+    output.seek(0)
+    filename=f"personas_talma_{datetime.now():%Y%m%d_%H%M%S}.xlsx"
+    return send_file(
+        output,as_attachment=True,download_name=filename,
+        mimetype="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+    )
 
 
 @app.post("/talma/usuarios")
