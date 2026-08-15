@@ -97,33 +97,34 @@ CONFIG = load_config()
 TALMA_ROSTER_PATH = BASE_DIR / "talma_personas.xlsx"
 
 def load_talma_roster() -> dict:
+    """Carga exclusivamente la base oficial de personas TALMA desde talma_personas.xlsx."""
     roster = {}
     try:
         workbook = load_workbook(TALMA_ROSTER_PATH, read_only=True, data_only=True)
         sheet = workbook.active
         rows = sheet.iter_rows(values_only=True)
         headers = [str(v or "").strip().upper() for v in next(rows)]
-        code_idx = headers.index("CODIGO ESTACION") if "CODIGO ESTACION" in headers else headers.index("CODIGO")
+        dni_idx = headers.index("DNI")
         name_idx = headers.index("NOMBRE_APELLIDOS")
         area_idx = headers.index("AREA")
         email_idx = headers.index("EMAIL")
         for row in rows:
             if not row:
                 continue
-            code = str(row[code_idx] or "").strip()
+            raw_dni = row[dni_idx]
+            dni = str(raw_dni).strip() if raw_dni is not None else ""
+            if dni.endswith(".0"):
+                dni = dni[:-2]
             name = str(row[name_idx] or "").strip()
             area = str(row[area_idx] or "").strip()
             email = str(row[email_idx] or "").strip().lower()
-            if code and email:
-                roster[f"{email}|{code}"] = {
-                    "email": email,
-                    "codigo": code,
-                    "nombre": name,
-                    "area": area,
+            if dni and email:
+                roster[f"{email}|{dni}"] = {
+                    "email": email, "dni": dni, "nombre": name, "area": area
                 }
         workbook.close()
     except Exception as error:
-        print(f"[TALMA] No se pudo leer la base Excel: {error}", file=sys.stderr)
+        print(f"[TALMA] No se pudo leer la base Excel de personas: {error}", file=sys.stderr)
     return roster
 
 TALMA_ROSTER = load_talma_roster()
@@ -151,14 +152,8 @@ def verify_talma_password(password: str, password_hash: str, password_salt: str)
         return False
 
 
-def get_talma_manual_user(email: str, code: str, include_inactive: bool = False):
-    with db() as conn:
-        query = "SELECT * FROM talma_manual_users WHERE lower(email)=? AND code=?"
-        params = (email.strip().lower(), code.strip())
-        if not include_inactive:
-            query += " AND active=1"
-        return conn.execute(query, params).fetchone()
-
+def get_talma_manual_user(email: str, dni: str, include_inactive: bool = False):
+    return None
 
 def init_db() -> None:
     with db() as conn:
@@ -198,20 +193,11 @@ def init_db() -> None:
                 FOREIGN KEY(company_id) REFERENCES companies(id) ON DELETE CASCADE,
                 UNIQUE(company_id, order_date, employee_key)
             );
-
-            CREATE TABLE IF NOT EXISTS talma_manual_users (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                email TEXT NOT NULL DEFAULT '',
-                code TEXT NOT NULL UNIQUE,
-                password_hash TEXT NOT NULL DEFAULT '',
-                password_salt TEXT NOT NULL DEFAULT '',
-                employee_name TEXT NOT NULL,
-                area TEXT NOT NULL,
-                active INTEGER NOT NULL DEFAULT 1,
-                created_at TEXT NOT NULL
-            );
             """
         )
+
+        # La antigua tabla de personas TALMA se elimina: la fuente oficial es el Excel.
+        conn.execute("DROP TABLE IF EXISTS talma_manual_users")
 
         # Migración compatible: versiones anteriores no tenían DNI.
         columns = {row["name"] for row in conn.execute("PRAGMA table_info(orders)").fetchall()}
@@ -224,11 +210,6 @@ def init_db() -> None:
         conn.execute("CREATE INDEX IF NOT EXISTS idx_orders_talma_dni ON orders(dni)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_orders_talma_code ON orders(login_code)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_orders_talma_email ON orders(login_email)")
-        manual_cols = {row["name"] for row in conn.execute("PRAGMA table_info(talma_manual_users)").fetchall()}
-        if "email" not in manual_cols:
-            conn.execute("ALTER TABLE talma_manual_users ADD COLUMN email TEXT NOT NULL DEFAULT ''")
-        conn.execute("CREATE INDEX IF NOT EXISTS idx_talma_manual_email ON talma_manual_users(email)")
-
         # Elimina el enlace de demostración de versiones anteriores y garantiza
         # los cuatro enlaces predeterminados solicitados.
         conn.execute("DELETE FROM companies WHERE slug='empresa-demo'")
@@ -442,33 +423,21 @@ def valid_session(value: str | None) -> bool:
 
 
 
-def resolve_talma_login(email: str, codigo: str):
+def resolve_talma_login(email: str, dni: str):
     email = email.strip().lower()
-    codigo = codigo.strip()
-    if not email or not codigo:
+    dni = dni.strip()
+    if not email or not dni:
         return None
-    override = get_talma_manual_user(email, codigo, include_inactive=True)
-    if override is not None:
-        if not override["active"]:
-            return None
-        return {
-            "email": override["email"],
-            "codigo": override["code"],
-            "nombre": override["employee_name"],
-            "area": override["area"],
-            "manual": True,
-        }
-    record = TALMA_ROSTER.get(f"{email}|{codigo}")
+    record = TALMA_ROSTER.get(f"{email}|{dni}")
     if record:
         result = dict(record)
         result["manual"] = False
         return result
     return None
 
-
 def talma_employee_session_value(record: dict) -> str:
     expires = str(int(time.time()) + 12 * 3600)
-    payload = f"talma_employee:{record['email']}:{record['codigo']}:{expires}"
+    payload = f"talma_employee:{record['email']}:{record['dni']}:{expires}"
     sig = hmac.new(CONFIG["secret_key"].encode(), payload.encode(), hashlib.sha256).hexdigest()
     return f"{payload}:{sig}"
 
@@ -477,14 +446,14 @@ def valid_talma_employee_session(value: str | None) -> dict | None:
     if not value:
         return None
     try:
-        user, email, codigo, expires, sig = value.split(":", 4)
+        user, email, dni, expires, sig = value.split(":", 4)
         if user != "talma_employee" or int(expires) < time.time():
             return None
-        payload = f"{user}:{email}:{codigo}:{expires}"
+        payload = f"{user}:{email}:{dni}:{expires}"
         expected = hmac.new(CONFIG["secret_key"].encode(), payload.encode(), hashlib.sha256).hexdigest()
         if not hmac.compare_digest(sig, expected):
             return None
-        return resolve_talma_login(email, codigo)
+        return resolve_talma_login(email, dni)
     except (ValueError, TypeError):
         return None
 
@@ -497,14 +466,14 @@ def talma_employee_login_page(token: str, error: str = "") -> str:
 <div class="talma-brand">TALMA</div>
 <div class="talma-line"></div>
 <h1>Acceso a pedidos</h1>
-<p class="talma-subtitle">Ingresa con tu correo y código registrados.</p>
+<p class="talma-subtitle">Ingresa con tu correo y DNI registrados.</p>
 {notice}
 <form method="post" action="/empresa/talma/login">
 <input type="hidden" name="token" value="{esc(token)}">
 <label>Correo electrónico</label>
 <input type="email" name="email" autocomplete="username" required placeholder="correo@empresa.com">
-<label>Código</label>
-<input type="text" name="codigo" autocomplete="one-time-code" required placeholder="Código">
+<label>DNI</label>
+<input type="text" name="dni" inputmode="numeric" autocomplete="username" required placeholder="DNI" maxlength="8">
 <p class="talma-help">El sistema valida ambos datos y carga automáticamente tu nombre y área.</p>
 <button type="submit">Ingresar</button>
 </form>
@@ -891,8 +860,8 @@ class AppHandler(BaseHTTPRequestHandler):
         form = self.read_form()
         token = form.get("token", "").strip()
         email = form.get("email", "").strip().lower()
-        codigo = form.get("codigo", "").strip()
-        record = resolve_talma_login(email, codigo)
+        dni = form.get("dni", "").strip()
+        record = resolve_talma_login(email, dni)
         company = get_company("talma", token) if token else get_company("talma")
         if company:
             token = company["token"]
@@ -900,7 +869,7 @@ class AppHandler(BaseHTTPRequestHandler):
             self.send_html(page("Enlace inválido", '<main class="wrap narrow"><div class="card"><h1>Enlace inválido</h1><p>El enlace de TALMA no es válido.</p></div></main>'), 403)
             return
         if not record:
-            self.redirect(f"/empresa/talma/login?{urlencode({'token':token,'error':'Correo o código incorrecto.'})}")
+            self.redirect(f"/empresa/talma/login?{urlencode({'token':token,'error':'Correo o DNI incorrecto.'})}")
             return
         value = talma_employee_session_value(record)
         secure = "; Secure" if self.headers.get("X-Forwarded-Proto") == "https" else ""
@@ -1078,8 +1047,8 @@ class AppHandler(BaseHTTPRequestHandler):
                 return
             name = talma_employee["nombre"]
             area = talma_employee["area"]
-            dni = ""
-            login_code = talma_employee["codigo"]
+            dni = talma_employee["dni"]
+            login_code = talma_employee["dni"]
             login_email = talma_employee["email"]
         else:
             name = form.get("nombre", "").strip()
@@ -1113,7 +1082,7 @@ class AppHandler(BaseHTTPRequestHandler):
             return
         try:
             with db() as conn:
-                employee_key = f"talma:{login_code}" if is_talma else normalize_key(name)
+                employee_key = f"talma:{dni}" if is_talma else normalize_key(name)
                 conn.execute(
                     """INSERT INTO orders(company_id, order_date, employee_name, employee_key, dni, area, entry_item, main_item, notes, delivery_type, created_at, login_code, login_email)
                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",

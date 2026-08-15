@@ -895,7 +895,7 @@ def page_like_admin(body, extra=""):
     # Reuse the clean visual shell used by the scanner admin templates.
     restaurant="Urpicha Restaurante"
     return f"""<!doctype html><html lang="es"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><title>TALMA · Usuarios</title><style>
-body{{margin:0;font-family:Inter,Segoe UI,Arial,sans-serif;background:#f4f7f8;color:#1f2d33}}a{{color:#006b78}}.top{{background:#11353b;color:#fff;padding:14px 20px;font-weight:800}}.top a{{color:#fff;text-decoration:none}}{extra}</style></head><body><div class="top"><a href="/admin/talma/">TALMA</a> &nbsp;|&nbsp; Gestión de usuarios</div>{body}
+body{{margin:0;font-family:Inter,Segoe UI,Arial,sans-serif;background:#f4f7f8;color:#1f2d33}}a{{color:#006b78}}.top{{background:#11353b;color:#fff;padding:14px 20px;font-weight:800}}.top a{{color:#fff;text-decoration:none}}{extra}</style></head><body><div class="top"><a href="/talma">TALMA</a> &nbsp;|&nbsp; Gestión de usuarios</div>{body}
 <footer style="text-align:center;color:#667085;padding:28px 16px;font-size:13px;line-height:1.6;border-top:1px solid #d8dfe6;margin-top:28px;background:#fff">
 <strong>Soporte del sistema</strong><br>
 Cualquier duda o sugerencia respecto al sistema, comunicarse por:<br>
@@ -1801,7 +1801,7 @@ def talma_portal():
         return _talma_login()
 
     orders_app.init_db()
-    codigo_filter = request.args.get("codigo", "").strip()[:40]
+    dni_filter = request.args.get("dni", "").strip()[:20]
     fecha_desde = request.args.get("desde", "").strip()
     fecha_hasta = request.args.get("hasta", "").strip()
 
@@ -1827,14 +1827,14 @@ def talma_portal():
 
     with orders_app.db() as conn:
         sql = """SELECT o.id, o.order_date, o.employee_name,
-                        COALESCE(NULLIF(o.login_code, ''), NULLIF(o.employee_key, '')) AS codigo,
+                        o.dni AS dni,
                         o.area, o.entry_item, o.main_item, o.notes, o.created_at
                  FROM orders o JOIN companies c ON c.id=o.company_id
                  WHERE c.slug='talma'"""
         args = []
-        if codigo_filter:
-            sql += " AND o.login_code=?"
-            args.append(codigo_filter)
+        if dni_filter:
+            sql += " AND o.dni=?"
+            args.append(dni_filter)
         if fecha_desde:
             sql += " AND o.order_date>=?"
             args.append(fecha_desde)
@@ -1842,13 +1842,13 @@ def talma_portal():
             sql += " AND o.order_date<=?"
             args.append(fecha_hasta)
         sql += """ ORDER BY o.order_date DESC,
-                   CASE WHEN o.login_code='' THEN 1 ELSE 0 END,
-                   o.login_code, o.employee_name COLLATE NOCASE, o.id"""
+                   CASE WHEN o.dni='' THEN 1 ELSE 0 END,
+                   o.dni, o.employee_name COLLATE NOCASE, o.id"""
         rows = conn.execute(sql, args).fetchall()
 
     counts = {}
     for r in rows:
-        key = r["codigo"] or f"legacy:{orders_app.normalize_key(r['employee_name'])}"
+        key = r["dni"] or f"legacy:{orders_app.normalize_key(r['employee_name'])}"
         counts[key] = counts.get(key, 0) + 1
 
     today = orders_app.local_now().date()
@@ -1871,7 +1871,7 @@ def talma_portal():
     running = {}
     table_rows = []
     for r in rows:
-        key = r["codigo"] or f"legacy:{orders_app.normalize_key(r['employee_name'])}"
+        key = r["dni"] or f"legacy:{orders_app.normalize_key(r['employee_name'])}"
         running[key] = running.get(key, 0) + 1
         table_rows.append(
             f"<tr><td>{esc(r['order_date'])}</td><td><b>{esc(r['codigo'] or '—')}</b></td><td>{esc(r['employee_name'])}</td>"
@@ -1880,12 +1880,12 @@ def talma_portal():
         )
 
     summary = []
-    for codigo_key, total in sorted(counts.items(), key=lambda x: x[0]):
-        rr = next((r for r in rows if (r["codigo"] or f"legacy:{orders_app.normalize_key(r['employee_name'])}") == codigo_key), None)
-        label = rr["employee_name"] if rr else codigo_key
-        codigo_label = rr["codigo"] if rr and rr["codigo"] else "Sin código (registro antiguo)"
+    for dni_key, total in sorted(counts.items(), key=lambda x: x[0]):
+        rr = next((r for r in rows if (r["dni"] or f"legacy:{orders_app.normalize_key(r['employee_name'])}") == dni_key), None)
+        label = rr["employee_name"] if rr else dni_key
+        dni_label = rr["dni"] if rr and rr["dni"] else "Sin DNI (registro antiguo)"
         summary.append(
-            f"<tr><td><b>{esc(codigo_label)}</b></td><td>{esc(label)}</td><td>{total}</td></tr>"
+            f"<tr><td><b>{esc(dni_label)}</b></td><td>{esc(label)}</td><td>{total}</td></tr>"
         )
 
     if fecha_desde and fecha_hasta:
@@ -1924,28 +1924,28 @@ def talma_portal():
       <input type="date" name="hasta" value="{esc(fecha_hasta)}">
     </div>
     <div>
-      <label>Código del trabajador <span class="muted">(opcional)</span></label>
-      <input name="codigo" value="{esc(codigo_filter)}" maxlength="40" placeholder="Ej. TL001">
+      <label>DNI del trabajador <span class="muted">(opcional)</span></label>
+      <input name="dni" value="{esc(dni_filter)}" maxlength="40" placeholder="Ej. 71206879">
     </div>
   </div>
   <div class="actions filter-actions">
     <button type="submit">Ver resultados</button>
-    <a class="btn secondary" href="/talma/excel?desde={esc(fecha_desde)}&hasta={esc(fecha_hasta)}&codigo={esc(codigo_filter)}">Generar reporte Excel</a>
-    <a class="btn secondary" href="/talma/cupones?desde={esc(fecha_desde)}&hasta={esc(fecha_hasta)}&codigo={esc(codigo_filter)}">Generar cupones</a>
+    <a class="btn secondary" href="/talma/excel?desde={esc(fecha_desde)}&hasta={esc(fecha_hasta)}&codigo={esc(dni_filter)}">Generar reporte Excel</a>
+    <a class="btn secondary" href="/talma/cupones?desde={esc(fecha_desde)}&hasta={esc(fecha_hasta)}&codigo={esc(dni_filter)}">Generar cupones</a>
     <a class="btn secondary" href="/talma">Limpiar filtros</a>
   </div>
 </form>
 </div>
 
 <div class="card talma-summary-card">
-<h2>Resumen por código — {periodo_label}</h2>
-<div class="table-wrap"><table class="talma-summary-table"><thead><tr><th>Código</th><th>Persona</th><th>Total almuerzos</th></tr></thead>
+<h2>Resumen por DNI — {periodo_label}</h2>
+<div class="table-wrap"><table class="talma-summary-table"><thead><tr><th>DNI</th><th>Persona</th><th>Total almuerzos</th></tr></thead>
 <tbody>{''.join(summary) or '<tr><td colspan="3">No hay pedidos en este período.</td></tr>'}</tbody></table></div>
 </div>
 
 <div class="card">
 <h2>Pedidos TALMA — {periodo_label}</h2>
-<div class="table-wrap"><table><thead><tr><th>Fecha</th><th>Código</th><th>Persona</th><th>Área</th><th>Entrada</th><th>Plato de fondo</th><th>N° Almuerzo</th><th>Hora</th></tr></thead>
+<div class="table-wrap"><table><thead><tr><th>Fecha</th><th>DNI</th><th>Persona</th><th>Área</th><th>Entrada</th><th>Plato de fondo</th><th>N° Almuerzo</th><th>Hora</th></tr></thead>
 <tbody>{''.join(table_rows) or '<tr><td colspan="8">No hay pedidos en este período.</td></tr>'}</tbody></table></div>
 </div>
 """
@@ -1986,101 +1986,46 @@ def talma_logout():
 
 @app.get("/talma/usuarios")
 def talma_admin_users():
-    orders_app.init_db()
-    edit_id=request.args.get("editar","").strip()
-    edit_source=request.args.get("origen","").strip()
+    """Personas TALMA: fuente única = talma_personas.xlsx."""
+    if not _valid_talma_session(request.cookies.get("talma_session")):
+        return _talma_login()
 
-    with orders_app.db() as conn:
-        manual_rows=conn.execute("SELECT id,email,code,employee_name,area,active,created_at FROM talma_manual_users ORDER BY employee_name COLLATE NOCASE").fetchall()
+    people = sorted(orders_app.TALMA_ROSTER.values(), key=lambda r: r["nombre"].lower())
+    rows = "".join(
+        f"<tr><td>{esc(r['nombre'])}</td><td>{esc(r['email'])}</td><td>{esc(r['area'])}</td><td><b>{esc(r['dni'])}</b></td></tr>"
+        for r in people
+    ) or '<tr><td colspan="4">No hay personas en la base TALMA.</td></tr>'
 
-    manual_by_key={(str(r["email"]).lower(),str(r["code"])):r for r in manual_rows}
-    combined=[]
-    seen=set()
-
-    for key,record in sorted(orders_app.TALMA_ROSTER.items(), key=lambda x:x[1]["nombre"].lower()):
-        email,code=key.split("|",1)
-        override=manual_by_key.get((email,code))
-        combined.append({
-            "source":"excel","id":override["id"] if override else "",
-            "email":override["email"] if override else email,
-            "code":override["code"] if override else code,
-            "name":override["employee_name"] if override else record["nombre"],
-            "area":override["area"] if override else record["area"],
-            "active":bool(override["active"]) if override else True,
-            "created":override["created_at"] if override else "Excel",
-        })
-        seen.add((email,code))
-
-    for r in manual_rows:
-        key=(str(r["email"]).lower(),str(r["code"]))
-        if key not in seen:
-            combined.append({
-                "source":"manual","id":r["id"],"email":r["email"],"code":r["code"],
-                "name":r["employee_name"],"area":r["area"],"active":bool(r["active"]),
-                "created":r["created_at"],
-            })
-    combined.sort(key=lambda r:r["name"].lower())
-
-    edit_data=None
-    for r in combined:
-        if edit_source=="excel" and edit_id and "|" in edit_id:
-            e,c=edit_id.split("|",1)
-            if r["source"]=="excel" and r["email"].lower()==e.lower() and r["code"]==c:
-                edit_data=r; break
-        elif edit_source=="manual" and str(r["id"])==edit_id:
-            edit_data=r; break
-
-    rows=[]
-    for r in combined:
-        if r["source"]=="excel" and not r["id"]:
-            edit_href=f'/talma/usuarios?editar={quote(r["email"]+"|"+r["code"])}&origen=excel'
-        else:
-            edit_href=f'/talma/usuarios?editar={quote(str(r["id"]))}&origen=manual'
-        delete_href=f'/talma/usuarios/eliminar?origen={r["source"]}&id={quote(str(r["id"]))}&email={quote(r["email"])}&codigo={quote(r["code"])}'
-        origin="Excel" if r["source"]=="excel" and not r["id"] else ("Editado" if r["source"]=="excel" else "Manual")
-        status="Activo" if r["active"] else "Inactivo"
-        rows.append(f'''<tr>
-<td>{orders_app.esc(r["name"])}</td><td>{orders_app.esc(r["email"])}</td><td>{orders_app.esc(r["area"])}</td>
-<td><b>{orders_app.esc(r["code"])}</b></td><td>{origin}</td><td>{status}</td><td>{orders_app.esc(r["created"])}</td>
-<td><a class="small-action" href="{edit_href}">Editar</a> &nbsp; <a class="small-action danger-text" href="{delete_href}" onclick="return confirm('¿Eliminar o desactivar este usuario?');">Eliminar</a></td>
-</tr>''')
-    rows="".join(rows) or '<tr><td colspan="8">No hay personas registradas.</td></tr>'
-
-    feedback=""
-    if request.args.get("ok")=="1": feedback='<div class="notice success">Usuario guardado correctamente.</div>'
-    elif request.args.get("ok")=="deleted": feedback='<div class="notice success">Usuario eliminado o desactivado correctamente.</div>'
-    elif request.args.get("error"): feedback=f'<div class="notice error">{orders_app.esc(request.args.get("error"))}</div>'
-
-    if edit_data:
-        title="Editar persona"; action="/talma/usuarios/editar"; submit="Guardar cambios"
-        hidden=f'<input type="hidden" name="origen" value="{orders_app.esc(edit_data["source"])}"><input type="hidden" name="original_email" value="{orders_app.esc(edit_data["email"])}"><input type="hidden" name="original_codigo" value="{orders_app.esc(edit_data["code"])}">'
-        cancel='<a class="secondary" href="/talma/usuarios">Cancelar</a>'
-    else:
-        title="Añadir persona"; action="/talma/usuarios"; submit="Añadir persona"; hidden=""; cancel=""
-
-    body=f'''
-<div class="admin-page">{feedback}
-<div class="admin-head"><div><div class="kicker">TALMA</div><h1>Personas y accesos</h1><p>Consulta, agrega, modifica o elimina las personas autorizadas.</p></div><a class="secondary" href="/admin/talma/">Volver a TALMA</a></div>
-<section class="card"><h2>{title}</h2>
-<form method="post" action="{action}" class="user-form">{hidden}
-<label>Correo electrónico</label><input type="email" name="email" maxlength="180" required value="{orders_app.esc(edit_data["email"] if edit_data else "")}">
-<label>Código</label><input name="codigo" maxlength="40" required value="{orders_app.esc(edit_data["code"] if edit_data else "")}">
-<label>Nombre y apellidos</label><input name="nombre" maxlength="120" required value="{orders_app.esc(edit_data["name"] if edit_data else "")}">
-<label>Área</label><input name="area" maxlength="80" required value="{orders_app.esc(edit_data["area"] if edit_data else "")}">
-<div class="actions"><button type="submit">{submit}</button>{cancel}</div></form>
-<p class="help">Los usuarios del Excel y los añadidos manualmente usan correo y código para acceder. Los cambios aquí se aplican al acceso del portal TALMA.</p></section>
-<section class="card"><h2>Personas registradas ({len(combined)})</h2>
-<div class="table-wrap"><table><thead><tr><th>Nombre</th><th>Correo</th><th>Área</th><th>Código</th><th>Origen</th><th>Estado</th><th>Registro</th><th>Acciones</th></tr></thead>
-<tbody>{rows}</tbody></table></div></section></div>'''
-    extra='''<style>
-.admin-page{max-width:1240px;margin:30px auto;padding:0 18px}.admin-head{display:flex;justify-content:space-between;gap:20px;align-items:flex-start;margin-bottom:18px}.admin-head h1{margin:4px 0 6px}.kicker{font-size:12px;font-weight:800;letter-spacing:2px;color:#006b78}
+    body=f"""
+<div class="admin-page">
+<div class="admin-head">
+  <div><div class="kicker">TALMA</div><h1>Personas y accesos</h1>
+  <p>Listado oficial cargado desde el Excel de TALMA.</p></div>
+  <a class="secondary" href="/talma">Volver a TALMA</a>
+</div>
+<section class="card">
+  <div class="actions" style="justify-content:space-between">
+    <h2 style="margin:0">Personas registradas ({len(people)})</h2>
+    <a class="secondary" href="/talma/usuarios/excel">Descargar Excel de personas</a>
+  </div>
+  <div class="table-wrap">
+    <table><thead><tr><th>Nombre</th><th>Correo</th><th>Área</th><th>DNI</th></tr></thead>
+    <tbody>{rows}</tbody></table>
+  </div>
+</section>
+</div>"""
+    extra="""
+<style>
+.admin-page{max-width:1240px;margin:30px auto;padding:0 18px}
+.admin-head{display:flex;justify-content:space-between;gap:20px;align-items:flex-start;margin-bottom:18px}
+.admin-head h1{margin:4px 0 6px}.kicker{font-size:12px;font-weight:800;letter-spacing:2px;color:#006b78}
 .card{background:#fff;border:1px solid #d8dfe6;border-radius:15px;padding:22px;margin-bottom:18px;box-shadow:0 5px 18px rgba(16,24,40,.05)}
-.user-form{max-width:720px}.user-form label{display:block;font-weight:700;margin:12px 0 6px}.user-form input{width:100%;padding:11px 12px;border:1px solid #cfd8dc;border-radius:9px;font:inherit}.user-form button{margin-top:16px;border:0;border-radius:9px;padding:11px 15px;background:#006b78;color:#fff;font-weight:700;cursor:pointer}
-.actions{display:flex;gap:10px;flex-wrap:wrap;align-items:center}.secondary{display:inline-block;padding:10px 14px;border-radius:9px;background:#eef3f5;color:#17323a;text-decoration:none;font-weight:700}.help{font-size:12px;color:#667085;line-height:1.5}
-.notice{padding:12px 14px;border-radius:10px;margin-bottom:16px}.notice.success{background:#ecfdf3;color:#067647;border:1px solid #abefc6}.notice.error{background:#fef3f2;color:#b42318;border:1px solid #fecdca}
-.table-wrap{overflow:auto}table{width:100%;border-collapse:collapse}th,td{padding:10px;border-bottom:1px solid #e4e7ec;text-align:left;vertical-align:top;white-space:nowrap}.small-action{color:#006b78;font-weight:700;text-decoration:none}.danger-text{color:#b42318}
+.actions{display:flex;gap:10px;flex-wrap:wrap;align-items:center}
+.secondary{display:inline-block;padding:10px 14px;border-radius:9px;background:#eef3f5;color:#17323a;text-decoration:none;font-weight:700}
+.table-wrap{overflow:auto}table{width:100%;border-collapse:collapse}
+th,td{padding:9px;border-bottom:1px solid #e4e7ec;text-align:left;vertical-align:top;white-space:nowrap}
 @media(max-width:800px){.admin-head{flex-direction:column}}
-</style>'''
+</style>"""
     return _talma_page("Personas TALMA", body, extra)
 
 
@@ -2089,71 +2034,23 @@ def talma_admin_users_excel():
     if not _valid_talma_session(request.cookies.get("talma_session")):
         return _talma_login()
 
-    orders_app.init_db()
-    with orders_app.db() as conn:
-        manual_rows=conn.execute(
-            """SELECT id,email,code,employee_name,area,active,created_at
-               FROM talma_manual_users
-               ORDER BY employee_name COLLATE NOCASE"""
-        ).fetchall()
-
-    manual_by_key={(str(r["email"]).lower(),str(r["code"])):r for r in manual_rows}
-    combined=[]
-    seen=set()
-
-    for key,record in sorted(orders_app.TALMA_ROSTER.items(), key=lambda x:x[1]["nombre"].lower()):
-        email,code=key.split("|",1)
-        override=manual_by_key.get((email,code))
-        combined.append({
-            "source":"Excel",
-            "email":override["email"] if override else email,
-            "code":override["code"] if override else code,
-            "name":override["employee_name"] if override else record["nombre"],
-            "area":override["area"] if override else record["area"],
-            "active":bool(override["active"]) if override else True,
-            "created":override["created_at"] if override else "Excel",
-        })
-        seen.add((email,code))
-
-    for r in manual_rows:
-        key=(str(r["email"]).lower(),str(r["code"]))
-        if key not in seen:
-            combined.append({
-                "source":"Manual",
-                "email":r["email"],
-                "code":r["code"],
-                "name":r["employee_name"],
-                "area":r["area"],
-                "active":bool(r["active"]),
-                "created":r["created_at"],
-            })
-
-    combined.sort(key=lambda r:r["name"].lower())
-
+    people = sorted(orders_app.TALMA_ROSTER.values(), key=lambda r: r["nombre"].lower())
     wb=Workbook()
     ws=wb.active
     ws.title="Personas TALMA"
-    headers=["Nombre y apellidos","Correo","Código","Área","Origen","Estado","Registro"]
-    ws.append(headers)
+    ws.append(["Nombre y apellidos","Correo","DNI","Área"])
+    for r in people:
+        ws.append([r["nombre"],r["email"],r["dni"],r["area"]])
 
-    for r in combined:
-        ws.append([
-            r["name"],r["email"],r["code"],r["area"],r["source"],
-            "Activo" if r["active"] else "Inactivo",r["created"]
-        ])
-
-    widths=[34,36,18,22,14,14,22]
-    for i,width in enumerate(widths,1):
+    for i,width in enumerate([36,40,18,24],1):
         ws.column_dimensions[get_column_letter(i)].width=width
-
-    header_fill=PatternFill("solid",fgColor="176B43")
+    fill=PatternFill("solid",fgColor="176B43")
     for cell in ws[1]:
         cell.font=Font(bold=True,color="FFFFFF")
-        cell.fill=header_fill
+        cell.fill=fill
         cell.alignment=Alignment(horizontal="center",vertical="center")
     ws.freeze_panes="A2"
     ws.auto_filter.ref=ws.dimensions
-
     for row in ws.iter_rows(min_row=2):
         for cell in row:
             cell.alignment=Alignment(vertical="top",wrap_text=True)
@@ -2161,135 +2058,19 @@ def talma_admin_users_excel():
     output=io.BytesIO()
     wb.save(output)
     output.seek(0)
-    filename=f"personas_talma_{datetime.now():%Y%m%d_%H%M%S}.xlsx"
-    return send_file(
-        output,as_attachment=True,download_name=filename,
-        mimetype="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-    )
+    return send_file(output,as_attachment=True,
+        download_name=f"personas_talma_{datetime.now():%Y%m%d_%H%M%S}.xlsx",
+        mimetype="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
 
 
-@app.post("/talma/usuarios")
-def talma_admin_users_create():
-    orders_app.init_db()
-    email=request.form.get("email","").strip().lower(); name=request.form.get("nombre","").strip()
-    area=request.form.get("area","").strip(); code=request.form.get("codigo","").strip()
-    if not re.fullmatch(r"[^@\s]+@[^@\s]+\.[^@\s]+",email) or len(name)<3 or not area or len(code)<2:
-        return redirect("/talma/usuarios?error=Datos+incompletos")
-    with orders_app.db() as conn:
-        collision=conn.execute("SELECT id FROM talma_manual_users WHERE code=? OR lower(email)=?",(code,email)).fetchone()
-        excel_collision=any(str(r["codigo"])==code and str(r["email"]).lower()==email for r in orders_app.TALMA_ROSTER.values())
-        if collision or excel_collision:
-            return redirect("/talma/usuarios?error=Ese+correo+o+código+ya+existe")
-        conn.execute("INSERT INTO talma_manual_users(email,code,password_hash,password_salt,employee_name,area,active,created_at) VALUES(?,?,?,?,?,?,1,?)",
-                     (email,code,"","",name,area,orders_app.now_iso()))
-    return redirect("/talma/usuarios?ok=1")
 
-
-@app.post("/talma/usuarios/editar")
-def talma_admin_users_edit():
-    orders_app.init_db()
-    email=request.form.get("email","").strip().lower(); code=request.form.get("codigo","").strip()
-    name=request.form.get("nombre","").strip(); area=request.form.get("area","").strip()
-    origin=request.form.get("origen","").strip()
-    original_email=request.form.get("original_email","").strip().lower()
-    original_code=request.form.get("original_codigo","").strip()
-    if not re.fullmatch(r"[^@\s]+@[^@\s]+\.[^@\s]+",email) or len(code)<2 or len(name)<3 or not area:
-        return redirect("/talma/usuarios?error=Datos+incompletos")
-    with orders_app.db() as conn:
-        existing=conn.execute("SELECT id FROM talma_manual_users WHERE lower(email)=? AND code=?",(original_email,original_code)).fetchone()
-        collision=conn.execute("SELECT id FROM talma_manual_users WHERE (code=? OR lower(email)=?) AND NOT (lower(email)=? AND code=?)",(code,email,original_email,original_code)).fetchone()
-        excel_collision=any(
-            str(r["codigo"])==code and str(r["email"]).lower()==email
-            and not (original_email==email and original_code==code)
-            for r in orders_app.TALMA_ROSTER.values()
-        )
-        if collision or excel_collision:
-            return redirect("/talma/usuarios?error=Ese+correo+o+código+ya+existe")
-
-        old_is_excel = origin=="excel" and f"{original_email}|{original_code}" in orders_app.TALMA_ROSTER
-
-        if existing:
-            conn.execute(
-                "UPDATE talma_manual_users SET email=?,code=?,employee_name=?,area=?,active=1 WHERE id=?",
-                (email,code,name,area,existing["id"]),
-            )
-        elif old_is_excel and (original_email!=email or original_code!=code):
-            # Disable the original Excel identity, then create the new active override.
-            roster=orders_app.TALMA_ROSTER[f"{original_email}|{original_code}"]
-            conn.execute(
-                "INSERT INTO talma_manual_users(email,code,password_hash,password_salt,employee_name,area,active,created_at) VALUES(?,?,?,?,?,?,0,?)",
-                (original_email,original_code,"","",roster["nombre"],roster["area"],orders_app.now_iso()),
-            )
-            conn.execute(
-                "INSERT INTO talma_manual_users(email,code,password_hash,password_salt,employee_name,area,active,created_at) VALUES(?,?,?,?,?,?,1,?)",
-                (email,code,"","",name,area,orders_app.now_iso()),
-            )
-        else:
-            conn.execute(
-                "INSERT INTO talma_manual_users(email,code,password_hash,password_salt,employee_name,area,active,created_at) VALUES(?,?,?,?,?,?,1,?)",
-                (email,code,"","",name,area,orders_app.now_iso()),
-            )
-    return redirect("/talma/usuarios?ok=1")
-
-
-@app.get("/talma/usuarios/eliminar")
-def talma_admin_users_delete():
-    orders_app.init_db()
-    origin=request.args.get("origen",""); email=request.args.get("email","").strip().lower(); code=request.args.get("codigo","").strip(); user_id=request.args.get("id","")
-    with orders_app.db() as conn:
-        if origin=="excel":
-            roster=orders_app.TALMA_ROSTER.get(f"{email}|{code}",{})
-            existing=conn.execute("SELECT id FROM talma_manual_users WHERE lower(email)=? AND code=?",(email,code)).fetchone()
-            if existing:
-                conn.execute("UPDATE talma_manual_users SET active=0 WHERE id=?",(existing["id"],))
-            else:
-                conn.execute("INSERT INTO talma_manual_users(email,code,password_hash,password_salt,employee_name,area,active,created_at) VALUES(?,?,?,?,?,?,0,?)",
-                             (email,code,"","",roster.get("nombre",""),roster.get("area",""),orders_app.now_iso()))
-        elif user_id:
-            conn.execute("UPDATE talma_manual_users SET active=0 WHERE id=?",(user_id,))
-    return redirect("/talma/usuarios?ok=deleted")
-
-
-@app.get("/talma/cupones")
-def talma_cupones():
-    if not _valid_talma_session(request.cookies.get("talma_session")):
-        return _talma_login()
-    orders_app.init_db()
-    fecha_desde = request.args.get("desde", "").strip()
-    fecha_hasta = request.args.get("hasta", "").strip()
-    codigo_filter = request.args.get("codigo", "").strip()[:40]
-    def valid(value):
-        try: datetime.strptime(value, "%Y-%m-%d"); return True
-        except ValueError: return False
-    if fecha_desde and not valid(fecha_desde): fecha_desde = ""
-    if fecha_hasta and not valid(fecha_hasta): fecha_hasta = ""
-    if fecha_desde and not fecha_hasta: fecha_hasta = fecha_desde
-    if fecha_hasta and not fecha_desde: fecha_desde = fecha_hasta
-    if fecha_desde and fecha_hasta and fecha_desde > fecha_hasta: fecha_desde, fecha_hasta = fecha_hasta, fecha_desde
-    with orders_app.db() as conn:
-        sql = """SELECT o.order_date, o.employee_name, COALESCE(NULLIF(o.login_code, ''), NULLIF(o.employee_key, '')) AS codigo,
-                        o.area, o.entry_item, o.main_item, o.notes, o.created_at
-                 FROM orders o JOIN companies c ON c.id=o.company_id WHERE c.slug='talma'"""
-        args=[]
-        if codigo_filter: sql += " AND o.login_code=?"; args.append(codigo_filter)
-        if fecha_desde: sql += " AND o.order_date>=?"; args.append(fecha_desde)
-        if fecha_hasta: sql += " AND o.order_date<=?"; args.append(fecha_hasta)
-        sql += " ORDER BY o.order_date, o.employee_name COLLATE NOCASE, o.id"
-        db_rows=conn.execute(sql,args).fetchall()
-    rows=[{"nombre":r["employee_name"],"area":r["area"],"fecha":r["order_date"],"entrada":r["entry_item"],"segundo":r["main_item"],"observacion":r["notes"]} for r in db_rows]
-    if not rows: raise RuntimeError("No hay pedidos TALMA en el rango seleccionado para generar cupones.")
-    suffix=f"_{fecha_desde}_a_{fecha_hasta}" if fecha_desde and fecha_hasta else "_historial_completo"
-    return create_pdf_from_rows("talma", rows, suffix=suffix)
-
-
-@app.get("/talma/excel")
 def talma_excel():
     if not _valid_talma_session(request.cookies.get("talma_session")):
         return _talma_login()
     orders_app.init_db()
     fecha_desde = request.args.get("desde", "").strip()
     fecha_hasta = request.args.get("hasta", "").strip()
-    codigo_filter = request.args.get("codigo", "").strip()[:40]
+    dni_filter = request.args.get("dni", "").strip()[:20]
 
     def _valid_iso(value):
         try:
@@ -2307,29 +2088,29 @@ def talma_excel():
 
     with orders_app.db() as conn:
         sql = """SELECT o.order_date, o.employee_name,
-                      COALESCE(NULLIF(o.login_code, ''), NULLIF(o.employee_key, '')) AS codigo,
+                      o.dni AS dni,
                       o.area, o.entry_item, o.main_item, o.notes, o.created_at
                FROM orders o JOIN companies c ON c.id=o.company_id
                WHERE c.slug='talma'"""
         args = []
-        if codigo_filter:
-            sql += " AND o.login_code=?"; args.append(codigo_filter)
+        if dni_filter:
+            sql += " AND o.dni=?"; args.append(dni_filter)
         if fecha_desde:
             sql += " AND o.order_date>=?"; args.append(fecha_desde)
         if fecha_hasta:
             sql += " AND o.order_date<=?"; args.append(fecha_hasta)
-        sql += " ORDER BY o.order_date, CASE WHEN o.login_code='' THEN 1 ELSE 0 END, o.login_code, o.employee_name COLLATE NOCASE, o.id"
+        sql += " ORDER BY o.order_date, CASE WHEN o.dni='' THEN 1 ELSE 0 END, o.dni, o.employee_name COLLATE NOCASE, o.id"
         rows = conn.execute(sql, args).fetchall()
     wb = Workbook()
     ws = wb.active
     ws.title = "Pedidos TALMA"
-    headers = ["Fecha", "Código", "Persona", "Área", "Entrada", "Plato de fondo", "Observación", "N° Almuerzo", "Hora"]
+    headers = ["Fecha", "DNI", "Persona", "Área", "Entrada", "Plato de fondo", "Observación", "N° Almuerzo", "Hora"]
     ws.append(headers)
     counts = {}
     for r in rows:
-        key = r["codigo"] or f"legacy:{orders_app.normalize_key(r['employee_name'])}"
+        key = r["dni"] or f"legacy:{orders_app.normalize_key(r['employee_name'])}"
         counts[key] = counts.get(key, 0) + 1
-        ws.append([r["order_date"], r["codigo"], r["employee_name"], r["area"], r["entry_item"], r["main_item"],
+        ws.append([r["order_date"], r["dni"], r["employee_name"], r["area"], r["entry_item"], r["main_item"],
                    r["notes"], counts[key], (r["created_at"] or "")[11:16]])
     for i, width in enumerate([14, 14, 34, 16, 32, 36, 40, 14, 10], 1):
         ws.column_dimensions[get_column_letter(i)].width = width
@@ -2341,10 +2122,10 @@ def talma_excel():
         for cell in row:
             cell.alignment = Alignment(vertical="top", wrap_text=True)
     summary = wb.create_sheet("Resumen")
-    summary.append(["CÓDIGO", "PERSONA", "TOTAL ALMUERZOS"])
+    summary.append(["DNI", "PERSONA", "TOTAL ALMUERZOS"])
     for key, total in sorted(counts.items()):
-        rr = next((r for r in rows if (r["codigo"] or f"legacy:{orders_app.normalize_key(r['employee_name'])}") == key), None)
-        summary.append([rr["codigo"] if rr and rr["codigo"] else "Sin código", rr["employee_name"] if rr else key, total])
+        rr = next((r for r in rows if (r["dni"] or f"legacy:{orders_app.normalize_key(r['employee_name'])}") == key), None)
+        summary.append([rr["dni"] if rr and rr["dni"] else "Sin DNI", rr["employee_name"] if rr else key, total])
     summary.column_dimensions["A"].width = 16
     summary.column_dimensions["B"].width = 34
     summary.column_dimensions["C"].width = 20
