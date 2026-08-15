@@ -153,7 +153,38 @@ def verify_talma_password(password: str, password_hash: str, password_salt: str)
 
 
 def get_talma_manual_user(email: str, dni: str, include_inactive: bool = False):
-    return None
+    email = email.strip().lower()
+    dni = dni.strip()
+    if not email or not dni:
+        return None
+
+    with db() as conn:
+        # Make login independent from whether the admin page was opened first.
+        exists = conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name='talma_manual_users'"
+        ).fetchone()
+        if exists:
+            cols = {row["name"] for row in conn.execute("PRAGMA table_info(talma_manual_users)").fetchall()}
+            if "dni" not in cols:
+                conn.execute("DROP TABLE talma_manual_users")
+
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS talma_manual_users (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                email TEXT NOT NULL,
+                dni TEXT NOT NULL UNIQUE,
+                employee_name TEXT NOT NULL,
+                area TEXT NOT NULL,
+                active INTEGER NOT NULL DEFAULT 1,
+                created_at TEXT NOT NULL
+            )
+        """)
+
+        query = "SELECT * FROM talma_manual_users WHERE lower(email)=? AND dni=?"
+        params = (email, dni)
+        if not include_inactive:
+            query += " AND active=1"
+        return conn.execute(query, params).fetchone()
 
 def init_db() -> None:
     with db() as conn:
@@ -196,8 +227,29 @@ def init_db() -> None:
             """
         )
 
-        # La antigua tabla de personas TALMA se elimina: la fuente oficial es el Excel.
-        conn.execute("DROP TABLE IF EXISTS talma_manual_users")
+        # Personas TALMA manuales: se mantienen separadas del Excel oficial.
+        # Si existe la antigua tabla basada en "code", se elimina una sola vez.
+        manual_table = conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name='talma_manual_users'"
+        ).fetchone()
+        if manual_table:
+            manual_cols = {row["name"] for row in conn.execute("PRAGMA table_info(talma_manual_users)").fetchall()}
+            if "dni" not in manual_cols:
+                conn.execute("DROP TABLE talma_manual_users")
+
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS talma_manual_users (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                email TEXT NOT NULL,
+                dni TEXT NOT NULL UNIQUE,
+                employee_name TEXT NOT NULL,
+                area TEXT NOT NULL,
+                active INTEGER NOT NULL DEFAULT 1,
+                created_at TEXT NOT NULL
+            )
+        """)
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_talma_manual_email ON talma_manual_users(email)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_talma_manual_dni ON talma_manual_users(dni)")
 
         # Migración compatible: versiones anteriores no tenían DNI.
         columns = {row["name"] for row in conn.execute("PRAGMA table_info(orders)").fetchall()}
@@ -428,6 +480,17 @@ def resolve_talma_login(email: str, dni: str):
     dni = dni.strip()
     if not email or not dni:
         return None
+
+    manual = get_talma_manual_user(email, dni)
+    if manual is not None:
+        return {
+            "email": manual["email"],
+            "dni": manual["dni"],
+            "nombre": manual["employee_name"],
+            "area": manual["area"],
+            "manual": True,
+        }
+
     record = TALMA_ROSTER.get(f"{email}|{dni}")
     if record:
         result = dict(record)
