@@ -1700,7 +1700,7 @@ def talma_portal():
         key = r["dni"] or f"legacy:{orders_app.normalize_key(r['employee_name'])}"
         running[key] = running.get(key, 0) + 1
         table_rows.append(
-            f"<tr><td>{esc(r['order_date'])}</td><td><b>{esc(r['codigo'] or '—')}</b></td><td>{esc(r['employee_name'])}</td>"
+            f"<tr><td>{esc(r['order_date'])}</td><td><b>{esc(r['dni'] or '—')}</b></td><td>{esc(r['employee_name'])}</td>"
             f"<td>{esc(r['area'])}</td><td>{esc(r['entry_item'])}</td><td>{esc(r['main_item'])}</td>"
             f"<td>{running[key]}</td><td>{esc((r['created_at'] or '')[11:16])}</td></tr>"
         )
