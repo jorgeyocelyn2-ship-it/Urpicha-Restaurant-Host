@@ -2143,6 +2143,7 @@ def talma_admin_users_excel():
     )
 
 
+@app.get("/talma/excel")
 def talma_excel():
     if not _valid_talma_session(request.cookies.get("talma_session")):
         return _talma_login()
@@ -2214,6 +2215,79 @@ def talma_excel():
     suffix = f"_{fecha_desde}_a_{fecha_hasta}" if fecha_desde and fecha_hasta else "_historial_completo"
     return send_file(output, as_attachment=True, download_name=f"pedidos_talma{suffix}.xlsx",
                      mimetype="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+
+
+@app.get("/talma/cupones")
+def talma_cupones():
+    """Genera la cuponera TALMA desde los pedidos persistidos del portal."""
+    if not _valid_talma_session(request.cookies.get("talma_session")):
+        return _talma_login()
+
+    orders_app.init_db()
+    fecha_desde = request.args.get("desde", "").strip()
+    fecha_hasta = request.args.get("hasta", "").strip()
+    dni_filter = request.args.get("dni", "").strip()[:20]
+
+    def _valid_iso(value):
+        try:
+            datetime.strptime(value, "%Y-%m-%d")
+            return True
+        except ValueError:
+            return False
+
+    if fecha_desde and not _valid_iso(fecha_desde):
+        fecha_desde = ""
+    if fecha_hasta and not _valid_iso(fecha_hasta):
+        fecha_hasta = ""
+    if fecha_desde and not fecha_hasta:
+        fecha_hasta = fecha_desde
+    if fecha_hasta and not fecha_desde:
+        fecha_desde = fecha_hasta
+    if fecha_desde and fecha_hasta and fecha_desde > fecha_hasta:
+        fecha_desde, fecha_hasta = fecha_hasta, fecha_desde
+
+    with orders_app.db() as conn:
+        sql = """SELECT o.order_date, o.employee_name, o.dni, o.area,
+                        o.entry_item, o.main_item, o.notes, o.created_at
+                 FROM orders o
+                 JOIN companies c ON c.id=o.company_id
+                 WHERE c.slug='talma'"""
+        args = []
+        if dni_filter:
+            sql += " AND o.dni=?"
+            args.append(dni_filter)
+        if fecha_desde:
+            sql += " AND o.order_date>=?"
+            args.append(fecha_desde)
+        if fecha_hasta:
+            sql += " AND o.order_date<=?"
+            args.append(fecha_hasta)
+        sql += """ ORDER BY o.order_date,
+                   CASE WHEN o.dni='' THEN 1 ELSE 0 END,
+                   o.dni, o.employee_name COLLATE NOCASE, o.id"""
+        db_rows = conn.execute(sql, args).fetchall()
+
+    rows = [
+        {
+            "fecha": r["order_date"],
+            "nombre": r["employee_name"],
+            "area": r["area"],
+            "entrada": r["entry_item"],
+            "segundo": r["main_item"],
+            "observacion": r["notes"],
+        }
+        for r in db_rows
+    ]
+    if not rows:
+        raise RuntimeError("No hay pedidos TALMA en el período seleccionado para generar los cupones.")
+
+    suffix = ""
+    if fecha_desde and fecha_hasta:
+        suffix = f"_{fecha_desde}_a_{fecha_hasta}"
+    elif dni_filter:
+        suffix = f"_dni_{dni_filter}"
+
+    return create_pdf_from_rows("talma", rows, suffix=suffix)
 
 
 # ---------------------------------------------------------------------------
