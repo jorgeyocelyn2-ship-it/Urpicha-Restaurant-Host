@@ -744,7 +744,7 @@ def system_home(sistema):
         titulo=c["titulo"],
         subtitulo=c["subtitulo"],
         ayuda=c["ayuda"],
-        usuarios_url=url_for("talma_users") if sistema == "talma" else "",
+        usuarios_url=url_for("talma_admin_users") if sistema == "talma" else "",
     )
 
 
