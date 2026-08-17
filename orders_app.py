@@ -224,6 +224,13 @@ def init_db() -> None:
                 FOREIGN KEY(company_id) REFERENCES companies(id) ON DELETE CASCADE,
                 UNIQUE(company_id, order_date, employee_key)
             );
+                        CREATE TABLE IF NOT EXISTS order_settings (
+                id INTEGER PRIMARY KEY CHECK(id=1),
+                closing_time TEXT NOT NULL DEFAULT '11:30',
+                manual_open_date TEXT NOT NULL DEFAULT '',
+                manual_closed INTEGER NOT NULL DEFAULT 0,
+                updated_at TEXT NOT NULL
+            );
             """
         )
 
@@ -292,10 +299,16 @@ def init_db() -> None:
             ]
             conn.executemany("INSERT INTO menu_items(menu_date, category, name) VALUES (?, ?, ?)", demo)
 
+        conn.execute(
+        "INSERT OR IGNORE INTO order_settings(id, closing_time, manual_open_date, manual_closed, updated_at) VALUES(1, ?, '', 0, ?)",
+        (str(CONFIG.get("order_deadline", "11:30")), datetime.now().isoformat(timespec="seconds")),
+        )
+        conn.commit()
     start_backup_worker()
 
 
 LOCAL_TZ = ZoneInfo("America/Lima")
+
 
 
 def local_now() -> datetime:
@@ -362,17 +375,98 @@ def start_backup_worker() -> None:
         threading.Thread(target=_backup_worker, name="backup-diario", daemon=True).start()
 
 
+def get_order_settings() -> dict:
+    """Obtiene la configuración persistente de cierre/reapertura desde SQLite."""
+    init_db()
+    with db() as conn:
+        row = conn.execute(
+            "SELECT closing_time, manual_open_date, manual_closed, updated_at FROM order_settings WHERE id=1"
+        ).fetchone()
+    if not row:
+        return {
+            "closing_time": str(CONFIG.get("order_deadline", "11:30")),
+            "manual_open_date": "",
+            "manual_closed": False,
+            "updated_at": "",
+        }
+    return {
+        "closing_time": row["closing_time"] or "11:30",
+        "manual_open_date": row["manual_open_date"] or "",
+        "manual_closed": bool(row["manual_closed"]),
+        "updated_at": row["updated_at"] or "",
+    }
+
+
+def _valid_hhmm(value: str) -> bool:
+    return bool(re.fullmatch(r"(?:[01]\d|2[0-3]):[0-5]\d", str(value or "")))
+
+
+def set_order_settings(closing_time: str | None = None, manual_open_date: str | None = None,
+                       manual_closed: bool | None = None) -> dict:
+    current = get_order_settings()
+    new_time = closing_time if closing_time is not None else current["closing_time"]
+    new_open = manual_open_date if manual_open_date is not None else current["manual_open_date"]
+    new_closed = int(manual_closed) if manual_closed is not None else int(current["manual_closed"])
+    if not _valid_hhmm(new_time):
+        raise ValueError("La hora de cierre debe tener formato HH:MM.")
+    with db() as conn:
+        conn.execute(
+            """UPDATE order_settings
+               SET closing_time=?, manual_open_date=?, manual_closed=?, updated_at=?
+               WHERE id=1""",
+            (new_time, new_open or "", new_closed, datetime.now().isoformat(timespec="seconds")),
+        )
+        conn.commit()
+    return get_order_settings()
+
+
+def _today_close_datetime() -> datetime:
+    settings = get_order_settings()
+    hh, mm = map(int, settings["closing_time"].split(":"))
+    return local_now().replace(hour=hh, minute=mm, second=0, microsecond=0)
+
+
 def is_order_closed(order_date: str) -> bool:
-    """Cierra los pedidos del día actual a las 11:30, hora de Perú."""
+    """Cierra el día actual según la hora configurada por el administrador."""
     if order_date != today_iso():
         return False
-    now = local_now()
-    return (now.hour, now.minute, now.second) >= (11, 30, 0)
+    settings = get_order_settings()
+    if settings["manual_open_date"] == order_date and not settings["manual_closed"]:
+        return False
+    if settings["manual_closed"]:
+        return True
+    return local_now() >= _today_close_datetime()
+
 
 def seconds_until_close() -> int:
-    now = local_now()
-    close = now.replace(hour=11, minute=30, second=0, microsecond=0)
-    return max(0, int((close-now).total_seconds()))
+    settings = get_order_settings()
+    if settings["manual_open_date"] == today_iso() and not settings["manual_closed"]:
+        return 0
+    if settings["manual_closed"]:
+        return 0
+    return max(0, int((_today_close_datetime() - local_now()).total_seconds()))
+
+
+def format_close_time(value: str | None = None) -> str:
+    raw = value or get_order_settings()["closing_time"]
+    try:
+        hh, mm = map(int, raw.split(":"))
+    except Exception:
+        return "11:30 a. m."
+    suffix = "a. m." if hh < 12 else "p. m."
+    h12 = hh % 12 or 12
+    return f"{h12}:{mm:02d} {suffix}"
+
+
+def orders_open_status() -> tuple[bool, str]:
+    settings = get_order_settings()
+    if settings["manual_open_date"] == today_iso() and not settings["manual_closed"]:
+        return True, "Abiertos manualmente"
+    if settings["manual_closed"]:
+        return False, "Cerrados manualmente"
+    if is_order_closed(today_iso()):
+        return False, f"Cerrados desde las {format_close_time(settings['closing_time'])}"
+    return True, f"Abiertos hasta las {format_close_time(settings['closing_time'])}"
 
 
 def normalize_key(text: str) -> str:
@@ -847,9 +941,15 @@ class AppHandler(BaseHTTPRequestHandler):
             self.admin_login(query.get("error"))
         elif path == "/admin/logout":
             self.redirect("/admin", "admin_session=; Path=/; Max-Age=0; HttpOnly; SameSite=Lax")
-        elif path == "/admin/dashboard":
+        elif path in ("/admin/dashboard", "/admin/pedidos"):
             if self.require_admin():
                 self.admin_dashboard(query)
+        elif path == "/admin/pedidos/configuracion":
+            if self.require_admin():
+                self.admin_order_settings(query)
+        elif path == "/admin/pedidos/manual":
+            if self.require_admin():
+                self.admin_manual_order(query)
         elif path == "/admin/personas":
             if self.require_admin():
                 self.admin_personas(query)
@@ -895,6 +995,18 @@ class AppHandler(BaseHTTPRequestHandler):
         elif path == "/admin/historico-excel":
             if self.require_admin():
                 self.update_historical_excel()
+        elif path == "/admin/pedidos/configuracion":
+            if self.require_admin():
+                self.save_order_settings()
+        elif path == "/admin/pedidos/reabrir":
+            if self.require_admin():
+                self.reopen_orders()
+        elif path == "/admin/pedidos/cerrar-manual":
+            if self.require_admin():
+                self.close_orders_manual()
+        elif path == "/admin/pedidos/manual":
+            if self.require_admin():
+                self.save_manual_order()
         elif path == "/empresa/talma/login":
             self.talma_employee_login()
         elif path.startswith("/pedido/"):
@@ -984,7 +1096,7 @@ class AppHandler(BaseHTTPRequestHandler):
                        if wa else '<p><b>Comunícate por WhatsApp con el responsable de la empresa para coordinar la entrega.</b></p>')
             menu_html=f"""<div class="notice error">
 <b> Pedidos cerrados</b>
-<p>Los pedidos para <b>{esc(fecha_con_dia(requested_date))}</b> se cerraron a las <b>11:30 a. m.</b> (hora de Perú).</p>
+<p>Los pedidos para <b>{esc(fecha_con_dia(requested_date))}</b> se cerraron a las <b>{esc(format_close_time())}</b> (hora de Perú).</p>
 {wa_button}
 </div>"""
             submit=""
@@ -1028,7 +1140,7 @@ class AppHandler(BaseHTTPRequestHandler):
         if requested_date == today_iso() and not is_order_closed(requested_date):
             remaining = seconds_until_close()
             countdown_html = f"""<div class="countdown-box" style="background:#fff7ed;border:2px solid #f79009;border-radius:14px;padding:14px;text-align:center;margin:14px 0;color:#7a2e0e">
-<b> Quedan <span id="countdown"></span> para el cierre de pedidos de hoy a las 11:30 a. m.</b>
+<b> Quedan <span id="countdown"></span> para el cierre de pedidos de hoy a las {esc(format_close_time())}.</b>
 </div>
 <script>
 (function(){{
@@ -1065,7 +1177,7 @@ class AppHandler(BaseHTTPRequestHandler):
   </form>
   <p class="muted" style="margin-bottom:0">Puedes elegir hoy o una fecha futura. El pedido quedará registrado para la fecha seleccionada.</p>
 </div>
-<p class="muted">Fecha seleccionada: <b>{esc(fecha_con_dia(requested_date))}</b> · Hora límite: <b>11:30 a. m.</b> (hora de Perú)</p>
+<p class="muted">Fecha seleccionada: <b>{esc(fecha_con_dia(requested_date))}</b> · Hora límite: <b>{esc(format_close_time())}</b> (hora de Perú)</p>
 {countdown_html}
 {notice}
 <form method="post" action="/pedido/{esc(slug)}">
@@ -1131,7 +1243,7 @@ class AppHandler(BaseHTTPRequestHandler):
         if order_date < today_iso():
             error = "No se pueden registrar pedidos para una fecha pasada."
         if is_order_closed(order_date):
-            error = "Los pedidos del día actual se cierran a las 11:30 a. m. (hora de Perú). Si necesita un pedido fuera de horario, comuníquese por WhatsApp para coordinar la entrega."
+            error = f"Los pedidos del día actual se cierran a las {format_close_time()} (hora de Perú). Si necesita un pedido fuera de horario, comuníquese por WhatsApp para coordinar la entrega."
         if len(name) < 3:
             error = "Ingrese su nombre y apellido."
         menu = get_menu(order_date)
@@ -1334,6 +1446,165 @@ class AppHandler(BaseHTTPRequestHandler):
 </style>"""
         self.send_html(page("Resumen de almuerzos", body, extra))
 
+    def admin_order_settings(self, query: dict[str, str]) -> None:
+        settings = get_order_settings()
+        is_open, status = orders_open_status()
+        message = ""
+        if query.get("ok") == "1":
+            message = '<div class="notice ok">Configuración de pedidos guardada correctamente.</div>'
+        elif query.get("error"):
+            message = f'<div class="notice error">{esc(query["error"])}</div>'
+        manual_open = settings["manual_open_date"] == today_iso() and not settings["manual_closed"]
+        body = f"""
+<main class="wrap narrow">
+<div class="actions no-print" style="justify-content:space-between;margin-bottom:16px">
+  <h1 style="margin:0">Gestión de pedidos</h1>
+  <a href="/admin/pedidos">← Volver a pedidos</a>
+</div>
+{message}
+<div class="card">
+  <h2>Horario de cierre</h2>
+  <p class="muted">Esta es la hora normal de cierre. Cambiarla no modifica los pedidos ya registrados.</p>
+  <form method="post" action="/admin/pedidos/configuracion">
+    <label>Hora de cierre de pedidos</label>
+    <input type="time" name="closing_time" value="{esc(settings['closing_time'])}" required>
+    <button type="submit" style="margin-top:12px">Guardar hora de cierre</button>
+  </form>
+</div>
+<div class="card">
+  <h2>Estado de pedidos</h2>
+  <div class="notice {'ok' if is_open else 'error'}">
+    <b>{esc(status)}</b>
+    {"<br>La reapertura manual está activa para hoy. La hora normal sigue siendo " + esc(format_close_time(settings["closing_time"])) + "." if manual_open else ""}
+  </div>
+  <div class="actions">
+    <form method="post" action="/admin/pedidos/reabrir">
+      <button type="submit">🔓 Abrir pedidos ahora</button>
+    </form>
+    <form method="post" action="/admin/pedidos/cerrar-manual" onsubmit="return confirm('¿Cerrar los pedidos manualmente?')">
+      <button type="submit" class="btn danger">🔒 Cerrar pedidos ahora</button>
+    </form>
+  </div>
+  <p class="muted">Abrir pedidos ahora <b>no cambia</b> la hora normal. La reapertura manual solo se aplica a hoy.</p>
+</div>
+<div class="card">
+  <h2>Pedido manual</h2>
+  <p class="muted">Registra un pedido recibido por teléfono, WhatsApp u otro medio. Esta opción funciona aunque los pedidos públicos estén cerrados.</p>
+  <a class="btn" href="/admin/pedidos/manual">📝 Ingresar pedido manual</a>
+</div>
+</main>"""
+        self.send_html(page("Gestión de pedidos", body))
+
+    def save_order_settings(self) -> None:
+        form = self.read_form()
+        closing_time = form.get("closing_time", "").strip()
+        if not _valid_hhmm(closing_time):
+            self.redirect("/admin/pedidos/configuracion?error=La+hora+debe+tener+formato+HH%3AMM")
+            return
+        current = get_order_settings()
+        set_order_settings(closing_time=closing_time,
+                           manual_open_date=current["manual_open_date"],
+                           manual_closed=current["manual_closed"])
+        self.redirect("/admin/pedidos/configuracion?ok=1")
+
+    def reopen_orders(self) -> None:
+        settings = get_order_settings()
+        set_order_settings(closing_time=settings["closing_time"], manual_open_date=today_iso(), manual_closed=False)
+        self.redirect("/admin/pedidos/configuracion?ok=1")
+
+    def close_orders_manual(self) -> None:
+        settings = get_order_settings()
+        set_order_settings(closing_time=settings["closing_time"], manual_open_date="", manual_closed=True)
+        self.redirect("/admin/pedidos/configuracion?ok=1")
+
+    def admin_manual_order(self, query: dict[str, str]) -> None:
+        requested_date = query.get("fecha", today_iso())
+        try:
+            datetime.strptime(requested_date, "%Y-%m-%d")
+        except ValueError:
+            requested_date = today_iso()
+        with db() as conn:
+            companies = conn.execute(
+                """SELECT * FROM companies WHERE active=1
+                   ORDER BY CASE slug WHEN 'liderman' THEN 1 WHEN 'aeropuerto' THEN 2
+                   WHEN 'talma' THEN 3 WHEN 'policia' THEN 4 ELSE 5 END, name"""
+            ).fetchall()
+        menu = get_menu(requested_date)
+        company_id = query.get("empresa", "")
+        message = '<div class="notice ok">Pedido manual registrado correctamente.</div>' if query.get("ok")=="1" else (
+            f'<div class="notice error">{esc(query["error"])}</div>' if query.get("error") else "")
+        company_options = "".join(
+            f'<option value="{c["id"]}" {"selected" if company_id == str(c["id"]) else ""}>{esc(c["name"])}</option>'
+            for c in companies)
+        entry_options = "".join(f'<option value="{esc(x["name"])}">{esc(x["name"])}</option>' for x in menu["entrada"])
+        main_options = "".join(f'<option value="{esc(x["name"])}">{esc(x["name"])}</option>' for x in menu["fondo"])
+        body=f"""
+<main class="wrap narrow">
+<div class="actions no-print" style="justify-content:space-between;margin-bottom:16px">
+  <h1 style="margin:0">Ingresar pedido manual</h1><a href="/admin/pedidos">← Volver a pedidos</a>
+</div>
+{message}
+<div class="card">
+<form method="get" action="/admin/pedidos/manual" class="actions" style="align-items:end;gap:12px">
+  <div><label>Fecha del pedido</label><input type="date" name="fecha" value="{esc(requested_date)}" required></div>
+  <div><label>Empresa</label><select name="empresa" required><option value="">Seleccionar empresa</option>{company_options}</select></div>
+  <button type="submit" class="btn secondary">Cargar menú</button>
+</form>
+</div>
+<div class="card">
+<form method="post" action="/admin/pedidos/manual">
+<input type="hidden" name="fecha" value="{esc(requested_date)}">
+<label>Empresa</label><select name="empresa_id" required><option value="">Seleccionar empresa</option>{company_options}</select>
+<label>Nombre y apellido *</label><input name="nombre" maxlength="100" required placeholder="Ejemplo: Juan Pérez">
+<label>DNI</label><input name="dni" maxlength="20" placeholder="Opcional">
+<label>Área o sede</label><input name="area" maxlength="80" placeholder="Ejemplo: RAMPA">
+<div class="grid grid2">
+<div><label>Entrada *</label><select name="entrada" required><option value="">Seleccionar entrada</option>{entry_options}</select></div>
+<div><label>Plato de fondo *</label><select name="fondo" required><option value="">Seleccionar plato</option>{main_options}</select></div>
+</div>
+<label>Observación</label><textarea name="observaciones" maxlength="300" placeholder="Ejemplo: sin cebolla"></textarea>
+<label>Modalidad de entrega</label><select name="delivery_type"><option value="Entrega en empresa">Entrega en empresa</option><option value="Para llevar">Para llevar</option></select>
+<button type="submit" style="margin-top:14px">Registrar pedido manual</button>
+</form>
+</div>
+</main>"""
+        self.send_html(page("Pedido manual", body))
+
+    def save_manual_order(self) -> None:
+        form=self.read_form()
+        company_id=form.get("empresa_id","").strip()
+        order_date=form.get("fecha",today_iso()).strip()
+        name=form.get("nombre","").strip()
+        dni=form.get("dni","").strip()
+        area=form.get("area","").strip()
+        entry=form.get("entrada","").strip()
+        main=form.get("fondo","").strip()
+        notes=form.get("observaciones","").strip()
+        delivery=form.get("delivery_type","Entrega en empresa").strip() or "Entrega en empresa"
+        try: datetime.strptime(order_date,"%Y-%m-%d")
+        except ValueError:
+            self.redirect("/admin/pedidos/manual?error=Fecha+inválida"); return
+        if not company_id.isdigit() or len(name)<3 or not entry or not main:
+            self.redirect(f"/admin/pedidos/manual?{urlencode({'fecha':order_date,'empresa':company_id,'error':'Completa los campos obligatorios'})}"); return
+        with db() as conn:
+            company=conn.execute("SELECT * FROM companies WHERE id=? AND active=1",(int(company_id),)).fetchone()
+            menu=get_menu(order_date)
+            valid_entries={r["name"] for r in menu["entrada"]}
+            valid_mains={r["name"] for r in menu["fondo"]}
+            if not company: error="Empresa inválida."
+            elif entry not in valid_entries or main not in valid_mains: error="La entrada o el plato de fondo no pertenecen al menú de esa fecha."
+            else: error=None
+            if error:
+                self.redirect(f"/admin/pedidos/manual?{urlencode({'fecha':order_date,'empresa':company_id,'error':error})}"); return
+            employee_key=f"manual:{secrets.token_hex(10)}"
+            conn.execute(
+                """INSERT INTO orders(company_id,order_date,employee_name,employee_key,dni,area,
+                   entry_item,main_item,notes,delivery_type,created_at,login_code,login_email)
+                   VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                (company["id"],order_date,name,employee_key,dni,area,entry,main,notes,delivery,now_iso(),"",""))
+            conn.commit()
+        self.redirect(f"/admin/pedidos/manual?{urlencode({'fecha':order_date,'empresa':company_id,'ok':'1'})}")
+
     def admin_dashboard(self, query: dict[str, str]) -> None:
         selected_date = query.get("fecha", today_iso())
         try:
@@ -1407,10 +1678,19 @@ class AppHandler(BaseHTTPRequestHandler):
         body = f"""
 <main class="wrap">
 <div class="actions no-print" style="justify-content:space-between;margin-bottom:16px"><h1 style="margin:0">Panel administrador</h1><a href="/admin/logout">Cerrar sesión</a></div>
-<div class="admin-tabs no-print"><a class="active" href="/admin/dashboard">Pedidos</a><a href="/admin/personas"> Personas y consumo</a><a href="/admin/resumen"> Resumen visual</a><a href="/admin/talma/">TALMA</a><a href="/admin/policia/">POLICÍA</a></div>
+<div class="admin-tabs no-print"><a class="active" href="/admin/pedidos">Pedidos</a><a href="/admin/personas"> Personas y consumo</a><a href="/admin/resumen"> Resumen visual</a><a href="/admin/talma/">TALMA</a><a href="/admin/policia/">POLICÍA</a></div>
 {notice}
 <div class="grid grid3">
 <div class="stat">Pedidos del día<b>{total_today}</b></div><div class="stat">Empresas activas<b>{company_total}</b></div><div class="stat">Fecha seleccionada<b style="font-size:18px">{esc(selected_date)}</b></div>
+</div>
+<div class="card no-print">
+<h2>Gestión de pedidos</h2>
+<p class="muted">Configura el horario, reabre pedidos después del cierre sin cambiar la hora configurada o registra un pedido manual.</p>
+<div class="actions">
+<a class="btn secondary" href="/admin/pedidos/configuracion">⚙️ Configurar hora de cierre</a>
+<form method="post" action="/admin/pedidos/reabrir" style="display:inline"><button type="submit">🔓 Abrir pedidos ahora</button></form>
+<a class="btn" href="/admin/pedidos/manual">📝 Ingresar pedido manual</a>
+</div>
 </div>
 
 <div class="card no-print">
