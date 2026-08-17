@@ -12,4 +12,4 @@ COPY requirements.txt ./
 RUN pip install --no-cache-dir -r requirements.txt
 COPY . .
 
-CMD ["/bin/sh", "-c", "python app.py ${PORT:-8080}"]
+CMD ["/bin/sh", "-c", "gunicorn --workers 1 --threads 8 --timeout 180 --bind 0.0.0.0:${PORT:-8080} app:app"]
