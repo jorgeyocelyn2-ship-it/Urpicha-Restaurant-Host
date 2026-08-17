@@ -234,6 +234,58 @@ def init_db() -> None:
             """
         )
 
+        # Migración compatible de order_settings:
+        # versiones anteriores usaban manual_open; las versiones actuales
+        # usan manual_open_date + manual_closed. Nunca se debe asumir que
+        # CREATE TABLE IF NOT EXISTS actualiza una tabla existente.
+        settings_columns = {
+            row["name"]
+            for row in conn.execute("PRAGMA table_info(order_settings)").fetchall()
+        }
+        if "closing_time" not in settings_columns:
+            conn.execute(
+                "ALTER TABLE order_settings ADD COLUMN closing_time TEXT NOT NULL DEFAULT '11:30'"
+            )
+        if "manual_open_date" not in settings_columns:
+            conn.execute(
+                "ALTER TABLE order_settings ADD COLUMN manual_open_date TEXT NOT NULL DEFAULT ''"
+            )
+        if "manual_closed" not in settings_columns:
+            conn.execute(
+                "ALTER TABLE order_settings ADD COLUMN manual_closed INTEGER NOT NULL DEFAULT 0"
+            )
+        if "updated_at" not in settings_columns:
+            conn.execute(
+                "ALTER TABLE order_settings ADD COLUMN updated_at TEXT NOT NULL DEFAULT ''"
+            )
+
+        # Si la base anterior tenía manual_open=1, conservar su intención
+        # convirtiéndola en reapertura manual para el día actual.
+        settings_columns = {
+            row["name"]
+            for row in conn.execute("PRAGMA table_info(order_settings)").fetchall()
+        }
+        if "manual_open" in settings_columns:
+            legacy = conn.execute(
+                "SELECT manual_open FROM order_settings WHERE id=1"
+            ).fetchone()
+            if legacy and int(legacy["manual_open"] or 0):
+                conn.execute(
+                    """UPDATE order_settings
+                       SET manual_open_date=?, manual_closed=0
+                       WHERE id=1 AND (manual_open_date IS NULL OR manual_open_date='')""",
+                    (today_iso(),),
+                )
+        conn.execute(
+            """UPDATE order_settings
+               SET closing_time=COALESCE(NULLIF(closing_time,''), ?),
+                   manual_open_date=COALESCE(manual_open_date,''),
+                   manual_closed=COALESCE(manual_closed,0),
+                   updated_at=COALESCE(updated_at,'')
+               WHERE id=1""",
+            (str(CONFIG.get("order_deadline", "11:30")),),
+        )
+
         # Personas TALMA manuales: se mantienen separadas del Excel oficial.
         # Si existe la antigua tabla basada en "code", se elimina una sola vez.
         manual_table = conn.execute(
