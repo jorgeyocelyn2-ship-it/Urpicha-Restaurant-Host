@@ -1,1581 +1,660 @@
-import re
-from flask import Flask, render_template, render_template_string, request, send_file, jsonify, redirect, url_for, Response
-from jinja2 import ChoiceLoader, FileSystemLoader, DictLoader
-from markupsafe import escape
-from pathlib import Path
-from datetime import datetime
-from PIL import Image, ImageOps, ImageEnhance
-from reportlab.pdfgen import canvas
-from reportlab.lib.pagesizes import A4
-from reportlab.lib.units import mm
-from openpyxl import Workbook, load_workbook
-from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
-from openpyxl.utils import get_column_letter
+#!/usr/bin/env python3
+"""
+Sistema sencillo de pedidos de almuerzos para empresas.
+No requiere librerías externas: usa solo Python + SQLite.
+"""
+from __future__ import annotations
+
+from datetime import datetime, date
+
+import csv
 from collections import Counter
-from http.server import ThreadingHTTPServer
-from urllib.parse import quote, urlsplit
-import subprocess, tempfile, csv, io, json, re, uuid, statistics, shutil, os, traceback, unicodedata, threading, http.client, time, hmac, hashlib
+import hashlib
+import hmac
+import html
+import io
+import json
+import os
+import re
+import secrets
+import sqlite3
+import sys
+import threading
+import time
+import unicodedata
+from datetime import date, datetime
+from zoneinfo import ZoneInfo
+from http import cookies
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
+from urllib.parse import parse_qs, quote, urlencode, urlparse
+from email.parser import BytesParser
+from email.policy import default as email_default_policy
+from openpyxl import Workbook, load_workbook
+from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
+from openpyxl.utils import get_column_letter
 
-import orders_app
-from scanner_templates import SCANNER_TEMPLATES, SCANNER_CSS
+BASE_DIR = Path(__file__).resolve().parent
+DATA_DIR = Path(os.environ.get("DATA_DIR", str(BASE_DIR / "datos"))).expanduser().resolve()
+DB_PATH = DATA_DIR / "pedidos.db"
+CONFIG_PATH = BASE_DIR / "config.json"
+HOST = "0.0.0.0"
+try:
+    PORT = int(os.environ.get("PORT", "8080"))
+except ValueError:
+    PORT = 8080
 
-ROOT = Path(__file__).resolve().parent
-TEMPLATES_DIR = ROOT / "templates"
-STATIC_DIR = ROOT / "static"
-app = Flask(__name__, template_folder=str(TEMPLATES_DIR), static_folder=str(STATIC_DIR))
-# Respaldo embebido: si Render no encuentra/copió templates/, Jinja usa estas plantillas incluidas en Python.
-app.jinja_loader = ChoiceLoader([
-    FileSystemLoader(str(TEMPLATES_DIR)),
-    DictLoader(SCANNER_TEMPLATES),
-])
-app.secret_key = os.environ.get("SECRET_KEY", "cuponera-v19-dual")
+DATA_DIR.mkdir(exist_ok=True)
 
-# Configuración compartida del portal TALMA.
-CONFIG = {"secret_key": app.secret_key}
+DEFAULT_CONFIG = {
+    "restaurant_name": "Urpicha Restaurante",
+    "admin_password": "cambiar123",
+    "secret_key": secrets.token_hex(32),
+    "order_deadline": "11:30",
+}
 
-def esc(value):
-    """Escapa valores antes de insertarlos en HTML generado por el portal TALMA."""
-    return str(escape("" if value is None else value))
+# Empresas que siempre deben existir en el sistema.
+# El token privado se genera solo la primera vez y se conserva en la base de datos.
+DEFAULT_COMPANIES = [
+    ("Liderman", "liderman"),
+    ("Aeropuerto", "aeropuerto"),
+    ("Talma", "talma"),
+    ("Policía", "policia"),
+]
 
-def page(title: str, body: str) -> str:
-    """Página HTML base usada por el portal privado TALMA."""
+
+def load_config() -> dict:
+    if not CONFIG_PATH.exists():
+        CONFIG_PATH.write_text(json.dumps(DEFAULT_CONFIG, indent=2, ensure_ascii=False), encoding="utf-8")
+    try:
+        cfg = json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError):
+        cfg = DEFAULT_CONFIG.copy()
+    changed = False
+    for key, value in DEFAULT_CONFIG.items():
+        if key not in cfg:
+            cfg[key] = value
+            changed = True
+    if changed:
+        CONFIG_PATH.write_text(json.dumps(cfg, indent=2, ensure_ascii=False), encoding="utf-8")
+
+    # En producción, las variables de entorno tienen prioridad sobre config.json.
+    env_overrides = {
+        "restaurant_name": "RESTAURANT_NAME",
+        "admin_password": "ADMIN_PASSWORD",
+        "secret_key": "SECRET_KEY",
+        "order_deadline": "ORDER_DEADLINE",
+    }
+    for config_key, env_key in env_overrides.items():
+        env_value = os.environ.get(env_key)
+        if env_value:
+            cfg[config_key] = env_value
+    return cfg
+
+
+CONFIG = load_config()
+
+TALMA_ROSTER_PATH = BASE_DIR / "talma_personas.xlsx"
+
+def load_talma_roster() -> dict:
+    """Carga exclusivamente la base oficial de personas TALMA desde talma_personas.xlsx."""
+    roster = {}
+    try:
+        workbook = load_workbook(TALMA_ROSTER_PATH, read_only=True, data_only=True)
+        sheet = workbook.active
+        rows = sheet.iter_rows(values_only=True)
+        headers = [str(v or "").strip().upper() for v in next(rows)]
+        dni_idx = headers.index("DNI")
+        name_idx = headers.index("NOMBRE_APELLIDOS")
+        area_idx = headers.index("AREA")
+        email_idx = headers.index("EMAIL")
+        for row in rows:
+            if not row:
+                continue
+            raw_dni = row[dni_idx]
+            dni = str(raw_dni).strip() if raw_dni is not None else ""
+            if dni.endswith(".0"):
+                dni = dni[:-2]
+            name = str(row[name_idx] or "").strip()
+            area = str(row[area_idx] or "").strip()
+            email = str(row[email_idx] or "").strip().lower()
+            if dni and email:
+                roster[f"{email}|{dni}"] = {
+                    "email": email, "dni": dni, "nombre": name, "area": area
+                }
+        workbook.close()
+    except Exception as error:
+        print(f"[TALMA] No se pudo leer la base Excel de personas: {error}", file=sys.stderr)
+    return roster
+
+TALMA_ROSTER = load_talma_roster()
+
+
+
+def db() -> sqlite3.Connection:
+    conn = sqlite3.connect(DB_PATH, timeout=15)
+    conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA foreign_keys = ON")
+    return conn
+
+
+def hash_talma_password(password: str, salt_hex: str | None = None) -> tuple[str, str]:
+    salt = bytes.fromhex(salt_hex) if salt_hex else os.urandom(16)
+    digest = hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"), salt, 180_000)
+    return digest.hex(), salt.hex()
+
+
+def verify_talma_password(password: str, password_hash: str, password_salt: str) -> bool:
+    try:
+        digest, _ = hash_talma_password(password, password_salt)
+        return hmac.compare_digest(digest, password_hash)
+    except Exception:
+        return False
+
+
+def get_talma_manual_user(email: str, dni: str, include_inactive: bool = False):
+    email = email.strip().lower()
+    dni = dni.strip()
+    if not email or not dni:
+        return None
+
+    with db() as conn:
+        # Make login independent from whether the admin page was opened first.
+        exists = conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name='talma_manual_users'"
+        ).fetchone()
+        if exists:
+            cols = {row["name"] for row in conn.execute("PRAGMA table_info(talma_manual_users)").fetchall()}
+            if "dni" not in cols:
+                conn.execute("DROP TABLE talma_manual_users")
+
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS talma_manual_users (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                email TEXT NOT NULL,
+                dni TEXT NOT NULL UNIQUE,
+                employee_name TEXT NOT NULL,
+                area TEXT NOT NULL,
+                active INTEGER NOT NULL DEFAULT 1,
+                created_at TEXT NOT NULL
+            )
+        """)
+
+        query = "SELECT * FROM talma_manual_users WHERE lower(email)=? AND dni=?"
+        params = (email, dni)
+        if not include_inactive:
+            query += " AND active=1"
+        return conn.execute(query, params).fetchone()
+
+def init_db() -> None:
+    with db() as conn:
+        conn.executescript(
+            """
+            CREATE TABLE IF NOT EXISTS companies (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                name TEXT NOT NULL,
+                slug TEXT NOT NULL UNIQUE,
+                token TEXT NOT NULL UNIQUE,
+                active INTEGER NOT NULL DEFAULT 1,
+                created_at TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS menu_items (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                menu_date TEXT NOT NULL,
+                category TEXT NOT NULL CHECK(category IN ('entrada','fondo')),
+                name TEXT NOT NULL,
+                active INTEGER NOT NULL DEFAULT 1,
+                UNIQUE(menu_date, category, name)
+            );
+
+            CREATE TABLE IF NOT EXISTS orders (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                company_id INTEGER NOT NULL,
+                order_date TEXT NOT NULL,
+                employee_name TEXT NOT NULL,
+                employee_key TEXT NOT NULL,
+                dni TEXT NOT NULL DEFAULT '',
+                area TEXT NOT NULL DEFAULT '',
+                entry_item TEXT NOT NULL,
+                main_item TEXT NOT NULL,
+                notes TEXT NOT NULL DEFAULT '',
+                delivery_type TEXT NOT NULL DEFAULT 'Empresa',
+                created_at TEXT NOT NULL,
+                FOREIGN KEY(company_id) REFERENCES companies(id) ON DELETE CASCADE,
+                UNIQUE(company_id, order_date, employee_key)
+            );
+                        CREATE TABLE IF NOT EXISTS order_settings (
+                id INTEGER PRIMARY KEY CHECK(id=1),
+                closing_time TEXT NOT NULL DEFAULT '11:30',
+                manual_open_date TEXT NOT NULL DEFAULT '',
+                manual_closed INTEGER NOT NULL DEFAULT 0,
+                updated_at TEXT NOT NULL
+            );
+            """
+        )
+
+        # Migración compatible de order_settings:
+        # versiones anteriores usaban manual_open; las versiones actuales
+        # usan manual_open_date + manual_closed. Nunca se debe asumir que
+        # CREATE TABLE IF NOT EXISTS actualiza una tabla existente.
+        settings_columns = {
+            row["name"]
+            for row in conn.execute("PRAGMA table_info(order_settings)").fetchall()
+        }
+        if "closing_time" not in settings_columns:
+            conn.execute(
+                "ALTER TABLE order_settings ADD COLUMN closing_time TEXT NOT NULL DEFAULT '11:30'"
+            )
+        if "manual_open_date" not in settings_columns:
+            conn.execute(
+                "ALTER TABLE order_settings ADD COLUMN manual_open_date TEXT NOT NULL DEFAULT ''"
+            )
+        if "manual_closed" not in settings_columns:
+            conn.execute(
+                "ALTER TABLE order_settings ADD COLUMN manual_closed INTEGER NOT NULL DEFAULT 0"
+            )
+        if "updated_at" not in settings_columns:
+            conn.execute(
+                "ALTER TABLE order_settings ADD COLUMN updated_at TEXT NOT NULL DEFAULT ''"
+            )
+
+        # Si la base anterior tenía manual_open=1, conservar su intención
+        # convirtiéndola en reapertura manual para el día actual.
+        settings_columns = {
+            row["name"]
+            for row in conn.execute("PRAGMA table_info(order_settings)").fetchall()
+        }
+        if "manual_open" in settings_columns:
+            legacy = conn.execute(
+                "SELECT manual_open FROM order_settings WHERE id=1"
+            ).fetchone()
+            if legacy and int(legacy["manual_open"] or 0):
+                conn.execute(
+                    """UPDATE order_settings
+                       SET manual_open_date=?, manual_closed=0
+                       WHERE id=1 AND (manual_open_date IS NULL OR manual_open_date='')""",
+                    (today_iso(),),
+                )
+        conn.execute(
+            """UPDATE order_settings
+               SET closing_time=COALESCE(NULLIF(closing_time,''), ?),
+                   manual_open_date=COALESCE(manual_open_date,''),
+                   manual_closed=COALESCE(manual_closed,0),
+                   updated_at=COALESCE(updated_at,'')
+               WHERE id=1""",
+            (str(CONFIG.get("order_deadline", "11:30")),),
+        )
+
+        # Personas TALMA manuales: se mantienen separadas del Excel oficial.
+        # Si existe la antigua tabla basada en "code", se elimina una sola vez.
+        manual_table = conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name='talma_manual_users'"
+        ).fetchone()
+        if manual_table:
+            manual_cols = {row["name"] for row in conn.execute("PRAGMA table_info(talma_manual_users)").fetchall()}
+            if "dni" not in manual_cols:
+                conn.execute("DROP TABLE talma_manual_users")
+
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS talma_manual_users (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                email TEXT NOT NULL,
+                dni TEXT NOT NULL UNIQUE,
+                employee_name TEXT NOT NULL,
+                area TEXT NOT NULL,
+                active INTEGER NOT NULL DEFAULT 1,
+                created_at TEXT NOT NULL
+            )
+        """)
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_talma_manual_email ON talma_manual_users(email)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_talma_manual_dni ON talma_manual_users(dni)")
+
+        # Migración compatible: versiones anteriores no tenían DNI.
+        columns = {row["name"] for row in conn.execute("PRAGMA table_info(orders)").fetchall()}
+        if "dni" not in columns:
+            conn.execute("ALTER TABLE orders ADD COLUMN dni TEXT NOT NULL DEFAULT ''")
+        if "login_code" not in columns:
+            conn.execute("ALTER TABLE orders ADD COLUMN login_code TEXT NOT NULL DEFAULT ''")
+        if "login_email" not in columns:
+            conn.execute("ALTER TABLE orders ADD COLUMN login_email TEXT NOT NULL DEFAULT ''")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_orders_talma_dni ON orders(dni)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_orders_talma_code ON orders(login_code)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_orders_talma_email ON orders(login_email)")
+        # Elimina el enlace de demostración de versiones anteriores y garantiza
+        # los cuatro enlaces predeterminados solicitados.
+        conn.execute("DELETE FROM companies WHERE slug='empresa-demo'")
+        for company_name, company_slug in DEFAULT_COMPANIES:
+            existing = conn.execute(
+                "SELECT id FROM companies WHERE slug=?",
+                (company_slug,),
+            ).fetchone()
+            if existing:
+                conn.execute(
+                    "UPDATE companies SET name=?, active=1 WHERE id=?",
+                    (company_name, existing["id"]),
+                )
+            else:
+                conn.execute(
+                    "INSERT INTO companies(name, slug, token, created_at) VALUES (?, ?, ?, ?)",
+                    (company_name, company_slug, secrets.token_urlsafe(18), now_iso()),
+                )
+
+        today = today_iso()
+        menu_count = conn.execute("SELECT COUNT(*) FROM menu_items WHERE menu_date=?", (today,)).fetchone()[0]
+        if menu_count == 0:
+            demo = [
+                (today, "entrada", "Sopa del día"),
+                (today, "entrada", "Ensalada fresca"),
+                (today, "fondo", "Pollo al horno con arroz"),
+                (today, "fondo", "Lomo saltado"),
+            ]
+            conn.executemany("INSERT INTO menu_items(menu_date, category, name) VALUES (?, ?, ?)", demo)
+
+        conn.execute(
+        "INSERT OR IGNORE INTO order_settings(id, closing_time, manual_open_date, manual_closed, updated_at) VALUES(1, ?, '', 0, ?)",
+        (str(CONFIG.get("order_deadline", "11:30")), datetime.now().isoformat(timespec="seconds")),
+        )
+        conn.commit()
+    start_backup_worker()
+
+
+LOCAL_TZ = ZoneInfo("America/Lima")
+
+
+
+def local_now() -> datetime:
+    return datetime.now(LOCAL_TZ)
+
+
+def today_iso() -> str:
+    return local_now().date().isoformat()
+
+
+def now_iso() -> str:
+    return local_now().replace(tzinfo=None, microsecond=0).isoformat(sep=" ")
+
+
+# ---------------------------------------------------------------------------
+# Persistencia y copias de seguridad
+# ---------------------------------------------------------------------------
+BACKUP_DIR = DATA_DIR / "backups"
+BACKUP_DIR.mkdir(parents=True, exist_ok=True)
+
+def backup_database() -> Path | None:
+    """Crea una copia consistente diaria de SQLite y conserva 30 días."""
+    try:
+        target = BACKUP_DIR / f"pedidos_{today_iso()}.db"
+        if target.exists():
+            return target
+        temp = BACKUP_DIR / f".pedidos_{today_iso()}.tmp"
+        if temp.exists():
+            temp.unlink()
+        with db() as source:
+            with sqlite3.connect(temp) as destination:
+                source.backup(destination)
+        os.replace(temp, target)
+        backups = sorted(BACKUP_DIR.glob("pedidos_*.db"), key=lambda x: x.name, reverse=True)
+        for old in backups[30:]:
+            try:
+                old.unlink()
+            except OSError:
+                pass
+        return target
+    except Exception as error:
+        print(f"[BACKUP] No se pudo crear la copia: {error}", file=sys.stderr)
+        return None
+
+def _backup_worker() -> None:
+    while True:
+        try:
+            backup_database()
+            time.sleep(3600)
+        except Exception as error:
+            print(f"[BACKUP] Error en el proceso diario: {error}", file=sys.stderr)
+            time.sleep(300)
+
+_backup_thread_started = False
+_backup_thread_lock = threading.Lock()
+
+def start_backup_worker() -> None:
+    global _backup_thread_started
+    with _backup_thread_lock:
+        if _backup_thread_started:
+            return
+        _backup_thread_started = True
+        backup_database()
+        threading.Thread(target=_backup_worker, name="backup-diario", daemon=True).start()
+
+
+def get_order_settings() -> dict:
+    """Obtiene la configuración persistente de cierre/reapertura desde SQLite."""
+    init_db()
+    with db() as conn:
+        row = conn.execute(
+            "SELECT closing_time, manual_open_date, manual_closed, updated_at FROM order_settings WHERE id=1"
+        ).fetchone()
+    if not row:
+        return {
+            "closing_time": str(CONFIG.get("order_deadline", "11:30")),
+            "manual_open_date": "",
+            "manual_closed": False,
+            "updated_at": "",
+        }
+    return {
+        "closing_time": row["closing_time"] or "11:30",
+        "manual_open_date": row["manual_open_date"] or "",
+        "manual_closed": bool(row["manual_closed"]),
+        "updated_at": row["updated_at"] or "",
+    }
+
+
+def _valid_hhmm(value: str) -> bool:
+    return bool(re.fullmatch(r"(?:[01]\d|2[0-3]):[0-5]\d", str(value or "")))
+
+
+def set_order_settings(closing_time: str | None = None, manual_open_date: str | None = None,
+                       manual_closed: bool | None = None) -> dict:
+    current = get_order_settings()
+    new_time = closing_time if closing_time is not None else current["closing_time"]
+    new_open = manual_open_date if manual_open_date is not None else current["manual_open_date"]
+    new_closed = int(manual_closed) if manual_closed is not None else int(current["manual_closed"])
+    if not _valid_hhmm(new_time):
+        raise ValueError("La hora de cierre debe tener formato HH:MM.")
+    with db() as conn:
+        conn.execute(
+            """UPDATE order_settings
+               SET closing_time=?, manual_open_date=?, manual_closed=?, updated_at=?
+               WHERE id=1""",
+            (new_time, new_open or "", new_closed, datetime.now().isoformat(timespec="seconds")),
+        )
+        conn.commit()
+    return get_order_settings()
+
+
+def _today_close_datetime() -> datetime:
+    settings = get_order_settings()
+    hh, mm = map(int, settings["closing_time"].split(":"))
+    return local_now().replace(hour=hh, minute=mm, second=0, microsecond=0)
+
+
+def is_order_closed(order_date: str) -> bool:
+    """Cierra el día actual según la hora configurada por el administrador."""
+    if order_date != today_iso():
+        return False
+    settings = get_order_settings()
+    if settings["manual_open_date"] == order_date and not settings["manual_closed"]:
+        return False
+    if settings["manual_closed"]:
+        return True
+    return local_now() >= _today_close_datetime()
+
+
+def seconds_until_close() -> int:
+    settings = get_order_settings()
+    if settings["manual_open_date"] == today_iso() and not settings["manual_closed"]:
+        return 0
+    if settings["manual_closed"]:
+        return 0
+    return max(0, int((_today_close_datetime() - local_now()).total_seconds()))
+
+
+def format_close_time(value: str | None = None) -> str:
+    raw = value or get_order_settings()["closing_time"]
+    try:
+        hh, mm = map(int, raw.split(":"))
+    except Exception:
+        return "11:30 a. m."
+    suffix = "a. m." if hh < 12 else "p. m."
+    h12 = hh % 12 or 12
+    return f"{h12}:{mm:02d} {suffix}"
+
+
+def orders_open_status() -> tuple[bool, str]:
+    settings = get_order_settings()
+    if settings["manual_open_date"] == today_iso() and not settings["manual_closed"]:
+        return True, "Abiertos manualmente"
+    if settings["manual_closed"]:
+        return False, "Cerrados manualmente"
+    if is_order_closed(today_iso()):
+        return False, f"Cerrados desde las {format_close_time(settings['closing_time'])}"
+    return True, f"Abiertos hasta las {format_close_time(settings['closing_time'])}"
+
+
+def normalize_key(text: str) -> str:
+    text = unicodedata.normalize("NFKD", text).encode("ascii", "ignore").decode("ascii")
+    return re.sub(r"[^a-z0-9]+", " ", text.lower()).strip()
+
+
+def slugify(text: str) -> str:
+    slug = normalize_key(text).replace(" ", "-")
+    return slug or f"empresa-{secrets.token_hex(3)}"
+
+
+def esc(value: object) -> str:
+    return html.escape(str(value), quote=True)
+
+
+def _logo_data_uri(filename: str, mime: str) -> str:
+    """Carga el logo localmente para que el encabezado no dependa del proxy /static/."""
+    try:
+        import base64
+        raw = (BASE_DIR / "static" / filename).read_bytes()
+        return f"data:{mime};base64," + base64.b64encode(raw).decode("ascii")
+    except (OSError, ValueError):
+        return ""
+
+
+LOGO_HEADER_URI = _logo_data_uri("urpicha-logo-header.png", "image/png")
+LOGO_WATERMARK_URI = _logo_data_uri("urpicha-logo-watermark.png", "image/png")
+
+
+def page(title: str, body: str, extra_head: str = "") -> str:
+    restaurant = esc(CONFIG.get("restaurant_name", "Mi Restaurante"))
     return f"""<!doctype html>
-<html lang=\"es\">
+<html lang="es">
 <head>
-<meta charset=\"utf-8\">
-<meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">
-<meta name=\"robots\" content=\"noindex,nofollow\">
-<title>{esc(title)} — Urpicha Restaurante</title>
-<style>{SCANNER_CSS}
-.wrap{{max-width:1200px;margin:30px auto;padding:20px}}
-.narrow{{max-width:560px}}
-.card{{background:#fff;padding:24px;border:1px solid #d8dfe6;border-radius:15px;box-shadow:0 5px 18px rgba(0,0,0,.05);margin-bottom:20px}}
-.actions{{display:flex;gap:10px;align-items:center;flex-wrap:wrap}}
-.btn{{display:inline-block;border:0;border-radius:9px;padding:10px 14px;background:#176b43;color:#fff;text-decoration:none;font-weight:700}}
-.btn.secondary{{background:#e7edf1;color:#17212b}}
-.muted{{color:#5f6b76}}
-.notice{{padding:12px 14px;border-radius:8px;background:#e9f6ef;margin:12px 0}}
-.notice.error{{background:#fdecea;color:#8a1c13;border-left:5px solid #b42318}}
-.grid{{display:grid;gap:16px}}
-.grid3{{grid-template-columns:repeat(3,minmax(0,1fr))}}
-.stat{{background:#fff;border:1px solid #d8dfe6;border-radius:14px;padding:18px;font-weight:700}}
-.stat b{{display:block;font-size:28px;margin-top:6px}}
-.table-wrap{{overflow:auto}}
-@media(max-width:800px){{.grid3{{grid-template-columns:1fr}}}}
-.topbar{{background:#101828;color:#fff;padding:10px 20px;display:flex;align-items:center;gap:12px;box-shadow:0 2px 10px rgba(0,0,0,.12)}}
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>{esc(title)} · {restaurant}</title>
+<style>
+:root{{--bg:#f4f6f8;--card:#fff;--text:#18212b;--muted:#667085;--brand:#175cd3;--brand2:#0b4bab;--danger:#b42318;--ok:#067647;--line:#e4e7ec}}
+*{{box-sizing:border-box}} body{{margin:0;font-family:Inter,Segoe UI,Arial,sans-serif;background:var(--bg);color:var(--text)}}
+a{{color:var(--brand);text-decoration:none}} .topbar{{background:#101828;color:#fff;padding:10px 20px;display:flex;justify-content:space-between;align-items:center;gap:15px}}
 .topbar-brand{{display:flex;align-items:center;gap:12px;min-width:0}}
 .topbar-logo{{width:52px;height:44px;object-fit:contain;flex:0 0 auto;filter:drop-shadow(0 2px 4px rgba(0,0,0,.28))}}
-.topbar strong{{font-size:18px;line-height:1.2}}
+.topbar strong{{font-size:18px;line-height:1.2}} .topbar a{{color:#fff}} .wrap{{max-width:1180px;margin:24px auto;padding:0 16px}} .narrow{{max-width:720px}}
+.card{{background:var(--card);border:1px solid var(--line);border-radius:14px;padding:20px;margin-bottom:18px;box-shadow:0 2px 10px rgba(16,24,40,.04)}}
+h1,h2,h3{{margin-top:0}} h1{{font-size:28px}} h2{{font-size:21px}} .muted{{color:var(--muted)}} .grid{{display:grid;gap:16px}} .grid2{{grid-template-columns:repeat(2,minmax(0,1fr))}} .grid3{{grid-template-columns:repeat(3,minmax(0,1fr))}}
+label{{display:block;font-weight:600;margin:12px 0 6px}} input,select,textarea{{width:100%;padding:11px 12px;border:1px solid #d0d5dd;border-radius:9px;font:inherit;background:#fff}} textarea{{min-height:96px;resize:vertical}}
+button,.btn{{display:inline-block;border:0;border-radius:9px;padding:11px 15px;background:var(--brand);color:#fff;font-weight:700;cursor:pointer}} button:hover,.btn:hover{{background:var(--brand2)}} .btn.secondary{{background:#475467}} .btn.danger{{background:var(--danger)}} .btn.small{{padding:7px 10px;font-size:13px}}
+.notice{{padding:12px 14px;border-radius:9px;margin:12px 0}} .notice.ok{{background:#ecfdf3;color:var(--ok);border:1px solid #abefc6}} .notice.error{{background:#fef3f2;color:var(--danger);border:1px solid #fecdca}}
+table{{width:100%;border-collapse:collapse;font-size:14px}} th,td{{border-bottom:1px solid var(--line);padding:10px 8px;text-align:left;vertical-align:top}} th{{background:#f9fafb}} .table-wrap{{overflow:auto}} .actions{{display:flex;gap:8px;flex-wrap:wrap;align-items:center}}
+.stat{{padding:16px;border:1px solid var(--line);border-radius:12px;background:#fff}} .stat b{{display:block;font-size:26px;margin-top:5px}}
+.menu-choice{{border:1px solid var(--line);border-radius:10px;padding:12px;margin:8px 0}} .menu-choice input{{width:auto;margin-right:8px}} .ticket{{border:2px dashed #333;padding:12px;margin:0 0 12px;break-inside:avoid;background:#fff}} .ticket h3{{margin-bottom:8px}}
+.registered-orders{{margin:0;padding-left:22px}} .registered-orders li{{padding:8px 0;border-bottom:1px solid var(--line)}} .registered-orders li:last-child{{border-bottom:0}}
+footer{{text-align:center;color:var(--muted);padding:28px 16px;font-size:13px;line-height:1.6;border-top:1px solid var(--line);margin-top:28px}} .support-footer{{max-width:1180px;margin:0 auto}}
+.admin-tabs{{display:flex;gap:8px;flex-wrap:wrap;background:#fff;border:1px solid var(--line);border-radius:12px;padding:8px;margin:0 0 18px;box-shadow:0 2px 10px rgba(16,24,40,.04)}}
+.admin-tabs a{{padding:10px 16px;border-radius:9px;font-weight:800;color:#344054}} .admin-tabs a:hover{{background:#f2f4f7}} .admin-tabs a.active{{background:var(--brand);color:#fff}}
 .brand-watermark{{position:fixed;right:18px;bottom:18px;width:154px;height:154px;object-fit:contain;padding:8px;background:rgba(255,255,255,.90);border:1px solid rgba(16,24,40,.10);border-radius:18px;box-shadow:0 8px 28px rgba(16,24,40,.18);opacity:1;z-index:999;pointer-events:none;user-select:none}}
-@media(max-width:800px){{.topbar{{padding:8px 12px}}.topbar-logo{{width:46px;height:40px}}.brand-watermark{{width:104px;height:104px;right:8px;bottom:8px;padding:5px;border-radius:13px}}}}
-@media print{{.brand-watermark{{display:none!important}}}}
+@media(max-width:760px){{.brand-watermark{{width:104px;height:104px;right:8px;bottom:8px;padding:5px;border-radius:13px}}}}
+@media(max-width:760px){{.grid2,.grid3{{grid-template-columns:1fr}} .topbar{{align-items:flex-start;flex-direction:column}}}}
+@media print{{.no-print,.topbar,footer,.brand-watermark{{display:none!important}} body{{background:#fff}} .wrap{{max-width:none;margin:0;padding:0}} .card{{border:0;box-shadow:none;padding:0}} .ticket{{page-break-inside:avoid}}}}
 </style>
+{extra_head}
 </head>
-<body><div class="topbar"><div class="topbar-brand"><img class="topbar-logo" src="{url_for('static', filename='urpicha-logo-header.png')}" alt="Logo Urpicha"><strong>Urpicha Restaurante</strong></div></div><img class="brand-watermark" src="{url_for('static', filename='urpicha-logo-watermark.png')}" alt="" aria-hidden="true">
+<body>
+<div class="topbar"><div class="topbar-brand"><img class="topbar-logo" src="{LOGO_HEADER_URI}" alt="Logo Urpicha"><strong>{restaurant}</strong></div></div>
+<img class="brand-watermark" src="{LOGO_WATERMARK_URI}" alt="" aria-hidden="true">
 {body}
-<footer class="site-footer">
+<footer>
+<div class="support-footer">
 <strong>Soporte del sistema</strong><br>
 Cualquier duda o sugerencia respecto al sistema, comunicarse por:<br>
 931099267 &nbsp;|&nbsp; 927314911 &nbsp;|&nbsp; sebasoa0711@gmail.com
 <br><span>Todos los derechos reservados · Urpicha Restaurante</span>
+</div>
 </footer>
-<style>.site-footer{{text-align:center;color:#667085;padding:28px 16px;font-size:13px;line-height:1.6;border-top:1px solid #d8dfe6;margin-top:28px;background:#fff}}</style>
-</body>
-</html>"""
-DATA_ROOT = Path(os.environ.get("DATA_DIR", str(ROOT / "datos"))).expanduser().resolve()
-SCANNER_ROOT = DATA_ROOT / "scanners"
-UPLOADS = SCANNER_ROOT / "uploads"
-OUTPUTS = SCANNER_ROOT / "outputs"
-
-UPLOADS.mkdir(parents=True, exist_ok=True)
-OUTPUTS.mkdir(parents=True, exist_ok=True)
-
-# ---------------------------------------------------------------------------
-# Configuración por sistema
-# ---------------------------------------------------------------------------
-SISTEMAS = {
-    "talma": {
-        "titulo": "TALMA",
-        "subtitulo": "Carga la captura del Excel de pedidos TALMA. Antes de leerla podrás ajustar las columnas.",
-        "ayuda": "Sistema TALMA: código, nombre, área (RAMPA, PAX, CARGA, OMA), entrada, segundo y observación.",
-        "data_file": SCANNER_ROOT / "datos_talma.json",
-        "cols": ["registro", "fecha", "sede", "codigo", "nombre", "area", "entrada", "segundo", "observacion"],
-        "areas": ["RAMPA", "PAX", "CARGA", "OMA"],
-        "label_entrada": "ENTRADA",
-        "label_segundo": "SEGUNDO",
-        "label_observacion": "OBSERVACIÓN",
-        "default_entry": 0.455,
-        "default_second": 0.545,
-        "default_observation": 0.685,
-        "excel_headers": ["Registro", "Fecha", "Sede", "Código", "Nombre", "N° Almuerzo", "Área", "Entrada", "Segundo", "Observación"],
-        "excel_widths": [24, 15, 12, 14, 30, 14, 12, 28, 34, 50],
-        "pdf_prefix": "talma",
-        "header_label": None,  # usa área
-    },
-    "policia": {
-        "titulo": "POLICÍA",
-        "subtitulo": "Carga la captura de la planilla PNP. Ajusta las barras de Entrada, Plato de fondo y Sugerencias.",
-        "ayuda": "Sistema POLICÍA: N°, nombre y apellido, entrada, plato de fondo y sugerencias. Sin columna de área.",
-        "data_file": SCANNER_ROOT / "datos_policia.json",
-        "cols": ["numero", "nombre", "entrada", "segundo", "observacion"],
-        "areas": [],
-        "label_entrada": "ENTRADA",
-        "label_segundo": "PLATO DE FONDO",
-        "label_observacion": "SUGERENCIAS",
-        # Formato PNP de la captura de Excel: C empieza ~33%, D ~56.6%, E ~79.8%.
-        "default_entry": 0.330,
-        "default_second": 0.566,
-        "default_observation": 0.798,
-        "excel_headers": ["N°", "Nombre y apellido", "N° Almuerzo", "Entrada", "Plato de fondo", "Sugerencias"],
-        "excel_widths": [8, 42, 14, 28, 34, 28],
-        "pdf_prefix": "policia",
-        "header_label": "POLICÍA",
-    },
-}
-
-# Compatibilidad: migrar datos antiguos si existen
-_legacy = SCANNER_ROOT / "datos_actuales.json"
-_talma_data = SISTEMAS["talma"]["data_file"]
-if _legacy.exists() and not _talma_data.exists():
-    try:
-        shutil.copy(_legacy, _talma_data)
-    except OSError:
-        pass
+</body></html>"""
 
 
-def cfg(sistema: str) -> dict:
-    key = (sistema or "").strip().lower()
-    if key not in SISTEMAS:
-        raise RuntimeError(f"Sistema desconocido: {sistema}")
-    return SISTEMAS[key]
+def get_company(slug: str, token: str | None = None):
+    with db() as conn:
+        if token is None:
+            return conn.execute("SELECT * FROM companies WHERE slug=? AND active=1", (slug,)).fetchone()
+        return conn.execute("SELECT * FROM companies WHERE slug=? AND token=? AND active=1", (slug, token)).fetchone()
 
 
-def repair_mojibake(value: str) -> str:
-    """Repara texto UTF-8 interpretado por error como Windows-1252/Latin-1."""
-    value = value or ""
-    markers = ("Ã", "Â", "â€", "â€™", "â€œ", "â€\u009d", "ðŸ", "�")
-    for _ in range(3):
-        if not any(marker in value for marker in markers):
-            break
-        repaired = None
-        for encoding in ("cp1252", "latin-1"):
-            try:
-                candidate = value.encode(encoding).decode("utf-8")
-            except (UnicodeEncodeError, UnicodeDecodeError):
-                continue
-            if candidate != value:
-                repaired = candidate
-                break
-        if repaired is None:
-            break
-        value = repaired
-    return value
-
-
-def remove_vowel_accents(value: str) -> str:
-    """Quita tildes y diéresis, pero conserva correctamente la letra ñ."""
-    protected = value.replace("ñ", "__ENYE_LOWER__").replace("Ñ", "__ENYE_UPPER__")
-    decomposed = unicodedata.normalize("NFD", protected)
-    without_marks = "".join(char for char in decomposed if unicodedata.category(char) != "Mn")
-    return without_marks.replace("__ENYE_LOWER__", "ñ").replace("__ENYE_UPPER__", "Ñ")
-
-
-def clean_text(text: str, preserve_accents: bool = False) -> str:
-    """Limpia OCR/codificación. Por compatibilidad TALMA quita tildes salvo que se pidan."""
-    value = str(text or "")
-    for stray in ("™", "®", "©", "�"):
-        value = value.replace(stray, "")
-    value = repair_mojibake(value)
-    value = unicodedata.normalize("NFC", value)
-
-    replacements = {
-        "\u00a0": " ",
-        "\u200b": "",
-        "\ufeff": "",
-        "|": " ",
-        "™": "",
-        "®": "",
-        "©": "",
-        "�": "",
-        "â€”": "-",
-        "â€“": "-",
-        "â€™": "'",
-        "â€œ": '"',
-        "â€\u009d": '"',
-        "Ã": "",
-        "Â": "",
-        "â": "",
+def get_menu(menu_date: str):
+    with db() as conn:
+        rows = conn.execute(
+            "SELECT * FROM menu_items WHERE menu_date=? AND active=1 ORDER BY category, id", (menu_date,)
+        ).fetchall()
+    return {
+        "entrada": [r for r in rows if r["category"] == "entrada"],
+        "fondo": [r for r in rows if r["category"] == "fondo"],
     }
-    for bad, good in replacements.items():
-        value = value.replace(bad, good)
-
-    allowed_punctuation = set(" .,:;!?¿¡'\"()/-+&°#%")
-    chars = []
-    for char in value:
-        category = unicodedata.category(char)
-        if char.isspace() or char in allowed_punctuation or category[0] in ("L", "N"):
-            chars.append(char)
-    value = "".join(chars)
-    value = re.sub(r"\s+", " ", value).strip()
-    if not preserve_accents:
-        value = remove_vowel_accents(value)
-    return value
 
 
-def clean_text_unicode(text: str) -> str:
-    """Limpia el texto conservando tildes, diéresis, ñ y signos españoles válidos."""
-    return clean_text(text, preserve_accents=True)
-
-
-def pdf_text(text: str, preserve_accents: bool = False) -> str:
-    """Texto seguro para las fuentes PDF incorporadas, conservando acentos cuando corresponde."""
-    value = clean_text(text, preserve_accents=preserve_accents)
-    return value.encode("cp1252", "ignore").decode("cp1252")
-
-
-def find_tesseract():
-    candidates = [
-        shutil.which("tesseract"),
-        r"C:\Program Files\Tesseract-OCR\tesseract.exe",
-        r"C:\Program Files (x86)\Tesseract-OCR\tesseract.exe",
-        os.path.expandvars(r"%LOCALAPPDATA%\Programs\Tesseract-OCR\tesseract.exe"),
-    ]
-    for candidate in candidates:
-        if candidate and Path(candidate).exists():
-            return str(candidate)
-    return None
-
-
-def available_languages(exe):
-    try:
-        result = subprocess.run(
-            [exe, "--list-langs"],
-            capture_output=True,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-            timeout=15,
-            creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0,
-        )
-        return [line.strip() for line in result.stdout.splitlines()[1:] if line.strip()]
-    except Exception:
-        return []
-
-
-def run_tesseract_tsv(image):
-    exe = find_tesseract()
-    if not exe:
-        raise RuntimeError("Tesseract OCR no está instalado. Ejecuta instalar_ocr.bat.")
-
-    languages = available_languages(exe)
-    language = "spa" if "spa" in languages else ("eng" if "eng" in languages else None)
-
-    image = ImageOps.grayscale(image)
-    if image.width < 1800:
-        ratio = 1800 / image.width
-        image = image.resize((1800, int(image.height * ratio)))
-    image = ImageEnhance.Contrast(image).enhance(1.55)
-
-    with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as temp:
-        image.save(temp.name)
-        temp_path = temp.name
-
-    try:
-        cmd = [exe, temp_path, "stdout"]
-        if language:
-            cmd.extend(["-l", language])
-        cmd.extend(["--oem", "3", "--psm", "6", "--dpi", "300", "-c", "preserve_interword_spaces=1", "tsv"])
-
-        result = subprocess.run(
-            cmd,
-            capture_output=True,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-            timeout=90,
-            creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0,
-        )
-        if result.returncode != 0:
-            raise RuntimeError(result.stderr.strip() or "Tesseract no pudo leer la imagen.")
-        return result.stdout, image.size
-    finally:
-        try:
-            os.unlink(temp_path)
-        except OSError:
-            pass
-
-
-def run_tesseract_tsv_policia(image):
-    """OCR especial para la planilla PNP.
-
-    El formato de POLICÍA viene como captura de Excel con líneas de cuadrícula.
-    En este tipo de imagen, el preprocesado fuerte + PSM 6 mezcla las celdas;
-    PSM 3 sobre la captura casi original conserva mucho mejor cada fila.
-    """
-    exe = find_tesseract()
-    if not exe:
-        raise RuntimeError("Tesseract OCR no está instalado. Ejecuta instalar_ocr.bat.")
-
-    languages = available_languages(exe)
-    language = "spa" if "spa" in languages else ("eng" if "eng" in languages else None)
-
-    # Mantener la cuadrícula y el texto tal como aparecen en Excel. Solo se amplían
-    # capturas realmente pequeñas para que Tesseract no pierda caracteres.
-    working = image.convert("RGB")
-    if working.width < 900:
-        ratio = 900 / working.width
-        working = working.resize(
-            (900, int(working.height * ratio)),
-            Image.Resampling.LANCZOS,
-        )
-
-    with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as temp:
-        working.save(temp.name)
-        temp_path = temp.name
-
-    try:
-        cmd = [exe, temp_path, "stdout"]
-        if language:
-            cmd.extend(["-l", language])
-        cmd.extend([
-            "--oem", "3",
-            "--psm", "3",
-            "--dpi", "300",
-            "-c", "preserve_interword_spaces=1",
-            "tsv",
-        ])
-        result = subprocess.run(
-            cmd,
-            capture_output=True,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-            timeout=90,
-            creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0,
-        )
-        if result.returncode != 0:
-            raise RuntimeError(result.stderr.strip() or "Tesseract no pudo leer la imagen de POLICÍA.")
-        return result.stdout, working.size
-    finally:
-        try:
-            os.unlink(temp_path)
-        except OSError:
-            pass
-
-
-def parse_words(tsv, preserve_accents=False):
-    words = []
-    reader = csv.DictReader(io.StringIO(tsv), delimiter="\t")
-    for row in reader:
-        text = clean_text(row.get("text"), preserve_accents=preserve_accents)
-        try:
-            confidence = float(row.get("conf", "-1"))
-            x = int(row.get("left", "0"))
-            y = int(row.get("top", "0"))
-            w = int(row.get("width", "0"))
-            h = int(row.get("height", "0"))
-        except (ValueError, TypeError):
-            continue
-        if not text or confidence < 0:
-            continue
-        words.append({
-            "text": text,
-            "x": x,
-            "right": x + w,
-            "cx": x + w / 2,
-            "cy": y + h / 2,
-            "conf": confidence,
-        })
-    return words
-
-
-def cluster_rows(words, image_height):
-    tolerance = max(11, image_height * 0.012)
-    rows = []
-    for word in sorted(words, key=lambda item: (item["cy"], item["x"])):
-        best = None
-        best_distance = None
-        for row in rows[-4:]:
-            distance = abs(word["cy"] - row["center"])
-            if distance <= tolerance and (best_distance is None or distance < best_distance):
-                best = row
-                best_distance = distance
-        if best is None:
-            rows.append({"center": word["cy"], "words": [word]})
-        else:
-            best["words"].append(word)
-            best["center"] = statistics.mean(item["cy"] for item in best["words"])
-    return sorted(rows, key=lambda row: row["center"])
-
-
-def area_value(text):
-    compact = re.sub(r"[^A-Z]", "", clean_text(text).upper())
-    aliases = {
-        "RAMPA": "RAMPA", "RANPA": "RAMPA", "RAMFA": "RAMPA", "RAMP": "RAMPA",
-        "PAX": "PAX", "FAX": "PAX",
-        "CARGA": "CARGA", "CARCA": "CARGA", "CARG": "CARGA",
-        "OMA": "OMA",
-    }
-    return aliases.get(compact, "")
-
-
-def identify_area_word(words, code_index):
-    for index in range(code_index + 1, len(words)):
-        value = area_value(words[index]["text"])
-        if value:
-            return index, value
-    return None, ""
-
-
-def extract_rows_talma(image_path, entry_start, second_start, observation_start):
-    image = Image.open(image_path).convert("RGB")
-    tsv, processed_size = run_tesseract_tsv(image)
-    processed_width, processed_height = processed_size
-    words = parse_words(tsv)
-    grouped = cluster_rows(words, processed_height)
-
-    if not (0.0 < entry_start < second_start < observation_start < 1.0):
-        raise RuntimeError("Las líneas de columnas no están ordenadas correctamente.")
-
-    output = []
-    for group in grouped:
-        row_words = sorted(group["words"], key=lambda item: item["x"])
-
-        code_index = None
-        code = ""
-        for index, word in enumerate(row_words):
-            digits = re.sub(r"\D", "", word["text"])
-            if 7 <= len(digits) <= 9:
-                position = word["cx"] / processed_width
-                if 0.17 <= position <= 0.38:
-                    code_index = index
-                    code = digits
-                    break
-        if code_index is None:
-            continue
-
-        area_index, area = identify_area_word(row_words, code_index)
-        if area_index is None:
-            area_index = len(row_words)
-
-        def joined(items):
-            return clean_text(" ".join(item["text"] for item in items))
-
-        code_x = row_words[code_index]["cx"] / processed_width
-        before_code = row_words[:code_index]
-        dates = [w for w in before_code if re.search(r"\d{1,2}/\d{1,2}/\d{4}", w["text"])]
-        registro_words = []
-        fecha_words = []
-        sede_words = []
-        if dates:
-            first_date_index = before_code.index(dates[0])
-            registro_words = before_code[:first_date_index + 1]
-            remaining = before_code[first_date_index + 1:]
-            if remaining and re.search(r"\d{1,2}/\d{1,2}/\d{4}", remaining[0]["text"]):
-                fecha_words = [remaining[0]]
-                sede_words = remaining[1:]
-            else:
-                fecha_words = dates[1:2]
-                if len(dates) > 1:
-                    second_idx = before_code.index(dates[1])
-                    sede_words = before_code[second_idx + 1:]
-                else:
-                    sede_words = remaining
-        else:
-            sede_words = before_code
-
-        name_words = row_words[code_index + 1:area_index]
-        after_area = row_words[area_index + 1:] if area_index < len(row_words) else []
-
-        entry_words = [
-            w for w in after_area
-            if entry_start <= w["cx"] / processed_width < second_start
+def get_public_menu(menu_date: str):
+    """Obtiene el menú público y recupera el menú del día si quedó vacío."""
+    menu = get_menu(menu_date)
+    if menu["entrada"] and menu["fondo"]:
+        return menu
+    if menu_date == today_iso():
+        defaults = [
+            ("entrada", "Sopa del día"),
+            ("entrada", "Ensalada fresca"),
+            ("fondo", "Pollo al horno con arroz"),
+            ("fondo", "Lomo saltado"),
         ]
-        second_words = [
-            w for w in after_area
-            if second_start <= w["cx"] / processed_width < observation_start
-        ]
-        observation_words = [
-            w for w in after_area
-            if w["cx"] / processed_width >= observation_start
-        ]
-
-        row = {
-            "registro": joined(registro_words),
-            "fecha": joined(fecha_words),
-            "sede": joined(sede_words),
-            "codigo": code,
-            "nombre": joined(name_words),
-            "area": area,
-            "entrada": joined(entry_words),
-            "segundo": joined(second_words),
-            "observacion": joined(observation_words),
-        }
-
-        warnings = []
-        if not row["nombre"]:
-            warnings.append("Nombre vacío")
-        if not row["area"]:
-            warnings.append("Área no reconocida")
-        if not row["entrada"]:
-            warnings.append("Entrada vacía: revisa la línea roja Entrada/Segundo")
-        if not row["segundo"]:
-            warnings.append("Segundo vacío: revisa la línea roja Segundo/Observación")
-        if area_value(row["entrada"]):
-            warnings.append("Entrada contiene un área")
-        if area_value(row["segundo"]):
-            warnings.append("Segundo contiene un área")
-        row["_warnings"] = warnings
-        output.append(row)
-
-    if not output:
-        raise RuntimeError("No se detectaron filas. Verifica que la captura incluya la columna Código y que el texto sea legible.")
-    return output
-
-
-HEADER_HINTS = re.compile(
-    r"NOMBRE|APELLIDO|ENTRADA|PLATO|FONDO|SUGEREN|OBSERV|SEGUNDO|CODIGO|ÁREA|AREA|SEDE|REGISTRO|FECHA|^N[°ºoO]?$",
-    re.IGNORECASE,
-)
-
-
-def normalize_policia_name(value):
-    """Corrige errores OCR muy comunes en los grados PNP sin tocar apellidos/nombres."""
-    text = clean_text_unicode(value)
-    text = re.sub(r"(?i)^TNTE\s*[.\-]?\s*PNP\b", "TNTE PNP", text)
-    text = re.sub(r"(?i)^ST1\s*[.\-]?\s*PNP\b", "ST1 PNP", text)
-    text = re.sub(r"(?i)^ST3\s*[.\-]?\s*PNP\b", "ST3 PNP", text)
-    # En esta planilla S2 suele ser leído como 2, 52, $2, s2 o S2.PNP.
-    text = re.sub(r"(?i)^(?:S2|52|2)\s*[.\-]?\s*PNP\b", "S2 PNP", text)
-    text = re.sub(r"(?i)\bPNP\b", "PNP", text)
-    return clean_text_unicode(text)
-
-
-def _match_case(original, replacement):
-    if original.isupper():
-        return replacement.upper()
-    if original[:1].isupper():
-        return replacement[:1].upper() + replacement[1:]
-    return replacement
-
-
-def normalize_policia_menu_text(value):
-    """Conserva/restaura tildes frecuentes que OCR inglés suele perder o leer como 'e'."""
-    text = clean_text_unicode(value)
-    # Con Tesseract sin el paquete SPA, una ó pequeña suele reconocerse como 'e'.
-    # Las sustituciones se limitan a vocabulario de comida para no alterar nombres.
-    accent_fixes = {
-        "limon": "limón", "limen": "limón",
-        "lechon": "lechón", "lechen": "lechón",
-        "salpicon": "salpicón", "salpicen": "salpicón",
-        "pure": "puré",
-        "atun": "atún", "jamon": "jamón", "camaron": "camarón",
-        "chicharron": "chicharrón", "tallarin": "tallarín",
-        "brocoli": "brócoli", "platano": "plátano", "maiz": "maíz",
-        "aji": "ají", "higado": "hígado", "oregano": "orégano",
-        "albondiga": "albóndiga", "albondigas": "albóndigas",
-        "menesron": "menesrón", "menestron": "menestrón",
-        "menu": "menú", "porcion": "porción", "guarnicion": "guarnición",
-    }
-    for wrong, right in accent_fixes.items():
-        pattern = re.compile(rf"(?i)(?<![A-Za-zÁÉÍÓÚÜÑáéíóúüñ]){re.escape(wrong)}(?![A-Za-zÁÉÍÓÚÜÑáéíóúüñ])")
-        text = pattern.sub(lambda m: _match_case(m.group(0), right), text)
-    return clean_text_unicode(text)
-
-
-def extract_rows_policia(image_path, entry_start, second_start, observation_start):
-    """Extrae la planilla PNP: N° | Nombre | Entrada | Plato de fondo | Sugerencias.
-
-    A diferencia de TALMA, la captura PNP incluye los números de fila de Excel a la
-    izquierda. Se usa un OCR específico y se toma como N° el número dentro de la
-    primera columna de la tabla, ignorando el número de fila de Excel.
-    """
-    image = Image.open(image_path).convert("RGB")
-    tsv, processed_size = run_tesseract_tsv_policia(image)
-    processed_width, processed_height = processed_size
-    words = parse_words(tsv, preserve_accents=True)
-    grouped = cluster_rows(words, processed_height)
-
-    if not (0.0 < entry_start < second_start < observation_start < 1.0):
-        raise RuntimeError("Las líneas de columnas no están ordenadas correctamente.")
-
-    output = []
-    for group in grouped:
-        row_words = sorted(group["words"], key=lambda item: item["x"])
-        if not row_words:
-            continue
-
-        def joined(items):
-            return clean_text_unicode(" ".join(item["text"] for item in items))
-
-        # Todo lo anterior a ENTRADA contiene: [número de fila Excel] [N°] [nombre].
-        left_words = [w for w in row_words if w["cx"] / processed_width < entry_start]
-
-        # El N° real está dentro de la tabla. El número de fila de Excel queda mucho
-        # más pegado al borde izquierdo y se excluye con este margen. Elegimos el
-        # primer número corto de la zona N°; así tampoco confundimos "S2" con N°.
-        number_candidates = []
-        number_min_x = max(0.03, entry_start * 0.09)
-        number_max_x = min(entry_start * 0.30, entry_start - 0.02)
-        for index, word in enumerate(left_words):
-            digits = re.sub(r"\D", "", word["text"])
-            position = word["cx"] / processed_width
-            if digits and len(digits) <= 3 and number_min_x <= position <= number_max_x:
-                number_candidates.append((index, word, digits))
-
-        if not number_candidates:
-            continue
-
-        number_index, _, numero = number_candidates[0]
-        name_items = left_words[number_index + 1:]
-        nombre = normalize_policia_name(joined(name_items))
-
-        # Una fila PNP válida siempre debe tener un nombre razonable. Esto descarta
-        # encabezados, fecha, letras de columnas de Excel y filas vacías.
-        if not nombre or len(re.sub(r"[^A-Za-zÁÉÍÓÚÜÑáéíóúüñ]", "", nombre)) < 4:
-            continue
-
-        entry_words = [
-            w for w in row_words
-            if entry_start <= w["cx"] / processed_width < second_start
-        ]
-        second_words = [
-            w for w in row_words
-            if second_start <= w["cx"] / processed_width < observation_start
-        ]
-        observation_words = [
-            w for w in row_words
-            if w["cx"] / processed_width >= observation_start
-        ]
-
-        row = {
-            "numero": numero,
-            "nombre": nombre,
-            "entrada": normalize_policia_menu_text(joined(entry_words)),
-            "segundo": normalize_policia_menu_text(joined(second_words)),
-            "observacion": normalize_policia_menu_text(joined(observation_words)),
-        }
-
-        warnings = []
-        if not row["entrada"]:
-            warnings.append("Entrada vacía: revisa la línea de Entrada")
-        if not row["segundo"]:
-            warnings.append("Plato de fondo vacío: revisa la línea de Plato de fondo")
-        row["_warnings"] = warnings
-        output.append(row)
-
-    if not output:
-        raise RuntimeError(
-            "No se detectaron filas de POLICÍA. Verifica que la captura tenga el formato "
-            "N°, Nombre y apellido, Entrada, Plato de fondo y Sugerencias, y ajusta las barras."
-        )
-    return output
-
-
-def extract_rows(sistema, image_path, entry_start, second_start, observation_start):
-    if sistema == "policia":
-        return extract_rows_policia(image_path, entry_start, second_start, observation_start)
-    return extract_rows_talma(image_path, entry_start, second_start, observation_start)
-
-
-def save_rows(sistema, rows):
-    path = cfg(sistema)["data_file"]
-    path.write_text(json.dumps(rows, ensure_ascii=False, indent=2), encoding="utf-8")
-
-
-def load_rows(sistema):
-    path = cfg(sistema)["data_file"]
-    if not path.exists():
-        return []
-    try:
-        return json.loads(path.read_text(encoding="utf-8"))
-    except (json.JSONDecodeError, OSError):
-        return []
-
-
-@app.errorhandler(Exception)
-def error_handler(error):
-    detail = traceback.format_exc()
-    try:
-        return render_template("error.html", message=str(error), detail=detail), 500
-    except Exception:
-        # Último recurso para que un fallo de plantilla nunca termine como 502 opaco.
-        return Response(
-            "<!doctype html><html lang='es'><meta charset='utf-8'><title>Error</title>"
-            "<body style='font-family:Arial;padding:24px'><h1>Error del panel</h1><p>"
-            + str(escape(str(error)))
-            + "</p><pre style='white-space:pre-wrap'>"
-            + str(escape(detail))
-            + "</pre><p><a href='/admin/dashboard'>Volver al panel</a></p></body></html>",
-            status=500,
-            mimetype="text/html",
-        )
-
-
-@app.get("/admin/scanner-style.css")
-def scanner_style():
-    return Response(SCANNER_CSS, mimetype="text/css")
-
-
-
-@app.get("/admin/talma/usuarios")
-def talma_users_legacy():
-    # Ruta antigua: el apartado actual de personas TALMA está en /talma/usuarios.
-    return redirect("/talma/usuarios")
-
-
-@app.post("/admin/talma/usuarios")
-def talma_users_create_legacy():
-    return redirect("/talma/usuarios")
-
-
-@app.post("/admin/talma/usuarios/editar")
-def talma_users_edit_legacy():
-    return redirect("/talma/usuarios")
-
-
-@app.get("/admin/talma/usuarios/eliminar")
-def talma_users_delete_legacy():
-    return redirect("/talma/usuarios")
-
-
-@app.get("/admin/scanners")
-def index():
-    return render_template("index.html")
-
-
-@app.get("/admin/<any(talma,policia):sistema>/")
-def system_home(sistema):
-    c = cfg(sistema)
-    return render_template(
-        "subir.html",
-        sistema=sistema,
-        titulo=c["titulo"],
-        subtitulo=c["subtitulo"],
-        ayuda=c["ayuda"],
-        usuarios_url=url_for("talma_admin_users") if sistema == "talma" else "",
-    )
-
-
-@app.post("/admin/<any(talma,policia):sistema>/subir")
-def upload_image(sistema):
-    cfg(sistema)  # valida
-    uploaded = request.files.get("imagen")
-    if not uploaded or not uploaded.filename:
-        raise RuntimeError("Selecciona una imagen.")
-    suffix = Path(uploaded.filename).suffix.lower()
-    if suffix not in (".png", ".jpg", ".jpeg", ".webp"):
-        raise RuntimeError("La imagen debe ser PNG, JPG, JPEG o WEBP.")
-    filename = f"{uuid.uuid4().hex}{suffix}"
-    image_path = UPLOADS / filename
-    uploaded.save(image_path)
-    return redirect(url_for("calibrate", sistema=sistema, filename=filename))
-
-
-@app.get("/admin/<any(talma,policia):sistema>/calibrar/<filename>")
-def calibrate(sistema, filename):
-    c = cfg(sistema)
-    image_path = UPLOADS / Path(filename).name
-    if not image_path.exists():
-        raise RuntimeError("La imagen ya no existe. Vuelve a cargarla.")
-    return render_template(
-        "calibrar.html",
-        sistema=sistema,
-        titulo=c["titulo"],
-        filename=image_path.name,
-        entry_start=c["default_entry"],
-        second_start=c["default_second"],
-        observation_start=c["default_observation"],
-        label_entrada=c["label_entrada"],
-        label_segundo=c["label_segundo"],
-        label_observacion=c["label_observacion"],
-    )
-
-
-@app.get("/admin/scanner-imagen/<filename>")
-def uploaded_image(filename):
-    image_path = UPLOADS / Path(filename).name
-    if not image_path.exists():
-        raise RuntimeError("Imagen no encontrada.")
-    return send_file(image_path)
-
-
-@app.post("/admin/<any(talma,policia):sistema>/procesar")
-def process_image(sistema):
-    c = cfg(sistema)
-    filename = Path(request.form.get("filename", "")).name
-    image_path = UPLOADS / filename
-    if not filename or not image_path.exists():
-        raise RuntimeError("La imagen no existe. Vuelve a cargarla.")
-    try:
-        entry_start = float(request.form.get("entry_start", c["default_entry"]))
-        second_start = float(request.form.get("second_start", c["default_second"]))
-        observation_start = float(request.form.get("observation_start", c["default_observation"]))
-    except ValueError:
-        raise RuntimeError("Los límites de columnas no son válidos.")
-
-    rows = extract_rows(sistema, image_path, entry_start, second_start, observation_start)
-    save_rows(sistema, rows)
-
-    if sistema == "policia":
-        return render_template("revisar_policia.html", rows=rows, filename=filename)
-    return render_template(
-        "revisar_talma.html",
-        rows=rows,
-        areas=c["areas"],
-        filename=filename,
-    )
-
-
-@app.post("/admin/<any(talma,policia):sistema>/guardar")
-def save_changes(sistema):
-    c = cfg(sistema)
-    received = json.loads(request.form.get("rows_json", "[]"))
-    cleaned = []
-    for row in received:
-        cleaner = clean_text_unicode if sistema == "policia" else clean_text
-        item = {column: cleaner(row.get(column, "")) for column in c["cols"]}
-        if sistema == "talma":
-            item["codigo"] = re.sub(r"\D", "", item.get("codigo", ""))
-            item["area"] = area_value(item.get("area", ""))
-        if sistema == "policia":
-            item["numero"] = re.sub(r"\D", "", item.get("numero", ""))
-            for field in ("entrada", "segundo", "observacion"):
-                item[field] = normalize_policia_menu_text(item.get(field, ""))
-        item["_warnings"] = []
-        cleaned.append(item)
-    save_rows(sistema, cleaned)
-    return jsonify({"ok": True, "count": len(cleaned)})
-
-
-def draw_centered_fit(pdf, text, center_x, y, max_width, font="Helvetica-Bold", max_size=16, min_size=9, preserve_accents=False):
-    safe_text = pdf_text(text, preserve_accents=preserve_accents)
-    size = max_size
-    while size > min_size and pdf.stringWidth(safe_text, font, size) > max_width:
-        size -= 1
-    if pdf.stringWidth(safe_text, font, size) > max_width:
-        original = safe_text
-        while len(safe_text) > 4 and pdf.stringWidth(safe_text + "...", font, size) > max_width:
-            safe_text = safe_text[:-1].rstrip()
-        if safe_text != original:
-            safe_text += "..."
-    pdf.setFont(font, size)
-    pdf.drawCentredString(center_x, y, safe_text)
-
-
-def _wrap_lines_for_size(pdf, text, max_width, font, size, preserve_accents=False):
-    words = pdf_text(text, preserve_accents=preserve_accents).split()
-    if not words:
-        return []
-    lines = []
-    current = ""
-    for word in words:
-        proposed = f"{current} {word}".strip()
-        if pdf.stringWidth(proposed, font, size) <= max_width:
-            current = proposed
-            continue
-        if current:
-            lines.append(current)
-            current = ""
-        piece = ""
-        for char in word:
-            candidate = piece + char
-            if piece and pdf.stringWidth(candidate, font, size) > max_width:
-                lines.append(piece)
-                piece = char
-            else:
-                piece = candidate
-        current = piece
-    if current:
-        lines.append(current)
-    return lines
-
-
-def draw_text_in_box(
-    pdf,
-    text,
-    x,
-    top_y,
-    max_width,
-    max_height,
-    font="Helvetica-Bold",
-    max_size=18,
-    min_size=10,
-    max_lines=3,
-    preserve_accents=False,
-):
-    safe_text = pdf_text(text, preserve_accents=preserve_accents)
-    if not safe_text:
-        return
-    chosen_size = min_size
-    chosen_lines = [safe_text]
-    chosen_leading = min_size * 1.08
-    for size in range(max_size, min_size - 1, -1):
-        lines = _wrap_lines_for_size(pdf, safe_text, max_width, font, size, preserve_accents=preserve_accents)
-        leading = size * 1.08
-        required_height = size + max(0, len(lines) - 1) * leading
-        if len(lines) <= max_lines and required_height <= max_height:
-            chosen_size = size
-            chosen_lines = lines
-            chosen_leading = leading
-            break
-    if len(chosen_lines) > max_lines:
-        chosen_lines = chosen_lines[:max_lines]
-        last = chosen_lines[-1]
-        suffix = "..."
-        while last and pdf.stringWidth(last + suffix, font, chosen_size) > max_width:
-            last = last[:-1].rstrip()
-        chosen_lines[-1] = (last + suffix) if last else suffix
-    pdf.setFont(font, chosen_size)
-    baseline = top_y - chosen_size
-    for line in chosen_lines:
-        pdf.drawString(x, baseline, line)
-        baseline -= chosen_leading
-
-
-def count_order_values(rows, field, preserve_accents=False):
-    counts = Counter()
-    labels = {}
-    for row in rows:
-        value = clean_text(row.get(field, ""), preserve_accents=preserve_accents)
-        if not value:
-            continue
-        key = value.casefold()
-        counts[key] += 1
-        labels.setdefault(key, value)
-    return sorted(
-        ((labels[key], amount) for key, amount in counts.items()),
-        key=lambda item: (-item[1], item[0].casefold()),
-    )
-
-
-def fit_single_line(pdf, text, max_width, font="Helvetica", size=10, preserve_accents=False):
-    value = pdf_text(text, preserve_accents=preserve_accents)
-    if pdf.stringWidth(value, font, size) <= max_width:
-        return value
-    suffix = "..."
-    while value and pdf.stringWidth(value + suffix, font, size) > max_width:
-        value = value[:-1].rstrip()
-    return value + suffix if value else suffix
-
-
-def draw_pdf_summary_talma(pdf, rows, page_width, page_height, areas):
-    left = 16 * mm
-    right = page_width - 16 * mm
-    top = page_height - 16 * mm
-    generated_at = datetime.now()
-
-    area_counts = Counter()
-    for row in rows:
-        area = clean_text(row.get("area", "")).upper() or "SIN ÁREA"
-        area_counts[area] += 1
-
-    ordered_areas = []
-    for area in areas:
-        if area_counts.get(area):
-            ordered_areas.append((area, area_counts.pop(area)))
-    ordered_areas.extend(sorted(area_counts.items(), key=lambda item: (-item[1], item[0])))
-
-    pdf.showPage()
-    pdf.setFont("Helvetica-Bold", 18)
-    pdf.drawString(left, top, "RESUMEN DE PEDIDOS — TALMA")
-    pdf.setFont("Helvetica", 8)
-    pdf.drawRightString(right, top + 1, generated_at.strftime("%d/%m/%Y %H:%M"))
-    pdf.setLineWidth(0.8)
-    pdf.line(left, top - 4 * mm, right, top - 4 * mm)
-
-    y = top - 14 * mm
-    pdf.setFont("Helvetica-Bold", 16)
-    pdf.drawString(left, y, f"TOTAL DE PEDIDOS: {len(rows)}")
-    y -= 13 * mm
-
-    pdf.setFont("Helvetica-Bold", 13)
-    pdf.drawString(left, y, "PEDIDOS POR ÁREA / CATEGORÍA")
-    pdf.setLineWidth(0.4)
-    pdf.line(left, y - 2 * mm, right, y - 2 * mm)
-    y -= 9 * mm
-
-    pdf.setFont("Helvetica-Bold", 10)
-    pdf.drawString(left + 2 * mm, y, "ÁREA / CATEGORÍA")
-    pdf.drawRightString(right - 2 * mm, y, "CANTIDAD")
-    y -= 7 * mm
-
-    if not ordered_areas:
-        pdf.setFont("Helvetica-Oblique", 10)
-        pdf.drawString(left + 2 * mm, y, "SIN DATOS")
-        return
-
-    for area, amount in ordered_areas:
-        pdf.setFont("Helvetica-Bold", 12)
-        pdf.drawString(left + 2 * mm, y, pdf_text(area))
-        pdf.drawRightString(right - 2 * mm, y, str(amount))
-        pdf.setLineWidth(0.25)
-        pdf.line(left + 2 * mm, y - 2 * mm, right - 2 * mm, y - 2 * mm)
-        y -= 8 * mm
-
-
-def draw_pdf_summary_policia(pdf, rows, page_width, page_height):
-    left = 16 * mm
-    right = page_width - 16 * mm
-    top = page_height - 16 * mm
-    generated_at = datetime.now()
-
-    pdf.showPage()
-    pdf.setFont("Helvetica-Bold", 18)
-    pdf.drawString(left, top, "RESUMEN DE PEDIDOS — POLICÍA")
-    pdf.setFont("Helvetica", 8)
-    pdf.drawRightString(right, top + 1, generated_at.strftime("%d/%m/%Y %H:%M"))
-    pdf.setLineWidth(0.8)
-    pdf.line(left, top - 4 * mm, right, top - 4 * mm)
-
-    y = top - 14 * mm
-    pdf.setFont("Helvetica-Bold", 16)
-    pdf.drawString(left, y, f"TOTAL DE PEDIDOS: {len(rows)}")
-    y -= 14 * mm
-
-    for field, title in (
-        ("entrada", "ENTRADAS MÁS PEDIDAS"),
-        ("segundo", "PLATOS DE FONDO MÁS PEDIDOS"),
-        ("observacion", "SUGERENCIAS"),
-    ):
-        values = count_order_values(rows, field, preserve_accents=True)
-        pdf.setFont("Helvetica-Bold", 13)
-        pdf.drawString(left, y, title)
-        pdf.setLineWidth(0.4)
-        pdf.line(left, y - 2 * mm, right, y - 2 * mm)
-        y -= 8 * mm
-        if not values:
-            pdf.setFont("Helvetica-Oblique", 10)
-            pdf.drawString(left + 2 * mm, y, "SIN DATOS")
-            y -= 10 * mm
-            continue
-        for label, amount in values[:12]:
-            if y < 25 * mm:
-                pdf.showPage()
-                y = top
-            pdf.setFont("Helvetica", 11)
-            pdf.drawString(left + 2 * mm, y, fit_single_line(pdf, label, right - left - 30 * mm, size=11, preserve_accents=True))
-            pdf.drawRightString(right - 2 * mm, y, str(amount))
-            y -= 6.5 * mm
-        y -= 6 * mm
-
-
-@app.get("/admin/<any(talma,policia):sistema>/pdf")
-def create_pdf(sistema):
-    rows = load_rows(sistema)
-    if not rows:
-        raise RuntimeError("No hay pedidos guardados para generar el PDF.")
-    return create_pdf_from_rows(sistema, rows)
-
-
-def create_pdf_from_rows(sistema, rows, suffix=""):
-    c = cfg(sistema)
-    if not rows:
-        raise RuntimeError("No hay pedidos guardados para generar el PDF.")
-    OUTPUTS.mkdir(parents=True, exist_ok=True)
-    output = OUTPUTS / f"cuponera_{c['pdf_prefix']}{suffix}_{datetime.now():%Y%m%d_%H%M%S}.pdf"
-
-    pdf = canvas.Canvas(str(output), pagesize=A4)
-    page_width, page_height = A4
-    preserve_accents = sistema == "policia"
-    margin = 8 * mm
-    coupon_width = (page_width - 2 * margin) / 2
-    coupon_height = (page_height - 2 * margin) / 4
-
-    for index, row in enumerate(rows):
-        position = index % 8
-        if index and position == 0:
-            pdf.showPage()
-        column = position % 2
-        line = position // 2
-        x = margin + column * coupon_width
-        top = page_height - margin - line * coupon_height
-        pad = 5 * mm
-
-        pdf.rect(x, top - coupon_height, coupon_width, coupon_height)
-        text_x = x + pad
-        text_y = top - 7 * mm
-
-        pdf.setFont("Helvetica-Bold", 8)
-        pdf.drawString(text_x, text_y, f"TICKET {index + 1:03d}")
-
-        if sistema == "talma":
-            header = pdf_text(row.get("area", "") or "SIN ÁREA").upper()
-            fecha = pdf_text(row.get("fecha", ""))
-            header_size = 12
-            name_max_size = 12
-            name_min_size = 8
-            content_top = top - 19 * mm
-            first_box_height = 16 * mm
-            second_box_top = content_top - 19 * mm
-            second_box_height = 16 * mm
-            menu_max_size = 35
-            menu_min_size = 17
-            observation_label_y = content_top - 39 * mm
-        else:
-            header = "POLICÍA"
-            fecha = ""
-            header_size = 12
-            name_max_size = 13
-            name_min_size = 8
-            # POLICÍA: empresa en esquina; nombre/área más discretos y platos mucho más grandes.
-            content_top = top - 19 * mm
-            first_box_height = 17 * mm
-            second_box_top = content_top - 20 * mm
-            second_box_height = 17 * mm
-            menu_max_size = 39
-            menu_min_size = 18
-            observation_label_y = content_top - 42 * mm
-            num = clean_text(row.get("numero", ""))
-            if num:
-                pdf.setFont("Helvetica", 8)
-                pdf.drawString(text_x + 22 * mm, text_y, f"N° {num}")
-
-        # Identificador de empresa: pequeño, visible y siempre en la esquina superior derecha.
-        company_label = "TALMA" if sistema == "talma" else "POLICÍA"
-        label_w = 16 * mm
-        label_h = 4.5 * mm
-        label_x = x + coupon_width - pad - label_w
-        label_y = top - label_h - 2.5 * mm
-        pdf.setLineWidth(0.5)
-        pdf.rect(label_x, label_y, label_w, label_h)
-        pdf.setFont("Helvetica-Bold", 7)
-        pdf.drawCentredString(label_x + label_w / 2, label_y + 1.35 * mm, company_label)
-
-        pdf.setFont("Helvetica-Bold", header_size)
-        pdf.drawCentredString(x + coupon_width / 2, text_y, header)
-        if fecha:
-            pdf.setFont("Helvetica", 7)
-            pdf.drawRightString(x + coupon_width - pad, text_y, fecha)
-        text_y -= 7 * mm
-
-        name = pdf_text(row.get("nombre", ""), preserve_accents=preserve_accents).upper()
-        draw_centered_fit(
-            pdf,
-            name,
-            x + coupon_width / 2,
-            text_y,
-            coupon_width - 2 * pad,
-            font="Helvetica-Bold",
-            max_size=name_max_size,
-            min_size=name_min_size,
-            preserve_accents=preserve_accents,
-        )
-
-        ticket_bottom = top - coupon_height + 4 * mm
-        inner_width = coupon_width - 2 * pad
-
-        draw_text_in_box(
-            pdf,
-            row.get("entrada", ""),
-            text_x,
-            content_top,
-            inner_width,
-            first_box_height,
-            font="Helvetica-Bold",
-            max_size=menu_max_size,
-            min_size=menu_min_size,
-            max_lines=2,
-            preserve_accents=preserve_accents,
-        )
-
-        draw_text_in_box(
-            pdf,
-            row.get("segundo", ""),
-            text_x,
-            second_box_top,
-            inner_width,
-            second_box_height,
-            font="Helvetica-Bold",
-            max_size=menu_max_size,
-            min_size=menu_min_size,
-            max_lines=2,
-            preserve_accents=preserve_accents,
-        )
-
-        obs_label = "OBSERVACIÓN" if sistema == "talma" else "SUGERENCIAS"
-        if clean_text(row.get("observacion", "")):
-            pdf.setFont("Helvetica-Bold", 8)
-            pdf.drawString(text_x, observation_label_y, obs_label)
-            observation_top = observation_label_y - 2 * mm
-            observation_height = max(7 * mm, observation_top - ticket_bottom)
-            draw_text_in_box(
-                pdf,
-                row.get("observacion", ""),
-                text_x,
-                observation_top,
-                inner_width,
-                observation_height,
-                font="Helvetica-Bold",
-                max_size=10,
-                min_size=7,
-                max_lines=3,
-                preserve_accents=preserve_accents,
-            )
-
-    if sistema == "talma":
-        draw_pdf_summary_talma(pdf, rows, page_width, page_height, c["areas"])
-    else:
-        draw_pdf_summary_policia(pdf, rows, page_width, page_height)
-
-    pdf.save()
-    return send_file(output, as_attachment=True)
-
-
-# ---- Excel helpers (compartidos, parametrizados por sistema) ----
-
-def normalized_excel_header(values):
-    return [clean_text(str(v or "")).casefold() for v in values]
-
-
-def is_orders_sheet(sheet, headers):
-    expected = [clean_text(str(h or "")).casefold() for h in headers]
-    first = normalized_excel_header([cell.value for cell in next(sheet.iter_rows(min_row=1, max_row=1))])
-    return first[: len(expected)] == expected
-
-
-def parse_order_date(value):
-    text = clean_text(str(value or ""))
-    for fmt in ("%d/%m/%Y", "%Y-%m-%d", "%d-%m-%Y"):
-        try:
-            return datetime.strptime(text, fmt)
-        except ValueError:
-            continue
-    return None
-
-
-def order_date_label(rows, date_field="fecha"):
-    dates = []
-    for row in rows:
-        parsed = parse_order_date(row.get(date_field, ""))
-        if parsed:
-            dates.append(parsed)
-    if not dates:
-        return datetime.now().strftime("%d/%m/%Y")
-    lo, hi = min(dates), max(dates)
-    if lo.date() == hi.date():
-        return lo.strftime("%d/%m/%Y")
-    return f"{lo.strftime('%d/%m/%Y')} - {hi.strftime('%d/%m/%Y')}"
-
-
-def sheet_date_range(sheet, date_col_index=2):
-    dates = []
-    for row in sheet.iter_rows(min_row=2, values_only=True):
-        if not row or date_col_index >= len(row):
-            continue
-        parsed = parse_order_date(row[date_col_index])
-        if parsed:
-            dates.append(parsed)
-    if not dates:
-        return ""
-    lo, hi = min(dates), max(dates)
-    if lo.date() == hi.date():
-        return lo.strftime("%d/%m/%Y")
-    return f"{lo.strftime('%d/%m/%Y')} - {hi.strftime('%d/%m/%Y')}"
-
-
-def style_orders_sheet(sheet, widths):
-    header_fill = PatternFill("solid", fgColor="176B43")
-    header_font = Font(color="FFFFFF", bold=True)
-    thin = Border(
-        left=Side(style="thin", color="B0B0B0"),
-        right=Side(style="thin", color="B0B0B0"),
-        top=Side(style="thin", color="B0B0B0"),
-        bottom=Side(style="thin", color="B0B0B0"),
-    )
-    for col_idx, width in enumerate(widths, start=1):
-        sheet.column_dimensions[get_column_letter(col_idx)].width = width
-    for cell in sheet[1]:
-        cell.fill = header_fill
-        cell.font = header_font
-        cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
-        cell.border = thin
-    for row in sheet.iter_rows(min_row=2, max_row=sheet.max_row, max_col=len(widths)):
-        for cell in row:
-            cell.border = thin
-            cell.alignment = Alignment(vertical="center", wrap_text=True)
-
-
-def remove_previous_summary(sheet):
-    # Elimina resúmenes anteriores para que la actualización mensual no duplique totales.
-    start = None
-    for idx, row in enumerate(sheet.iter_rows(min_row=1, values_only=True), start=1):
-        text = " ".join(clean_text(str(v or "")) for v in row).upper()
-        if "RESUMEN DE ALMUERZOS POR PERSONA" in text:
-            start = idx
-            break
-    if start is not None:
-        sheet.delete_rows(start, sheet.max_row - start + 1)
-
-    rows_to_delete = []
-    for idx, row in enumerate(sheet.iter_rows(min_row=1, values_only=True), start=1):
-        text = " ".join(clean_text(str(v or "")) for v in row).upper()
-        if "TOTAL DE PEDIDOS" in text or "PERIODO" in text or "PERÍODO" in text:
-            rows_to_delete.append(idx)
-    for idx in reversed(rows_to_delete):
-        sheet.delete_rows(idx, 1)
-
-
-def append_summary(sheet, added_count, accumulated_total, cols_count, period_label=""):
-    sheet.append([])
-    sheet.append(["PERIODO", period_label or datetime.now().strftime("%d/%m/%Y")])
-    sheet.append(["PEDIDOS AGREGADOS", added_count])
-    sheet.append(["TOTAL DE PEDIDOS ACUMULADO", accumulated_total])
-    for row_idx in range(sheet.max_row - 2, sheet.max_row + 1):
-        for col in range(1, min(3, cols_count + 1)):
-            cell = sheet.cell(row=row_idx, column=col)
-            cell.font = Font(bold=True)
-
-
-def person_key(value):
-    return clean_text(str(value or ""), preserve_accents=True).casefold()
-
-
-def append_orders(sheet, rows, cols, preserve_accents=False):
-    """Agrega pedidos y deja un número de almuerzo acumulativo por persona."""
-    # Buscar el nombre dentro de las columnas del sistema.
-    name_index = cols.index("nombre") if "nombre" in cols else None
-    existing_counts = Counter()
-    if name_index is not None:
-        for values in sheet.iter_rows(min_row=2, values_only=True):
-            if not values or name_index >= len(values):
-                continue
-            key = person_key(values[name_index])
-            if key:
-                existing_counts[key] += 1
-
-    for row in rows:
-        values = [clean_text(row.get(column, ""), preserve_accents=preserve_accents) for column in cols]
-        if name_index is not None:
-            key = person_key(row.get("nombre", ""))
-            existing_counts[key] += 1
-            values.insert(name_index + 1, existing_counts[key])
-        sheet.append(values)
-
-
-def recompute_lunch_numbers(sheet, headers):
-    """Recalcula N° de almuerzo por persona en el orden en que aparecen los pedidos."""
-    if "N° Almuerzo" not in headers:
-        return
-    name_col = headers.index("Nombre") + 1 if "Nombre" in headers else (
-        headers.index("Nombre y apellido") + 1 if "Nombre y apellido" in headers else None
-    )
-    num_col = headers.index("N° Almuerzo") + 1
-    if not name_col:
-        return
-    counts = Counter()
-    for row_idx in range(2, sheet.max_row + 1):
-        name = sheet.cell(row=row_idx, column=name_col).value
-        key = person_key(name)
-        if not key:
-            continue
-        counts[key] += 1
-        sheet.cell(row=row_idx, column=num_col).value = counts[key]
-
-
-def append_person_summary(sheet, headers):
-    """Añade al final de la hoja el total acumulado de almuerzos por persona."""
-    name_col = headers.index("Nombre") + 1 if "Nombre" in headers else (
-        headers.index("Nombre y apellido") + 1 if "Nombre y apellido" in headers else None
-    )
-    if not name_col:
-        return
-    counts = Counter()
-    labels = {}
-    for row_idx in range(2, sheet.max_row + 1):
-        value = clean_text_unicode(str(sheet.cell(row=row_idx, column=name_col).value or "")).strip()
-        if not value:
-            continue
-        key = value.casefold()
-        counts[key] += 1
-        labels.setdefault(key, value)
-
-    sheet.append([])
-    sheet.append(["RESUMEN DE ALMUERZOS POR PERSONA"])
-    sheet.append(["PERSONA", "TOTAL ALMUERZOS"])
-    for key, total in sorted(counts.items(), key=lambda item: (-item[1], labels[item[0]].casefold())):
-        sheet.append([labels[key], total])
-
-    title_row = sheet.max_row - len(counts) - 1
-    for cell in sheet[title_row]:
-        cell.font = Font(bold=True, size=12)
-    for cell in sheet[title_row + 1]:
-        cell.font = Font(bold=True, color="FFFFFF")
-        cell.fill = PatternFill("solid", fgColor="176B43")
-        cell.alignment = Alignment(horizontal="center")
-
-
-def count_order_rows(sheet, headers):
-    count = 0
-    expected_len = len(headers)
-    for row in sheet.iter_rows(min_row=2, values_only=True):
-        if not row:
-            continue
-        values = [clean_text(str(v or "")) for v in row[:expected_len]]
-        text = " ".join(values).upper()
-        if "TOTAL DE PEDIDOS" in text or "PERIODO" in text or "PERÍODO" in text:
-            continue
-        if any(values):
-            count += 1
-    return count
-
-
-def prepare_orders_sheet(workbook, headers, preserve_accents=False):
-    # Preferir hoja llamada Pedidos; consolidar si hay varias.
-    candidates = [s for s in workbook.worksheets if s.title.lower().startswith("pedido")]
-    if not candidates:
-        sheet = workbook.worksheets[0] if workbook.worksheets else workbook.create_sheet("Pedidos")
-        sheet.title = "Pedidos"
-        if sheet.max_row < 1 or not is_orders_sheet(sheet, headers):
-            for _ in range(sheet.max_row):
-                sheet.delete_rows(1)
-            sheet.append(headers)
-        return sheet
-
-    main = candidates[0]
-    main.title = "Pedidos"
-    current = normalized_excel_header([cell.value for cell in next(main.iter_rows(min_row=1, max_row=1))]) if main.max_row else []
-    expected = normalized_excel_header(headers)
-
-    if current != expected:
-        # Migración compatible de Excel mensual anterior: conserva pedidos y agrega N° Almuerzo.
-        legacy = headers.copy()
-        if "N° Almuerzo" in legacy:
-            legacy.remove("N° Almuerzo")
-        legacy_expected = normalized_excel_header(legacy)
-        if current[:len(legacy_expected)] == legacy_expected:
-            insert_at = legacy.index("Nombre") + 2 if "Nombre" in legacy else legacy.index("Nombre y apellido") + 2
-            main.insert_cols(insert_at)
-            main.cell(row=1, column=insert_at).value = "N° Almuerzo"
-        else:
-            for _ in range(main.max_row):
-                main.delete_rows(1)
-            main.append(headers)
-
-    for extra in candidates[1:]:
-        for row in extra.iter_rows(min_row=2, values_only=True):
-            if not row:
-                continue
-            values = [clean_text(str(v or ""), preserve_accents=preserve_accents) for v in row[: len(headers)]]
-            text = " ".join(values).upper()
-            if "TOTAL DE PEDIDOS" in text or "PERIODO" in text or "RESUMEN DE ALMUERZOS" in text:
-                continue
-            if any(values):
-                main.append(values)
-        del workbook[extra.title]
-    return main
-
-
-@app.get("/admin/<any(talma,policia):sistema>/excel")
-def create_excel(sistema):
-    c = cfg(sistema)
-    rows = load_rows(sistema)
-    if not rows:
-        raise RuntimeError("No hay pedidos guardados para exportar.")
-    OUTPUTS.mkdir(parents=True, exist_ok=True)
-    output = OUTPUTS / f"pedidos_{c['pdf_prefix']}_{datetime.now():%Y_%m}.xlsx"
-    workbook = Workbook()
-    sheet = workbook.active
-    sheet.title = "Pedidos"
-    sheet.append(c["excel_headers"])
-    append_orders(sheet, rows, c["cols"], preserve_accents=(sistema == "policia"))
-    recompute_lunch_numbers(sheet, c["excel_headers"])
-    total = count_order_rows(sheet, c["excel_headers"])
-    period = order_date_label(rows, "fecha") if sistema == "talma" else datetime.now().strftime("%d/%m/%Y")
-    append_summary(sheet, added_count=len(rows), accumulated_total=total, cols_count=len(c["excel_headers"]), period_label=period)
-    append_person_summary(sheet, c["excel_headers"])
-    style_orders_sheet(sheet, c["excel_widths"])
-    workbook.save(output)
-    return send_file(output, as_attachment=True, download_name=output.name)
-
-
-@app.post("/admin/<any(talma,policia):sistema>/actualizar-excel")
-def update_excel(sistema):
-    c = cfg(sistema)
-    rows = load_rows(sistema)
-    if not rows:
-        raise RuntimeError("No hay pedidos guardados para agregar al Excel.")
-
-    uploaded = request.files.get("excel_anterior")
-    if not uploaded or not uploaded.filename:
-        raise RuntimeError("Selecciona el archivo Excel mensual que deseas actualizar.")
-    suffix = Path(uploaded.filename).suffix.lower()
-    if suffix != ".xlsx":
-        raise RuntimeError("El archivo anterior debe estar en formato .xlsx.")
-
-    OUTPUTS.mkdir(parents=True, exist_ok=True)
-    temp_input = UPLOADS / f"{uuid.uuid4().hex}.xlsx"
-    uploaded.save(temp_input)
-    try:
-        workbook = load_workbook(temp_input)
-        sheet = prepare_orders_sheet(workbook, c["excel_headers"], preserve_accents=(sistema == "policia"))
-        remove_previous_summary(sheet)
-        append_orders(sheet, rows, c["cols"], preserve_accents=(sistema == "policia"))
-        recompute_lunch_numbers(sheet, c["excel_headers"])
-        accumulated_total = count_order_rows(sheet, c["excel_headers"])
-        period = order_date_label(rows, "fecha") if sistema == "talma" else datetime.now().strftime("%d/%m/%Y")
-        append_summary(
-            sheet,
-            added_count=len(rows),
-            accumulated_total=accumulated_total,
-            cols_count=len(c["excel_headers"]),
-            period_label=period,
-        )
-        append_person_summary(sheet, c["excel_headers"])
-        style_orders_sheet(sheet, c["excel_widths"])
-
-        original_name = clean_text(Path(uploaded.filename).stem) or f"pedidos_{c['pdf_prefix']}"
-        output = OUTPUTS / f"{original_name}_actualizado.xlsx"
-        workbook.save(output)
-    finally:
-        try:
-            temp_input.unlink()
-        except OSError:
-            pass
-
-    return send_file(output, as_attachment=True, download_name=output.name)
-
-
-@app.get("/admin/scanner-diagnostico")
-def diagnostic():
-    exe = find_tesseract()
-    return jsonify({
-        "version": "20.3-talma-dni",
-        "sistemas": list(SISTEMAS.keys()),
-        "tesseract_encontrado": bool(exe),
-        "ruta": exe,
-        "idiomas": available_languages(exe) if exe else [],
-        "python": os.sys.version,
-        "uploads": str(UPLOADS),
-        "outputs": str(OUTPUTS),
-        "templates_dir": str(TEMPLATES_DIR),
-        "templates_dir_existe": TEMPLATES_DIR.exists(),
-        "templates_en_disco": sorted(p.name for p in TEMPLATES_DIR.glob("*.html")) if TEMPLATES_DIR.exists() else [],
-        "templates_embebidas": sorted(SCANNER_TEMPLATES.keys()),
-    })
-
-
-
-# ---------------------------------------------------------------------------
-# Portal privado TALMA
-# ---------------------------------------------------------------------------
-def _talma_password() -> str:
-    return os.environ.get("TALMA_PASSWORD", "Talma2026")
-
-
-def _talma_session_value() -> str:
-    expires = str(int(time.time()) + 12 * 3600)
-    payload = f"talma:{expires}"
+        with db() as conn:
+            existing = {(r["category"], r["name"]) for r in conn.execute(
+                "SELECT category,name FROM menu_items WHERE menu_date=?", (menu_date,)
+            ).fetchall()}
+            missing = [(menu_date,c,n) for c,n in defaults if (c,n) not in existing]
+            if missing:
+                conn.executemany(
+                    "INSERT OR IGNORE INTO menu_items(menu_date,category,name) VALUES (?,?,?)", missing
+                )
+                conn.commit()
+        menu = get_menu(menu_date)
+    return menu
+
+
+def session_value() -> str:
+    expires = str(int(time.time()) + 8 * 3600)
+    payload = f"admin:{expires}"
     sig = hmac.new(CONFIG["secret_key"].encode(), payload.encode(), hashlib.sha256).hexdigest()
     return f"{payload}:{sig}"
 
 
-def _valid_talma_session(value: str | None) -> bool:
+def valid_session(value: str | None) -> bool:
     if not value:
         return False
     try:
         user, expires, sig = value.split(":", 2)
-        if user != "talma" or int(expires) < time.time():
+        if user != "admin" or int(expires) < time.time():
             return False
         payload = f"{user}:{expires}"
         expected = hmac.new(CONFIG["secret_key"].encode(), payload.encode(), hashlib.sha256).hexdigest()
@@ -1584,798 +663,1599 @@ def _valid_talma_session(value: str | None) -> bool:
         return False
 
 
-def _talma_page(title: str, body: str, extra: str = "") -> str:
-    query = request.query_string.decode("latin-1") if request.query_string else ""
-    suffix = f"?{query}" if query else ""
-    return page(title, f"""
-<main class="wrap">
-<div class="actions no-print" style="justify-content:space-between;margin-bottom:16px">
-  <h1 style="margin:0">Portal TALMA</h1>
-  <span class="actions">
-  <a class="btn secondary" href="/talma/usuarios">Personas TALMA</a>
-  <a class="btn secondary" href="{"/talma/usuarios/excel" if title == "Personas TALMA" else "/talma/excel"+suffix}">{'Descargar Excel de personas' if title == "Personas TALMA" else 'Descargar Excel'}</a>
-  <a class="btn secondary" href="/talma/cupones{suffix}">Generar cupones</a>
-  <a class="btn secondary" href="/talma/logout">Cerrar sesión</a></span>
-</div>
-{body}
-</main>
-<style>
-.talma-filters{{padding:20px 22px}}
-.talma-filters .filter-title{{font-size:20px;font-weight:800;margin-bottom:14px;color:#17212b}}
-.talma-filters label{{font-size:14px}}
-.talma-filters input{{margin-top:5px}}
-.talma-filters .filter-actions{{margin-top:16px}}
-.talma-filters .filter-actions .btn,.talma-filters .filter-actions button{{white-space:nowrap}}
-</style>
-{extra}
-""")
 
 
-def _talma_login(error: bool = False):
-    notice = '<div class="notice error">Contraseña incorrecta.</div>' if error else ""
+
+def resolve_talma_login(email: str, dni: str):
+    email = email.strip().lower()
+    dni = dni.strip()
+    if not email or not dni:
+        return None
+
+    manual = get_talma_manual_user(email, dni)
+    if manual is not None:
+        return {
+            "email": manual["email"],
+            "dni": manual["dni"],
+            "nombre": manual["employee_name"],
+            "area": manual["area"],
+            "manual": True,
+        }
+
+    record = TALMA_ROSTER.get(f"{email}|{dni}")
+    if record:
+        result = dict(record)
+        result["manual"] = False
+        return result
+    return None
+
+def talma_employee_session_value(record: dict) -> str:
+    expires = str(int(time.time()) + 12 * 3600)
+    payload = f"talma_employee:{record['email']}:{record['dni']}:{expires}"
+    sig = hmac.new(CONFIG["secret_key"].encode(), payload.encode(), hashlib.sha256).hexdigest()
+    return f"{payload}:{sig}"
+
+
+def valid_talma_employee_session(value: str | None) -> dict | None:
+    if not value:
+        return None
+    try:
+        user, email, dni, expires, sig = value.split(":", 4)
+        if user != "talma_employee" or int(expires) < time.time():
+            return None
+        payload = f"{user}:{email}:{dni}:{expires}"
+        expected = hmac.new(CONFIG["secret_key"].encode(), payload.encode(), hashlib.sha256).hexdigest()
+        if not hmac.compare_digest(sig, expected):
+            return None
+        return resolve_talma_login(email, dni)
+    except (ValueError, TypeError):
+        return None
+
+
+def talma_employee_login_page(token: str, error: str = "") -> str:
+    notice = f'<div class="notice error">{esc(error)}</div>' if error else ""
     body = f"""
-<main class="wrap narrow">
-<div class="card">
-<h1>Acceso TALMA</h1>
-<p class="muted">Este apartado es exclusivo para TALMA.</p>
+<main class="talma-login-shell">
+<div class="talma-login-card">
+<div class="talma-brand">TALMA</div>
+<div class="talma-line"></div>
+<h1>Acceso a pedidos</h1>
+<p class="talma-subtitle">Ingresa con tu correo y DNI registrados.</p>
 {notice}
-<form method="post" action="/talma/login">
-<label>Contraseña TALMA</label>
-<input type="password" name="password" required autofocus autocomplete="current-password">
+<form method="post" action="/empresa/talma/login">
+<input type="hidden" name="token" value="{esc(token)}">
+<label>Correo electrónico</label>
+<input type="email" name="email" autocomplete="username" required placeholder="correo@empresa.com">
+<label>DNI</label>
+<input type="text" name="dni" inputmode="numeric" autocomplete="username" required placeholder="DNI" maxlength="8">
+<p class="talma-help">El sistema valida ambos datos y carga automáticamente tu nombre y área.</p>
 <button type="submit">Ingresar</button>
 </form>
 </div>
 </main>"""
-    return page("Acceso TALMA", body)
+    extra="""<style>
+.talma-login-shell{min-height:100vh;display:flex;align-items:center;justify-content:center;padding:30px;background:linear-gradient(145deg,#f4f8fb 0%,#eef6f7 100%)}
+.talma-login-card{width:min(440px,100%);background:#fff;border:1px solid #d5e1e5;border-radius:18px;padding:34px;box-shadow:0 18px 50px rgba(19,60,70,.12)}
+.talma-brand{font-size:28px;font-weight:900;letter-spacing:4px;color:#006b78}.talma-line{height:4px;width:62px;background:#00a7b5;border-radius:6px;margin:10px 0 24px}
+.talma-login-card h1{font-size:25px;margin-bottom:8px;color:#18343b}.talma-subtitle{color:#667085;margin-top:0;margin-bottom:22px}
+.talma-login-card input{margin-bottom:6px}.talma-login-card button{width:100%;margin-top:12px;background:#006b78}.talma-login-card button:hover{background:#005761}
+.talma-help{font-size:12px;color:#7b8794;margin-top:10px;line-height:1.45}
+</style>"""
+    return page("Acceso TALMA", body, extra)
+
+def normalize_report_header(value: object) -> str:
+    text = unicodedata.normalize("NFKD", str(value or "")).encode("ascii", "ignore").decode("ascii")
+    return re.sub(r"[^a-z0-9]+", " ", text.lower()).strip()
 
 
-@app.get("/talma")
-@app.get("/talma/")
-def talma_portal():
-    if not _valid_talma_session(request.cookies.get("talma_session")):
-        return _talma_login()
+def read_multipart_file(handler: BaseHTTPRequestHandler, field_name: str, max_bytes: int = 20_000_000):
+    """Lee un único archivo de un formulario multipart sin depender del módulo cgi."""
+    try:
+        length = int(handler.headers.get("Content-Length", "0"))
+    except ValueError:
+        length = 0
+    if length <= 0 or length > max_bytes:
+        raise ValueError("El archivo está vacío o supera el límite de 20 MB.")
+    raw = handler.rfile.read(length)
+    content_type = handler.headers.get("Content-Type", "")
+    if "multipart/form-data" not in content_type:
+        raise ValueError("El formulario de archivo no es multipart/form-data.")
+    mime = b"Content-Type: " + content_type.encode("utf-8") + b"\r\nMIME-Version: 1.0\r\n\r\n" + raw
+    message = BytesParser(policy=email_default_policy).parsebytes(mime)
+    for part in message.iter_parts():
+        if part.get_content_disposition() == "form-data" and part.get_param("name", header="content-disposition") == field_name:
+            filename = part.get_filename() or "historico.xlsx"
+            return filename, part.get_payload(decode=True) or b""
+    raise ValueError("No se encontró el archivo Excel.")
 
-    orders_app.init_db()
-    dni_filter = request.args.get("dni", "").strip()[:20]
-    fecha_desde = request.args.get("desde", "").strip()
-    fecha_hasta = request.args.get("hasta", "").strip()
 
-    # Si solo se indica una fecha, se usa como fecha única.
-    if fecha_desde and not fecha_hasta:
-        fecha_hasta = fecha_desde
-    if fecha_hasta and not fecha_desde:
-        fecha_desde = fecha_hasta
+def extract_historical_orders(workbook):
+    """Extrae filas de un Excel anterior usando encabezados flexibles."""
+    aliases = {
+        "fecha": {"fecha", "date", "dia", "fecha pedido"},
+        "empresa": {"empresa", "company", "compania"},
+        "nombre": {"empleado", "nombre", "nombre y apellido", "persona", "trabajador"},
+        "area": {"area", "area o sede", "sede"},
+        "entrada": {"entrada", "plato de entrada"},
+        "fondo": {"plato de fondo", "fondo", "segundo", "plato fondo", "main"},
+        "observacion": {"observacion", "observaciones", "sugerencias", "notas"},
+    }
+    records = []
+    for sheet in workbook.worksheets:
+        rows = list(sheet.iter_rows(values_only=True))
+        if not rows:
+            continue
+        header_idx = None
+        mapping = {}
+        for i, raw_header in enumerate(rows[:10]):
+            normalized = [normalize_report_header(v) for v in raw_header]
+            candidate = {}
+            for idx, h in enumerate(normalized):
+                for field, names in aliases.items():
+                    if h in names and field not in candidate:
+                        candidate[field] = idx
+            if "nombre" in candidate and ("fecha" in candidate or "entrada" in candidate):
+                header_idx = i
+                mapping = candidate
+                break
+        if header_idx is None:
+            continue
 
-    def valid_iso(value):
-        try:
-            datetime.strptime(value, "%Y-%m-%d")
-            return True
-        except ValueError:
-            return False
+        for raw in rows[header_idx + 1:]:
+            def val(field):
+                idx = mapping.get(field)
+                return raw[idx] if idx is not None and idx < len(raw) else ""
 
-    if fecha_desde and not valid_iso(fecha_desde):
-        fecha_desde = ""
-    if fecha_hasta and not valid_iso(fecha_hasta):
-        fecha_hasta = ""
-    if fecha_desde and fecha_hasta and fecha_desde > fecha_hasta:
-        fecha_desde, fecha_hasta = fecha_hasta, fecha_desde
+            name = re.sub(r"\s+", " ", str(val("nombre") or "")).strip()
+            entry = re.sub(r"\s+", " ", str(val("entrada") or "")).strip()
+            fondo = re.sub(r"\s+", " ", str(val("fondo") or "")).strip()
+            if not name and not entry and not fondo:
+                continue
 
-    with orders_app.db() as conn:
-        sql = """SELECT o.id, o.order_date, o.employee_name,
-                        o.dni AS dni,
-                        o.area, o.entry_item, o.main_item, o.notes, o.created_at
-                 FROM orders o JOIN companies c ON c.id=o.company_id
-                 WHERE c.slug='talma'"""
-        args = []
-        if dni_filter:
-            sql += " AND o.dni=?"
-            args.append(dni_filter)
-        if fecha_desde:
-            sql += " AND o.order_date>=?"
-            args.append(fecha_desde)
-        if fecha_hasta:
-            sql += " AND o.order_date<=?"
-            args.append(fecha_hasta)
-        sql += """ ORDER BY o.order_date DESC,
-                   CASE WHEN o.dni='' THEN 1 ELSE 0 END,
-                   o.dni, o.employee_name COLLATE NOCASE, o.id"""
-        rows = conn.execute(sql, args).fetchall()
+            raw_date = val("fecha")
+            if isinstance(raw_date, datetime):
+                order_date = raw_date.strftime("%Y-%m-%d")
+            elif isinstance(raw_date, date):
+                order_date = raw_date.isoformat()
+            else:
+                parsed = None
+                raw_text = re.sub(r"\s+", " ", str(raw_date or "")).strip()
+                for fmt in ("%d/%m/%Y", "%Y-%m-%d", "%d-%m-%Y", "%d/%m/%y"):
+                    try:
+                        parsed = datetime.strptime(raw_text, fmt)
+                        break
+                    except ValueError:
+                        pass
+                order_date = parsed.strftime("%Y-%m-%d") if parsed else raw_text
 
-    counts = {}
-    for r in rows:
-        key = r["dni"] or f"legacy:{orders_app.normalize_key(r['employee_name'])}"
-        counts[key] = counts.get(key, 0) + 1
+            records.append({
+                "fecha": order_date,
+                "empresa": re.sub(r"\s+", " ", str(val("empresa") or "")).strip(),
+                "nombre": name,
+                "area": re.sub(r"\s+", " ", str(val("area") or "")).strip(),
+                "entrada": entry,
+                "fondo": fondo,
+                "observacion": re.sub(r"\s+", " ", str(val("observacion") or "")).strip(),
+            })
+    return records
 
-    today = orders_app.local_now().date()
-    month_names = ("enero", "febrero", "marzo", "abril", "mayo", "junio", "julio", "agosto", "septiembre", "octubre", "noviembre", "diciembre")
-    month_name = month_names[today.month - 1]
-    month_start = today.replace(day=1).isoformat()
-    today_iso = today.isoformat()
-    with orders_app.db() as conn:
-        monthly_total = conn.execute(
-            """SELECT COUNT(*) FROM orders o JOIN companies c ON c.id=o.company_id
-               WHERE c.slug='talma' AND o.order_date>=? AND o.order_date<=?""",
-            (month_start, today_iso),
-        ).fetchone()[0]
-        daily_total = conn.execute(
-            """SELECT COUNT(*) FROM orders o JOIN companies c ON c.id=o.company_id
-               WHERE c.slug='talma' AND o.order_date=?""",
-            (today_iso,),
-        ).fetchone()[0]
+
+def build_historical_report(workbook, historical_records, current_records):
+    """Añade al Excel un detalle unificado y reportes por persona y por día."""
+    all_records = []
+    seen = set()
+
+    for record in historical_records + current_records:
+        key = (
+            normalize_key(record.get("fecha", "")),
+            normalize_key(record.get("empresa", "")),
+            normalize_key(record.get("nombre", "")),
+            normalize_key(record.get("entrada", "")),
+            normalize_key(record.get("fondo", "")),
+        )
+        if not key[0] or not key[2]:
+            continue
+        if key in seen:
+            continue
+        seen.add(key)
+        all_records.append(record)
+
+    # El detalle queda ordenado alfabéticamente por persona para identificarla rápidamente.
+    # Dentro de cada persona, sus almuerzos se ordenan por fecha y empresa para que
+    # el N° Almuerzo siga una secuencia lógica.
+    all_records.sort(key=lambda r: (normalize_key(r.get("nombre", "")), normalize_key(r.get("empresa", "")), r.get("fecha", "")))
+
+    # Reemplaza las hojas de reporte para que la actualización sea idempotente.
+    for name in ("REPORTE PEDIDOS", "DETALLE UNIFICADO"):
+        if name in workbook.sheetnames:
+            del workbook[name]
+
+    detail = workbook.create_sheet("DETALLE UNIFICADO")
+    headers = ["Fecha", "Empresa", "Persona", "Área", "Entrada", "Plato de fondo", "Observación", "N° Almuerzo"]
+    detail.append(headers)
+
+    person_counts = {}
+    for record in all_records:
+        person_key = (normalize_key(record["empresa"]), normalize_key(record["nombre"]))
+        person_counts[person_key] = person_counts.get(person_key, 0) + 1
 
     running = {}
-    table_rows = []
-    for r in rows:
-        key = r["dni"] or f"legacy:{orders_app.normalize_key(r['employee_name'])}"
-        running[key] = running.get(key, 0) + 1
-        table_rows.append(
-            f"<tr><td>{esc(r['order_date'])}</td><td><b>{esc(r['dni'] or '—')}</b></td><td>{esc(r['employee_name'])}</td>"
-            f"<td>{esc(r['area'])}</td><td>{esc(r['entry_item'])}</td><td>{esc(r['main_item'])}</td>"
-            f"<td>{running[key]}</td><td>{esc((r['created_at'] or '')[11:16])}</td></tr>"
-        )
+    for record in all_records:
+        person_key = (normalize_key(record["empresa"]), normalize_key(record["nombre"]))
+        running[person_key] = running.get(person_key, 0) + 1
+        detail.append([
+            record["fecha"], record["empresa"], record["nombre"], record["area"],
+            record["entrada"], record["fondo"], record["observacion"], running[person_key]
+        ])
 
-    summary = []
-    for dni_key, total in sorted(counts.items(), key=lambda x: x[0]):
-        rr = next((r for r in rows if (r["dni"] or f"legacy:{orders_app.normalize_key(r['employee_name'])}") == dni_key), None)
-        label = rr["employee_name"] if rr else dni_key
-        dni_label = rr["dni"] if rr and rr["dni"] else "Sin DNI (registro antiguo)"
-        summary.append(
-            f"<tr><td><b>{esc(dni_label)}</b></td><td>{esc(label)}</td><td>{total}</td></tr>"
-        )
+    report = workbook.create_sheet("REPORTE PEDIDOS")
+    report.append(["REPORTE HISTÓRICO DE ALMUERZOS"])
+    report.append([f"Generado: {local_now().strftime('%d/%m/%Y %H:%M')}"])
+    report.append([f"Total de registros: {len(all_records)}"])
+    report.append([])
+    report.append(["RESUMEN POR PERSONA"])
+    report.append(["Empresa", "Persona", "Total almuerzos", "Último pedido"])
 
-    if fecha_desde and fecha_hasta:
-        periodo_label = (
-            f"{esc(orders_app.fecha_con_dia(fecha_desde))}"
-            if fecha_desde == fecha_hasta
-            else f"del <b>{esc(orders_app.fecha_con_dia(fecha_desde))}</b> "
-                 f"al <b>{esc(orders_app.fecha_con_dia(fecha_hasta))}</b>"
-        )
-    else:
-        periodo_label = "Todo el historial"
+    by_person = {}
+    for record in all_records:
+        key = (record["empresa"], record["nombre"])
+        item = by_person.setdefault(key, {"total": 0, "last": "", "entries": Counter(), "mains": Counter()})
+        item["total"] += 1
+        item["last"] = max(item["last"], record["fecha"])
+        if record["entrada"]:
+            item["entries"][record["entrada"]] += 1
+        if record["fondo"]:
+            item["mains"][record["fondo"]] += 1
 
-    body = f"""
-<div class="hero-total">
-  <div class="hero-kicker">PEDIDOS TALMA — MES ACTUAL</div>
-  <div class="hero-number">{monthly_total}</div>
-  <div class="hero-date">menús pedidos en {month_name} de {today.year}</div>
+    for (empresa, nombre), item in sorted(by_person.items(), key=lambda x: (normalize_key(x[0][0]), normalize_key(x[0][1]))):
+        report.append([empresa, nombre, item["total"], item["last"]])
+
+    report.append([])
+    report.append(["RESUMEN POR DÍA"])
+    report.append(["Fecha", "Empresa", "Pedidos"])
+    by_day = Counter((r["fecha"], r["empresa"]) for r in all_records)
+    for (fecha, empresa), total in sorted(by_day.items()):
+        report.append([fecha, empresa, total])
+
+    report.append([])
+    report.append(["PLATOS MÁS PEDIDOS"])
+    report.append(["Tipo", "Plato", "Cantidad"])
+    dish_counts = Counter()
+    for record in all_records:
+        if record["entrada"]:
+            dish_counts[("Entrada", record["entrada"])] += 1
+        if record["fondo"]:
+            dish_counts[("Plato de fondo", record["fondo"])] += 1
+    for (kind, dish), total in dish_counts.most_common():
+        report.append([kind, dish, total])
+
+    # Formato
+    header_fill = PatternFill("solid", fgColor="176B43")
+    header_font = Font(color="FFFFFF", bold=True)
+    thin = Side(style="thin", color="D0D5DD")
+    for sheet in (detail, report):
+        for row in sheet.iter_rows():
+            for cell in row:
+                cell.alignment = Alignment(vertical="top", wrap_text=True)
+                cell.border = Border(bottom=thin)
+        for cell in sheet[1]:
+            cell.fill = header_fill
+            cell.font = header_font
+        sheet.freeze_panes = "A2"
+    if detail.max_row > 1:
+        detail.auto_filter.ref = detail.dimensions
+    if report.max_row > 1:
+        # El resumen por persona también queda alfabético.
+        report.auto_filter.ref = f"A6:D{5 + len(by_person) + 1}" if by_person else "A6:D6"
+
+    for idx, width in enumerate([14, 18, 28, 18, 32, 36, 30, 14], 1):
+        detail.column_dimensions[get_column_letter(idx)].width = width
+    for idx, width in enumerate([20, 30, 18, 18], 1):
+        report.column_dimensions[get_column_letter(idx)].width = width
+
+    return len(all_records), len(by_person)
+
+
+class AppHandler(BaseHTTPRequestHandler):
+    server_version = "Almuerzos/1.0"
+
+    def log_message(self, fmt: str, *args) -> None:
+        sys.stdout.write("[%s] %s\n" % (self.log_date_time_string(), fmt % args))
+
+    def parse_cookies(self) -> cookies.SimpleCookie:
+        jar = cookies.SimpleCookie()
+        if self.headers.get("Cookie"):
+            jar.load(self.headers["Cookie"])
+        return jar
+
+    def is_admin(self) -> bool:
+        jar = self.parse_cookies()
+        value = jar.get("admin_session")
+        return valid_session(value.value if value else None)
+
+    def read_form(self) -> dict[str, str]:
+        try:
+            length = int(self.headers.get("Content-Length", "0"))
+        except ValueError:
+            length = 0
+        raw = self.rfile.read(min(length, 2_000_000)).decode("utf-8", "replace")
+        parsed = parse_qs(raw, keep_blank_values=True)
+        return {k: v[0] if v else "" for k, v in parsed.items()}
+
+    def send_html(self, content: str, status: int = 200, headers: dict | None = None) -> None:
+        data = content.encode("utf-8")
+        self.send_response(status)
+        self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.send_header("Content-Length", str(len(data)))
+        self.send_header("X-Content-Type-Options", "nosniff")
+        self.send_header("X-Frame-Options", "SAMEORIGIN")
+        self.send_header("Referrer-Policy", "same-origin")
+        self.send_header("Cache-Control", "no-store, no-cache, must-revalidate, max-age=0")
+        self.send_header("Pragma", "no-cache")
+        if headers:
+            for key, value in headers.items():
+                self.send_header(key, value)
+        self.end_headers()
+        self.wfile.write(data)
+
+    def send_text(self, text: str, status: int = 200) -> None:
+        data = text.encode("utf-8")
+        self.send_response(status)
+        self.send_header("Content-Type", "text/plain; charset=utf-8")
+        self.send_header("Content-Length", str(len(data)))
+        self.end_headers()
+        self.wfile.write(data)
+
+    def send_bytes(self, data: bytes, content_type: str, filename: str) -> None:
+        self.send_response(200)
+        self.send_header("Content-Type", content_type)
+        self.send_header("Content-Disposition", f'attachment; filename="{filename}"')
+        self.send_header("Content-Length", str(len(data)))
+        self.end_headers()
+        self.wfile.write(data)
+
+    def redirect(self, location: str, cookie_header: str | None = None) -> None:
+        self.send_response(303)
+        self.send_header("Location", location)
+        if cookie_header:
+            self.send_header("Set-Cookie", cookie_header)
+        self.end_headers()
+
+    def require_admin(self) -> bool:
+        if not self.is_admin():
+            self.redirect("/admin")
+            return False
+        return True
+
+    def do_GET(self) -> None:
+        parsed = urlparse(self.path)
+        path = parsed.path.rstrip("/") or "/"
+        query = {k: v[0] for k, v in parse_qs(parsed.query).items()}
+
+        # Recursos estáticos del sistema de pedidos.
+        # El portal principal puede actuar como proxy hacia este servidor interno,
+        # por lo que estos archivos deben poder servirse también desde aquí.
+        if path.startswith("/static/"):
+            relative = path[len("/static/"):].lstrip("/")
+            static_root = BASE_DIR / "static"
+            candidate = (static_root / relative).resolve()
+            try:
+                candidate.relative_to(static_root.resolve())
+            except ValueError:
+                self.send_text("Not found", 404)
+                return
+            if not candidate.is_file():
+                self.send_text("Not found", 404)
+                return
+            mime = {
+                ".png": "image/png",
+                ".jpg": "image/jpeg",
+                ".jpeg": "image/jpeg",
+                ".webp": "image/webp",
+                ".gif": "image/gif",
+                ".svg": "image/svg+xml",
+                ".ico": "image/x-icon",
+                ".css": "text/css; charset=utf-8",
+                ".js": "application/javascript; charset=utf-8",
+            }.get(candidate.suffix.lower(), "application/octet-stream")
+            try:
+                data = candidate.read_bytes()
+            except OSError:
+                self.send_text("Not found", 404)
+                return
+            self.send_response(200)
+            self.send_header("Content-Type", mime)
+            self.send_header("Content-Length", str(len(data)))
+            self.send_header("Cache-Control", "public, max-age=86400")
+            self.end_headers()
+            self.wfile.write(data)
+            return
+
+        if path == "/":
+            self.home()
+        elif path == "/health":
+            self.send_text("ok")
+        elif path == "/admin":
+            self.admin_login(query.get("error"))
+        elif path == "/admin/logout":
+            self.redirect("/admin", "admin_session=; Path=/; Max-Age=0; HttpOnly; SameSite=Lax")
+        elif path in ("/admin/dashboard", "/admin/pedidos"):
+            if self.require_admin():
+                self.admin_dashboard(query)
+        elif path == "/admin/pedidos/configuracion":
+            if self.require_admin():
+                self.admin_order_settings(query)
+        elif path == "/admin/pedidos/manual":
+            if self.require_admin():
+                self.admin_manual_order(query)
+        elif path == "/admin/personas":
+            if self.require_admin():
+                self.admin_personas(query)
+        elif path == "/admin/resumen":
+            if self.require_admin():
+                self.admin_resumen(query)
+        elif path == "/admin/export.csv":
+            if self.require_admin():
+                self.export_csv(query)
+        elif path == "/admin/cupones":
+            if self.require_admin():
+                self.coupons(query)
+        elif path.startswith("/empresa/") and path.endswith("/excel"):
+            self.company_export_excel(path.split("/")[2], query)
+        elif path == "/empresa/talma/login":
+            self.send_html(talma_employee_login_page(query.get("token", ""), query.get("error", "")))
+        elif path == "/empresa/talma/logout":
+            self.redirect(f"/empresa/talma/login?{urlencode({'token':query.get('token','')})}", "talma_employee_session=; Path=/; Max-Age=0; HttpOnly; SameSite=Lax")
+        elif path.startswith("/empresa/") and path.endswith("/pdf"):
+            self.company_export_pdf(path.split("/")[2], query)
+        elif path.startswith("/empresa/"):
+            self.employee_form(path.split("/", 2)[2], query)
+        else:
+            self.send_html(page("No encontrado", '<main class="wrap narrow"><div class="card"><h1>404</h1><p>Página no encontrada.</p></div></main>'), 404)
+
+    def do_POST(self) -> None:
+        parsed = urlparse(self.path)
+        path = parsed.path.rstrip("/") or "/"
+        if path == "/admin/login":
+            self.login()
+        elif path == "/admin/menu":
+            if self.require_admin():
+                self.save_menu()
+        elif path == "/admin/empresa":
+            if self.require_admin():
+                self.create_company()
+        elif path == "/admin/empresa/toggle":
+            if self.require_admin():
+                self.toggle_company()
+        elif path == "/admin/pedido/eliminar":
+            if self.require_admin():
+                self.delete_order()
+        elif path == "/admin/historico-excel":
+            if self.require_admin():
+                self.update_historical_excel()
+        elif path == "/admin/pedidos/configuracion":
+            if self.require_admin():
+                self.save_order_settings()
+        elif path == "/admin/pedidos/reabrir":
+            if self.require_admin():
+                self.reopen_orders()
+        elif path == "/admin/pedidos/cerrar-manual":
+            if self.require_admin():
+                self.close_orders_manual()
+        elif path == "/admin/pedidos/manual":
+            if self.require_admin():
+                self.save_manual_order()
+        elif path == "/empresa/talma/login":
+            self.talma_employee_login()
+        elif path.startswith("/pedido/"):
+            self.submit_order(path.split("/", 2)[2])
+        else:
+            self.send_html(page("No encontrado", '<main class="wrap narrow"><div class="card"><h1>404</h1></div></main>'), 404)
+
+    def home(self) -> None:
+
+        body = f"""
+<main class="wrap narrow">
+<div class="card">
+<h1>Pedidos de almuerzo</h1>
+<p>Los trabajadores deben ingresar mediante el enlace privado de su empresa.</p>
+<p class="muted">Administrador del restaurante: use el panel para publicar el menú y revisar pedidos.</p>
+<a class="btn" href="/admin">Ingresar al panel administrador</a>
 </div>
+</main>"""
+        self.send_html(page("Inicio", body))
 
-<div class="grid grid3">
-<div class="stat highlight-stat">Pedidos del mes<b>{monthly_total}</b></div>
-<div class="stat highlight-stat">Pedidos de hoy<b>{daily_total}</b></div>
-<div class="stat period-stat">Período consultado<b style="font-size:18px;line-height:1.3">{periodo_label}</b></div>
+    def whatsapp_link(self, message: str = "") -> str:
+        number=re.sub(r"\D","",os.environ.get("WHATSAPP_NUMBER",str(CONFIG.get("whatsapp_number",""))))
+        return f"https://wa.me/{number}?text={quote(message)}" if number else ""
+
+    def talma_employee_login(self) -> None:
+        form = self.read_form()
+        token = form.get("token", "").strip()
+        email = form.get("email", "").strip().lower()
+        dni = form.get("dni", "").strip()
+        record = resolve_talma_login(email, dni)
+        company = get_company("talma", token) if token else get_company("talma")
+        if company:
+            token = company["token"]
+        if not company:
+            self.send_html(page("Enlace inválido", '<main class="wrap narrow"><div class="card"><h1>Enlace inválido</h1><p>El enlace de TALMA no es válido.</p></div></main>'), 403)
+            return
+        if not record:
+            self.redirect(f"/empresa/talma/login?{urlencode({'token':token,'error':'Correo o DNI incorrecto.'})}")
+            return
+        value = talma_employee_session_value(record)
+        secure = "; Secure" if self.headers.get("X-Forwarded-Proto") == "https" else ""
+        location = f"/empresa/talma?{urlencode({'token':token,'ok_login':'1'})}"
+        self.redirect(location, f"talma_employee_session={value}; Path=/; Max-Age=43200; HttpOnly; SameSite=Lax{secure}")
+
+    def display_area(self, company_slug: str, area: str) -> str:
+        value = str(area or "").strip()
+        if company_slug.lower() == "talma" and value.upper() == "PAXHANDLING":
+            return "PAX"
+        return value
+
+    def employee_form(self, slug: str, query: dict[str, str]) -> None:
+        token = query.get("token", "").strip()
+        company = get_company(slug, token) if token else get_company(slug)
+        if not company:
+            self.send_html(page("Enlace inválido", '<main class="wrap narrow"><div class="card"><h1>Enlace inválido</h1><p>Solicite a su empresa un enlace actualizado.</p></div></main>'), 403)
+            return
+        token = company["token"]
+        is_talma = slug.lower() == "talma"
+        talma_employee = None
+        if is_talma:
+            talma_employee = valid_talma_employee_session(self.parse_cookies().get("talma_employee_session").value if self.parse_cookies().get("talma_employee_session") else None)
+            if not talma_employee:
+                self.redirect(f"/empresa/talma/login?{urlencode({'token':token})}")
+                return
+        requested_date = query.get("fecha", today_iso())
+        try:
+            datetime.strptime(requested_date, "%Y-%m-%d")
+        except ValueError:
+            requested_date = today_iso()
+        menu = get_public_menu(requested_date)
+        with db() as conn:
+            public_orders = conn.execute(
+                """SELECT employee_name, dni, created_at FROM orders
+                   WHERE company_id=? AND order_date=?
+                   ORDER BY created_at DESC, id DESC""",
+                (company["id"], requested_date),
+            ).fetchall()
+        notice = ""
+        if query.get("ok") == "1":
+            notice = '<div class="notice ok">Pedido registrado correctamente.</div>'
+        elif query.get("error"):
+            notice = f'<div class="notice error">{esc(query["error"])}</div>'
+
+        settings = get_order_settings()
+        manual_open = settings["manual_open_date"] == requested_date and not settings["manual_closed"]
+        if closed_for_date:
+            wa=self.whatsapp_link(f"Hola, necesito realizar un pedido fuera de horario para {company['name']}.")
+            wa_button=(f'<a class="btn" target="_blank" rel="noopener" href="{esc(wa)}"> Comunicarme por WhatsApp</a>'
+                       if wa else '<p><b>Comunícate por WhatsApp con el responsable de la empresa para coordinar la entrega.</b></p>')
+            menu_html=f"""<div class="notice error">
+<b> Pedidos cerrados</b>
+<p>Los pedidos para <b>{esc(fecha_con_dia(requested_date))}</b> se cerraron a las <b>{esc(format_close_time())}</b> (hora de Perú).</p>
+{wa_button}
+</div>"""
+            submit=""
+        elif not menu["entrada"] or not menu["fondo"]:
+            menu_html = '<div class="notice error">Todavía no se ha publicado un menú completo para esta fecha. Vuelve a cargar la página después de abrir los pedidos.</div>'
+            submit = ""
+        else:
+            entries = "".join(
+                f'<label class="menu-choice"><input required type="radio" name="entrada" value="{esc(item["name"])}"> {esc(item["name"])}</label>'
+                for item in menu["entrada"]
+            )
+            mains = "".join(
+                f'<label class="menu-choice"><input required type="radio" name="fondo" value="{esc(item["name"])}"> {esc(item["name"])}</label>'
+                for item in menu["fondo"]
+            )
+            menu_html = f"""
+<div class="grid grid2">
+<div><h3>Entrada</h3>{entries}</div>
+<div><h3>Plato de fondo</h3>{mains}</div>
+</div>"""
+            submit = '<button type="submit">Enviar mi pedido</button>'
+
+        # Cuando los pedidos están cerrados no se muestra el campo Observación
+        # ni se permite interactuar con él desde la interfaz.
+        closed_for_date = is_order_closed(requested_date)
+        observation_html = "" if closed_for_date else '<label>Observación (opcional)</label><textarea name="observaciones" maxlength="300" placeholder="Ejemplo: sin cebolla, poco arroz..."></textarea>'
+
+        if public_orders:
+            public_order_rows = "".join(
+                f'<li><b>{esc(o["employee_name"])}</b> — pedido registrado a las <b>{esc(o["created_at"][11:16])}</b></li>'
+                for o in public_orders
+            )
+            public_orders_html = f"""
+<div class="card">
+<h2>Pedidos registrados</h2>
+<p class="muted">Registros de {esc(company['name'])} para la fecha seleccionada.</p>
+<ul class="registered-orders">{public_order_rows}</ul>
+</div>"""
+        else:
+            public_orders_html = """
+<div class="card">
+<h2>Pedidos registrados</h2>
+<p class="muted">Todavía no hay pedidos registrados para esta fecha.</p>
+</div>"""
+
+        if requested_date == today_iso() and manual_open:
+            countdown_html = f"""<div class="countdown-box" style="background:#ecfdf3;border:2px solid #12b76a;border-radius:14px;padding:14px;text-align:center;margin:14px 0;color:#05603a">
+ <b>Pedidos abiertos manualmente.</b> La hora normal de cierre sigue siendo <b>{esc(format_close_time(settings["closing_time"]))}</b>.
+ </div>"""
+        elif requested_date == today_iso() and not is_order_closed(requested_date):
+            remaining = seconds_until_close()
+            countdown_html = f"""<div class="countdown-box" style="background:#fff7ed;border:2px solid #f79009;border-radius:14px;padding:14px;text-align:center;margin:14px 0;color:#7a2e0e">
+ <b>Quedan <span id="countdown"></span> para el cierre de pedidos de hoy a las {esc(format_close_time())}.</b>
+ </div>
+ <script>
+(function(){{
+ const end=Date.now()+{remaining}*1000, out=document.getElementById("countdown");
+ function tick(){{
+  let n=Math.max(0,Math.floor((end-Date.now())/1000));
+  let h=Math.floor(n/3600),m=Math.floor((n%3600)/60),sec=n%60;
+  out.textContent=(h?String(h).padStart(2,"0")+" h ":"")+String(m).padStart(2,"0")+" min "+String(sec).padStart(2,"0")+" s";
+  if(n<=0) location.reload(); else setTimeout(tick,1000);
+ }}
+ tick();
+}})();
+ </script>"""
+        else:
+            countdown_html = ""
+
+        body = f"""
+<main class="wrap narrow">
+<div class="card">
+<div class="actions" style="justify-content:space-between;align-items:center">
+<h1 style="margin:0">Menú de {esc(company['name'])}</h1>
+{f'<a class="btn secondary" href="/empresa/talma/logout?token={esc(token)}">Cerrar sesión</a>' if is_talma else ''}
 </div>
-
-<div class="card no-print talma-filters">
-<div class="filter-title">Consultar pedidos</div>
-<form method="get" action="/talma">
-  <div class="grid grid3">
+<div class="notice" style="margin:12px 0">
+  <b>¿Para qué día quieres hacer tu pedido?</b>
+  <form method="get" action="/empresa/{esc(slug)}" style="display:flex;gap:10px;align-items:end;flex-wrap:wrap;margin-top:10px">
+    <input type="hidden" name="token" value="{esc(token)}">
     <div>
-      <label>Desde</label>
-      <input type="date" name="desde" value="{esc(fecha_desde)}">
+      <label>Fecha del pedido</label>
+      <input type="date" id="fecha-pedido" name="fecha" value="{esc(requested_date)}" min="{today_iso()}" required>
+      <div id="dia-pedido" class="muted" style="margin-top:6px;font-weight:700"></div>
     </div>
-    <div>
-      <label>Hasta</label>
-      <input type="date" name="hasta" value="{esc(fecha_hasta)}">
-    </div>
-    <div>
-      <label>DNI del trabajador <span class="muted">(opcional)</span></label>
-      <input name="dni" value="{esc(dni_filter)}" maxlength="40" placeholder="Ej. 71206879">
-    </div>
-  </div>
-  <div class="actions filter-actions">
-    <button type="submit">Ver resultados</button>
-    <a class="btn secondary" href="/talma/excel?desde={esc(fecha_desde)}&hasta={esc(fecha_hasta)}&dni={esc(dni_filter)}">Generar reporte Excel</a>
-    <a class="btn secondary" href="/talma/cupones?desde={esc(fecha_desde)}&hasta={esc(fecha_hasta)}&dni={esc(dni_filter)}">Generar cupones</a>
-    <a class="btn secondary" href="/talma">Limpiar filtros</a>
-  </div>
+    <button type="submit" class="btn secondary">Ver menú de ese día</button>
+     <a class="btn secondary" href="/empresa/{esc(slug)}?token={esc(token)}&fecha={esc(requested_date)}&actualizar=1">Actualizar</a>
+  </form>
+  <p class="muted" style="margin-bottom:0">Puedes elegir hoy o una fecha futura. El pedido quedará registrado para la fecha seleccionada.</p>
+</div>
+<p class="muted">Fecha seleccionada: <b>{esc(fecha_con_dia(requested_date))}</b> · Hora límite: <b>{esc(format_close_time())}</b> (hora de Perú)</p>
+{countdown_html}
+{notice}
+<form method="post" action="/pedido/{esc(slug)}">
+<input type="hidden" name="token" value="{esc(token)}">
+<input type="hidden" name="fecha" value="{esc(requested_date)}">
+{f'<div class="notice ok talma-welcome">Acceso correcto. Hola de nuevo, <b>{esc(talma_employee["nombre"])}</b>.<br><span>Área: {esc(self.display_area("talma", talma_employee["area"]))}</span></div>' if is_talma else ''}
+{'' if is_talma else '<div class="grid grid2">\n<div>\n<label>Nombre y apellido</label>\n<input name="nombre" required maxlength="100" placeholder="Ejemplo: Juan Pérez">\n</div>\n<div>\n<label>Área o sede</label>\n<input name="area" required maxlength="80" placeholder="Ejemplo: RAMPA">\n</div>\n</div>'}
+{menu_html}
+{observation_html}
+{submit}
 </form>
 </div>
+{public_orders_html}
 
-<div class="card talma-summary-card">
-<h2>Resumen por DNI — {periodo_label}</h2>
-<div class="table-wrap"><table class="talma-summary-table"><thead><tr><th>DNI</th><th>Persona</th><th>Total almuerzos</th></tr></thead>
-<tbody>{''.join(summary) or '<tr><td colspan="3">No hay pedidos en este período.</td></tr>'}</tbody></table></div>
+<div class="card no-print" style="margin-top:24px">
+<h3>Reporte del día</h3>
+<p class="muted">Descarga los pedidos de la fecha seleccionada.</p>
+<div class="actions">
+<a class="btn secondary" href="/empresa/{esc(slug)}/excel?token={esc(token)}&fecha={esc(requested_date)}">Excel del día</a>
+<a class="btn secondary" href="/empresa/{esc(slug)}/pdf?token={esc(token)}&fecha={esc(requested_date)}">PDF del día</a>
 </div>
+</div>
+</main>"""
+        self.send_html(page("Realizar pedido", body))
+
+    def submit_order(self, slug: str) -> None:
+        form = self.read_form()
+        token = form.get("token", "")
+        company = get_company(slug, token)
+        if not company:
+            self.send_html(page("No autorizado", '<main class="wrap narrow"><div class="card"><h1>No autorizado</h1></div></main>'), 403)
+            return
+        order_date = form.get("fecha", today_iso()).strip()
+        is_talma = slug.lower() == "talma"
+        talma_employee = None
+        if is_talma:
+            cookie = self.parse_cookies().get("talma_employee_session")
+            talma_employee = valid_talma_employee_session(cookie.value if cookie else None)
+            if not talma_employee:
+                self.redirect(f"/empresa/talma/login?{urlencode({'token':token})}")
+                return
+            name = talma_employee["nombre"]
+            area = talma_employee["area"]
+            dni = talma_employee["dni"]
+            login_code = talma_employee["dni"]
+            login_email = talma_employee["email"]
+        else:
+            name = form.get("nombre", "").strip()
+            dni = ""
+            area = form.get("area", "").strip()
+            login_code = ""
+            login_email = ""
+        entry = form.get("entrada", "").strip()
+        main = form.get("fondo", "").strip()
+        notes = form.get("observaciones", "").strip()
+        delivery = "Entrega en empresa"
+        error = None
+        try:
+            datetime.strptime(order_date, "%Y-%m-%d")
+        except ValueError:
+            error = "Fecha inválida."
+        if order_date < today_iso():
+            error = "No se pueden registrar pedidos para una fecha pasada."
+        if is_order_closed(order_date):
+            error = f"Los pedidos del día actual se cierran a las {format_close_time()} (hora de Perú). Si necesita un pedido fuera de horario, comuníquese por WhatsApp para coordinar la entrega."
+        if len(name) < 3:
+            error = "Ingrese su nombre y apellido."
+        menu = get_public_menu(order_date)
+        valid_entries = {r["name"] for r in menu["entrada"]}
+        valid_mains = {r["name"] for r in menu["fondo"]}
+        if entry not in valid_entries or main not in valid_mains:
+            error = "Seleccione platos válidos del menú publicado."
+        if error:
+            params = urlencode({"token": token, "fecha": order_date, "error": error})
+            self.redirect(f"/empresa/{quote(slug)}?{params}")
+            return
+        try:
+            with db() as conn:
+                employee_key = f"talma:{dni}" if is_talma else normalize_key(name)
+                conn.execute(
+                    """INSERT INTO orders(company_id, order_date, employee_name, employee_key, dni, area, entry_item, main_item, notes, delivery_type, created_at, login_code, login_email)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    (company["id"], order_date, name, employee_key, dni, area, entry, main, notes, delivery, now_iso(), login_code, login_email),
+                )
+        except sqlite3.IntegrityError:
+            params = urlencode({"token": token, "fecha": order_date, "error": "Ya existe un pedido para ese usuario en la fecha seleccionada." if is_talma else "Ya existe un pedido con ese nombre en la fecha seleccionada."})
+            self.redirect(f"/empresa/{quote(slug)}?{params}")
+            return
+        self.redirect(f"/empresa/{quote(slug)}?{urlencode({'token':token,'fecha':order_date,'ok':'1'})}")
+
+    def _company_orders(self, company_id: int, order_date: str = ""):
+        with db() as conn:
+            sql = """SELECT o.id,o.order_date,o.employee_name,o.dni,o.area,o.entry_item,
+                            o.main_item,o.notes,o.delivery_type,o.created_at
+                     FROM orders o WHERE o.company_id=?"""
+            args=[company_id]
+            if order_date:
+                sql += " AND o.order_date=?"
+                args.append(order_date)
+            sql += " ORDER BY o.order_date DESC,o.employee_name COLLATE NOCASE,o.id"
+            return conn.execute(sql,args).fetchall()
+
+    def company_export_excel(self, slug: str, query: dict[str,str]) -> None:
+        token=query.get("token","")
+        company=get_company(slug,token)
+        if not company:
+            self.send_html(page("Enlace inválido",'<main class="wrap narrow"><div class="card"><h1>Enlace inválido</h1></div></main>'),403); return
+        requested_date=query.get("fecha","").strip()
+        if not requested_date:
+            self.send_html(page("Fecha requerida", '<main class="wrap narrow"><div class="card"><h1>Fecha requerida</h1><p>Selecciona una fecha para descargar el reporte.</p></div></main>'), 400)
+            return
+        rows=self._company_orders(company["id"],requested_date)
+        wb=Workbook(); ws=wb.active; ws.title="Pedidos"
+        headers=["Fecha","Nombre","DNI","Área / sede","Entrada","Plato de fondo","Observación","Tipo entrega","Hora"]
+        ws.append(headers)
+        for r in rows:
+            ws.append([r["order_date"],r["employee_name"],r["dni"] or "",r["area"] or "",r["entry_item"],r["main_item"],r["notes"] or "",r["delivery_type"] or "",(r["created_at"] or "")[11:16]])
+        for i,w in enumerate([14,32,15,20,34,38,45,22,10],1): ws.column_dimensions[get_column_letter(i)].width=w
+        for c in ws[1]:
+            c.font=Font(bold=True,color="FFFFFF"); c.fill=PatternFill("solid",fgColor="176B43"); c.alignment=Alignment(horizontal="center")
+        for row in ws.iter_rows(min_row=2):
+            for c in row: c.alignment=Alignment(vertical="top",wrap_text=True)
+        out=io.BytesIO(); wb.save(out)
+        suffix=f"_{requested_date}"
+        self.send_bytes(out.getvalue(),"application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",f"pedidos_{company['slug']}{suffix}.xlsx")
+
+    def company_export_pdf(self, slug: str, query: dict[str,str]) -> None:
+        token=query.get("token","")
+        company=get_company(slug,token)
+        if not company:
+            self.send_html(page("Enlace inválido",'<main class="wrap narrow"><div class="card"><h1>Enlace inválido</h1></div></main>'),403); return
+        requested_date=query.get("fecha","").strip()
+        if not requested_date:
+            self.send_html(page("Fecha requerida", '<main class="wrap narrow"><div class="card"><h1>Fecha requerida</h1><p>Selecciona una fecha para descargar el reporte.</p></div></main>'), 400)
+            return
+        rows=self._company_orders(company["id"],requested_date)
+        from reportlab.lib import colors
+        from reportlab.lib.pagesizes import A4, landscape
+        from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+        from reportlab.lib.enums import TA_CENTER
+        from reportlab.platypus import SimpleDocTemplate,Table,TableStyle,Paragraph,Spacer
+        out=io.BytesIO()
+        doc=SimpleDocTemplate(out,pagesize=landscape(A4),rightMargin=20,leftMargin=20,topMargin=20,bottomMargin=20)
+        styles=getSampleStyleSheet()
+        title=ParagraphStyle("ExportTitle",parent=styles["Title"],alignment=TA_CENTER,fontSize=18)
+        small=ParagraphStyle("Small",parent=styles["BodyText"],fontSize=7,leading=9)
+        story=[Paragraph(f"Pedidos — {html.escape(company['name'])}",title),
+               Paragraph(f"Fecha: {html.escape(requested_date)}",styles["Normal"]),Spacer(1,8)]
+        data=[["Fecha","Nombre","DNI","Área / sede","Entrada","Plato de fondo","Observación","Entrega","Hora"]]
+        for r in rows:
+            data.append([Paragraph(str(r["order_date"]),small),Paragraph(str(r["employee_name"]),small),Paragraph(str(r["dni"] or ""),small),Paragraph(str(r["area"] or ""),small),Paragraph(str(r["entry_item"]),small),Paragraph(str(r["main_item"]),small),Paragraph(str(r["notes"] or ""),small),Paragraph(str(r["delivery_type"] or ""),small),Paragraph(str((r["created_at"] or "")[11:16]),small)])
+        table=Table(data,repeatRows=1,colWidths=[48,95,55,65,100,105,125,65,35])
+        table.setStyle(TableStyle([("BACKGROUND",(0,0),(-1,0),colors.HexColor("#176B43")),("TEXTCOLOR",(0,0),(-1,0),colors.white),("FONTNAME",(0,0),(-1,0),"Helvetica-Bold"),("GRID",(0,0),(-1,-1),.35,colors.HexColor("#D0D5DD")),("VALIGN",(0,0),(-1,-1),"TOP"),("FONTSIZE",(0,0),(-1,-1),7)]))
+        story += [table,Spacer(1,8),Paragraph(f"Total de pedidos: {len(rows)}",styles["Heading3"])]
+        doc.build(story); out.seek(0)
+        suffix=requested_date or "historial"
+        self.send_bytes(out.getvalue(),"application/pdf",f"pedidos_{company['slug']}_{suffix}.pdf")
+
+    def admin_login(self, error: str | None) -> None:
+        if self.is_admin():
+            self.redirect("/admin/dashboard")
+            return
+        notice = '<div class="notice error">Contraseña incorrecta.</div>' if error else ""
+        body = f"""
+<main class="wrap narrow"><div class="card">
+<h1>Panel administrador</h1>
+{notice}
+<form method="post" action="/admin/login">
+<label>Contraseña</label><input type="password" name="password" required autofocus>
+<button type="submit">Ingresar</button>
+</form>
+<p class="muted">La contraseña inicial está en el archivo <b>config.json</b>.</p>
+</div></main>"""
+        self.send_html(page("Administrador", body))
+
+    def login(self) -> None:
+        form = self.read_form()
+        if hmac.compare_digest(form.get("password", ""), str(CONFIG.get("admin_password", ""))):
+            value = session_value()
+            secure = "; Secure" if self.headers.get("X-Forwarded-Proto") == "https" else ""
+            self.redirect("/admin/dashboard", f"admin_session={value}; Path=/; Max-Age=28800; HttpOnly; SameSite=Lax{secure}")
+        else:
+            self.redirect("/admin?error=1")
+
+    def admin_personas(self, query: dict[str, str]) -> None:
+        company_filter = query.get("empresa", "").strip()
+        search = query.get("buscar", "").strip()
+        with db() as conn:
+            companies = conn.execute("SELECT * FROM companies WHERE active=1 ORDER BY name COLLATE NOCASE").fetchall()
+            filters, args = [], []
+            if company_filter.isdigit():
+                filters.append("o.company_id=?"); args.append(int(company_filter))
+            if search:
+                term = f"%{search}%"
+                filters.append("(o.employee_name LIKE ? OR o.dni LIKE ? OR o.area LIKE ?)")
+                args.extend([term, term, term])
+            where = (" WHERE " + " AND ".join(filters)) if filters else ""
+            rows = conn.execute(
+                f"""SELECT c.name AS company_name, o.employee_name, o.dni, MAX(o.area) AS area,
+                           COUNT(*) AS total_consumo, MIN(o.order_date) AS primer_pedido,
+                           MAX(o.order_date) AS ultimo_pedido
+                    FROM orders o JOIN companies c ON c.id=o.company_id
+                    {where}
+                    GROUP BY c.id, o.employee_key, o.employee_name, o.dni
+                    ORDER BY c.name COLLATE NOCASE, o.employee_name COLLATE NOCASE""", args).fetchall()
+
+        options = '<option value="">Todas las empresas</option>' + "".join(
+            f'<option value="{c["id"]}" {"selected" if str(c["id"])==company_filter else ""}>{esc(c["name"])}</option>' for c in companies
+        )
+        rows_html = "".join(
+            f'<tr><td><b>{esc(r["employee_name"])}</b></td><td>{esc(r["company_name"])}</td>'
+            f'<td>{esc(r["dni"]) if r["dni"] else "—"}</td><td>{esc(r["area"]) if r["area"] else "—"}</td>'
+            f'<td><strong>{r["total_consumo"]}</strong></td><td>{esc(r["primer_pedido"])}</td><td>{esc(r["ultimo_pedido"])}</td></tr>'
+            for r in rows
+        ) or '<tr><td colspan="7">No se encontraron personas.</td></tr>'
+
+        body=f"""
+<main class="wrap">
+<div class="actions no-print" style="justify-content:space-between;margin-bottom:16px"><h1 style="margin:0"> Base de datos · Personas y consumo</h1><a href="/admin/dashboard">← Pedidos</a></div>
+<div class="card no-print"><h2>Buscar persona</h2>
+<form method="get" action="/admin/personas" class="grid grid3">
+<div><label>Nombre, DNI o área</label><input name="buscar" value="{esc(search)}" placeholder="Ej. Juan, 76543210, RAMPA"></div>
+<div><label>Empresa</label><select name="empresa">{options}</select></div>
+<div style="align-self:end"><button>Buscar</button> <a class="btn secondary" href="/admin/personas">Limpiar</a></div>
+</form></div>
+<div class="grid grid3"><div class="stat">Personas encontradas<b>{len(rows)}</b></div>
+<div class="stat">Empresas<b>{len(companies)}</b></div><div class="stat">Consumo total<b>{sum(int(r["total_consumo"]) for r in rows)}</b></div></div>
+<div class="card"><h2>Consumo por persona</h2>
+<p class="muted">TALMA se identifica principalmente por DNI; las demás empresas por nombre.</p>
+<div class="table-wrap"><table><thead><tr><th>Nombre</th><th>Empresa</th><th>DNI</th><th>Área</th><th>Total almuerzos</th><th>Primer pedido</th><th>Último pedido</th></tr></thead>
+<tbody>{rows_html}</tbody></table></div></div></main>"""
+        self.send_html(page("Base de datos · Personas", body))
+
+    def admin_resumen(self, query: dict[str, str]) -> None:
+        selected_date = query.get("fecha", today_iso())
+        try:
+            datetime.strptime(selected_date, "%Y-%m-%d")
+        except ValueError:
+            selected_date = today_iso()
+        with db() as conn:
+            company_rows = conn.execute(
+                """SELECT c.id, c.name, c.slug, COUNT(o.id) AS total
+                   FROM companies c
+                   LEFT JOIN orders o ON o.company_id=c.id AND o.order_date=?
+                   WHERE c.active=1 GROUP BY c.id
+                   ORDER BY CASE c.slug WHEN 'liderman' THEN 1 WHEN 'aeropuerto' THEN 2
+                   WHEN 'talma' THEN 3 WHEN 'policia' THEN 4 ELSE 5 END, c.name""",
+                (selected_date,)).fetchall()
+        grand_total=sum(int(r["total"]) for r in company_rows)
+        cards="".join(f'<div class="big-company-card"><div class="company-name">{esc(r["name"])}</div><div class="company-total">{r["total"]}</div><div class="company-label">MENÚS / PEDIDOS</div></div>' for r in company_rows)
+        body=f"""
+<main class="wrap">
+<div class="actions no-print" style="justify-content:space-between;margin-bottom:16px"><h1 style="margin:0"> Resumen de almuerzos</h1><a href="/admin/dashboard">← Panel</a></div>
+<div class="card no-print"><form method="get" action="/admin/resumen" class="actions" style="align-items:end">
+<div><label>Fecha</label><input type="date" name="fecha" value="{esc(selected_date)}" required></div><button>Actualizar</button>
+<a class="btn secondary" href="/admin/resumen?fecha={today_iso()}">Hoy</a></form></div>
+<div class="hero-total"><div class="hero-kicker">TOTAL GENERAL</div><div class="hero-number">{grand_total}</div><div class="hero-date">{esc(fecha_con_dia(selected_date))}</div></div>
+<div class="company-cards">{cards}</div>
+<div class="card" style="text-align:center"><h2>Resumen de {esc(fecha_con_dia(selected_date))}</h2><p class="muted">Esta pantalla se actualiza automáticamente cada 30 segundos.</p></div>
+</main><script>setTimeout(function(){{ location.reload(); }},30000);</script>"""
+        extra="""<style>
+.hero-total{background:linear-gradient(135deg,#101828,#175cd3);color:white;border-radius:24px;padding:32px;text-align:center;margin-bottom:24px;box-shadow:0 14px 40px rgba(16,24,40,.22)}
+.hero-kicker{font-weight:800;letter-spacing:3px;font-size:14px;opacity:.9}.hero-number{font-size:72px;font-weight:900;line-height:1;margin:10px 0}.hero-date{font-size:20px;font-weight:700}
+.company-cards{display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:20px;margin-bottom:24px}.big-company-card{background:white;border:1px solid #e4e7ec;border-radius:22px;padding:26px;text-align:center;box-shadow:0 8px 24px rgba(16,24,40,.08)}.company-name{font-size:25px;font-weight:900}.company-total{font-size:64px;font-weight:900;margin:12px 0;color:#175cd3}.company-label{font-size:13px;font-weight:800;letter-spacing:1.5px;color:#667085}
+</style>"""
+        self.send_html(page("Resumen de almuerzos", body, extra))
+
+    def admin_order_settings(self, query: dict[str, str]) -> None:
+        settings = get_order_settings()
+        is_open, status = orders_open_status()
+        message = ""
+        if query.get("ok") == "1":
+            message = '<div class="notice ok">Configuración de pedidos guardada correctamente.</div>'
+        elif query.get("error"):
+            message = f'<div class="notice error">{esc(query["error"])}</div>'
+        manual_open = settings["manual_open_date"] == today_iso() and not settings["manual_closed"]
+        body = f"""
+<main class="wrap narrow">
+<div class="actions no-print" style="justify-content:space-between;margin-bottom:16px">
+  <h1 style="margin:0">Gestión de pedidos</h1>
+  <a href="/admin/pedidos">← Volver a pedidos</a>
+</div>
+{message}
+<div class="card">
+  <h2>Horario de cierre</h2>
+  <p class="muted">Esta es la hora normal de cierre. Cambiarla no modifica los pedidos ya registrados.</p>
+  <form method="post" action="/admin/pedidos/configuracion">
+    <label>Hora de cierre de pedidos</label>
+    <input type="time" name="closing_time" value="{esc(settings['closing_time'])}" required>
+    <button type="submit" style="margin-top:12px">Guardar hora de cierre</button>
+  </form>
+</div>
+<div class="card">
+  <h2>Estado de pedidos</h2>
+  <div class="notice {'ok' if is_open else 'error'}">
+    <b>{esc(status)}</b>
+    {"<br>La reapertura manual está activa para hoy. La hora normal sigue siendo " + esc(format_close_time(settings["closing_time"])) + "." if manual_open else ""}
+  </div>
+  <div class="actions">
+    <form method="post" action="/admin/pedidos/reabrir">
+      <button type="submit">🔓 Abrir pedidos ahora</button>
+    </form>
+    <form method="post" action="/admin/pedidos/cerrar-manual" onsubmit="return confirm('¿Cerrar los pedidos manualmente?')">
+      <button type="submit" class="btn danger">🔒 Cerrar pedidos ahora</button>
+    </form>
+  </div>
+  <p class="muted">Abrir pedidos ahora <b>no cambia</b> la hora normal. La reapertura manual solo se aplica a hoy.</p>
+</div>
+<div class="card">
+  <h2>Pedido manual</h2>
+  <p class="muted">Registra un pedido recibido por teléfono, WhatsApp u otro medio. Esta opción funciona aunque los pedidos públicos estén cerrados.</p>
+  <a class="btn" href="/admin/pedidos/manual">📝 Ingresar pedido manual</a>
+</div>
+</main>"""
+        self.send_html(page("Gestión de pedidos", body))
+
+    def save_order_settings(self) -> None:
+        form = self.read_form()
+        closing_time = form.get("closing_time", "").strip()
+        if not _valid_hhmm(closing_time):
+            self.redirect("/admin/pedidos/configuracion?error=La+hora+debe+tener+formato+HH%3AMM")
+            return
+        current = get_order_settings()
+        set_order_settings(closing_time=closing_time,
+                           manual_open_date=current["manual_open_date"],
+                           manual_closed=current["manual_closed"])
+        self.redirect("/admin/pedidos/configuracion?ok=1")
+
+    def reopen_orders(self) -> None:
+        settings = get_order_settings()
+        set_order_settings(closing_time=settings["closing_time"], manual_open_date=today_iso(), manual_closed=False)
+        self.redirect("/admin/pedidos/configuracion?ok=1")
+
+    def close_orders_manual(self) -> None:
+        settings = get_order_settings()
+        set_order_settings(closing_time=settings["closing_time"], manual_open_date="", manual_closed=True)
+        self.redirect("/admin/pedidos/configuracion?ok=1")
+
+    def admin_manual_order(self, query: dict[str, str]) -> None:
+        requested_date = query.get("fecha", today_iso())
+        try:
+            datetime.strptime(requested_date, "%Y-%m-%d")
+        except ValueError:
+            requested_date = today_iso()
+        with db() as conn:
+            companies = conn.execute(
+                """SELECT * FROM companies WHERE active=1
+                   ORDER BY CASE slug WHEN 'liderman' THEN 1 WHEN 'aeropuerto' THEN 2
+                   WHEN 'talma' THEN 3 WHEN 'policia' THEN 4 ELSE 5 END, name"""
+            ).fetchall()
+        menu = get_menu(requested_date)
+        company_id = query.get("empresa", "")
+        message = '<div class="notice ok">Pedido manual registrado correctamente.</div>' if query.get("ok")=="1" else (
+            f'<div class="notice error">{esc(query["error"])}</div>' if query.get("error") else "")
+        company_options = "".join(
+            f'<option value="{c["id"]}" {"selected" if company_id == str(c["id"]) else ""}>{esc(c["name"])}</option>'
+            for c in companies)
+        entry_options = "".join(f'<option value="{esc(x["name"])}">{esc(x["name"])}</option>' for x in menu["entrada"])
+        main_options = "".join(f'<option value="{esc(x["name"])}">{esc(x["name"])}</option>' for x in menu["fondo"])
+        body=f"""
+<main class="wrap narrow">
+<div class="actions no-print" style="justify-content:space-between;margin-bottom:16px">
+  <h1 style="margin:0">Ingresar pedido manual</h1><a href="/admin/pedidos">← Volver a pedidos</a>
+</div>
+{message}
+<div class="card">
+<form method="get" action="/admin/pedidos/manual" class="actions" style="align-items:end;gap:12px">
+  <div><label>Fecha del pedido</label><input type="date" name="fecha" value="{esc(requested_date)}" required></div>
+  <div><label>Empresa</label><select name="empresa" required><option value="">Seleccionar empresa</option>{company_options}</select></div>
+  <button type="submit" class="btn secondary">Cargar menú</button>
+</form>
+</div>
+<div class="card">
+<form method="post" action="/admin/pedidos/manual">
+<input type="hidden" name="fecha" value="{esc(requested_date)}">
+<label>Empresa</label><select name="empresa_id" required><option value="">Seleccionar empresa</option>{company_options}</select>
+<label>Nombre y apellido *</label><input name="nombre" maxlength="100" required placeholder="Ejemplo: Juan Pérez">
+<label>DNI</label><input name="dni" maxlength="20" placeholder="Opcional">
+<label>Área o sede</label><input name="area" maxlength="80" placeholder="Ejemplo: RAMPA">
+<div class="grid grid2">
+<div><label>Entrada *</label><select name="entrada" required><option value="">Seleccionar entrada</option>{entry_options}</select></div>
+<div><label>Plato de fondo *</label><select name="fondo" required><option value="">Seleccionar plato</option>{main_options}</select></div>
+</div>
+<label>Observación</label><textarea name="observaciones" maxlength="300" placeholder="Ejemplo: sin cebolla"></textarea>
+<label>Modalidad de entrega</label><select name="delivery_type"><option value="Entrega en empresa">Entrega en empresa</option><option value="Para llevar">Para llevar</option></select>
+<button type="submit" style="margin-top:14px">Registrar pedido manual</button>
+</form>
+</div>
+</main>"""
+        self.send_html(page("Pedido manual", body))
+
+    def save_manual_order(self) -> None:
+        form=self.read_form()
+        company_id=form.get("empresa_id","").strip()
+        order_date=form.get("fecha",today_iso()).strip()
+        name=form.get("nombre","").strip()
+        dni=form.get("dni","").strip()
+        area=form.get("area","").strip()
+        entry=form.get("entrada","").strip()
+        main=form.get("fondo","").strip()
+        notes=form.get("observaciones","").strip()
+        delivery=form.get("delivery_type","Entrega en empresa").strip() or "Entrega en empresa"
+        try: datetime.strptime(order_date,"%Y-%m-%d")
+        except ValueError:
+            self.redirect("/admin/pedidos/manual?error=Fecha+inválida"); return
+        if not company_id.isdigit() or len(name)<3 or not entry or not main:
+            self.redirect(f"/admin/pedidos/manual?{urlencode({'fecha':order_date,'empresa':company_id,'error':'Completa los campos obligatorios'})}"); return
+        with db() as conn:
+            company=conn.execute("SELECT * FROM companies WHERE id=? AND active=1",(int(company_id),)).fetchone()
+            menu=get_menu(order_date)
+            valid_entries={r["name"] for r in menu["entrada"]}
+            valid_mains={r["name"] for r in menu["fondo"]}
+            if not company: error="Empresa inválida."
+            elif entry not in valid_entries or main not in valid_mains: error="La entrada o el plato de fondo no pertenecen al menú de esa fecha."
+            else: error=None
+            if error:
+                self.redirect(f"/admin/pedidos/manual?{urlencode({'fecha':order_date,'empresa':company_id,'error':error})}"); return
+            employee_key=f"manual:{secrets.token_hex(10)}"
+            conn.execute(
+                """INSERT INTO orders(company_id,order_date,employee_name,employee_key,dni,area,
+                   entry_item,main_item,notes,delivery_type,created_at,login_code,login_email)
+                   VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                (company["id"],order_date,name,employee_key,dni,area,entry,main,notes,delivery,now_iso(),"",""))
+            conn.commit()
+        self.redirect(f"/admin/pedidos/manual?{urlencode({'fecha':order_date,'empresa':company_id,'ok':'1'})}")
+
+    def admin_dashboard(self, query: dict[str, str]) -> None:
+        selected_date = query.get("fecha", today_iso())
+        try:
+            datetime.strptime(selected_date, "%Y-%m-%d")
+        except ValueError:
+            selected_date = today_iso()
+        selected_company = query.get("empresa", "")
+        with db() as conn:
+            companies = conn.execute(
+                """SELECT * FROM companies
+                   ORDER BY CASE slug
+                       WHEN 'liderman' THEN 1
+                       WHEN 'aeropuerto' THEN 2
+                       WHEN 'talma' THEN 3
+                       WHEN 'policia' THEN 4
+                       ELSE 5
+                   END, name"""
+            ).fetchall()
+            filters = ["o.order_date=?"]
+            args: list[object] = [selected_date]
+            if selected_company.isdigit():
+                filters.append("o.company_id=?")
+                args.append(int(selected_company))
+            orders = conn.execute(
+                f"""SELECT o.*, c.name AS company_name FROM orders o
+                    JOIN companies c ON c.id=o.company_id
+                    WHERE {' AND '.join(filters)} ORDER BY o.employee_name COLLATE NOCASE, c.name COLLATE NOCASE, o.created_at""",
+                args,
+            ).fetchall()
+            total_today = conn.execute("SELECT COUNT(*) FROM orders WHERE order_date=?", (selected_date,)).fetchone()[0]
+            company_total = conn.execute("SELECT COUNT(*) FROM companies WHERE active=1").fetchone()[0]
+            entry_summary = conn.execute(
+                "SELECT entry_item, COUNT(*) qty FROM orders WHERE order_date=? GROUP BY entry_item ORDER BY qty DESC, entry_item",
+                (selected_date,),
+            ).fetchall()
+            main_summary = conn.execute(
+                "SELECT main_item, COUNT(*) qty FROM orders WHERE order_date=? GROUP BY main_item ORDER BY qty DESC, main_item",
+                (selected_date,),
+            ).fetchall()
+        menu = get_menu(selected_date)
+        entries_text = "\n".join(r["name"] for r in menu["entrada"])
+        mains_text = "\n".join(r["name"] for r in menu["fondo"])
+        entry_menu_view = "".join(f"<li>{esc(r['name'])}</li>" for r in menu["entrada"]) or "<li><span class='muted'>No hay entradas publicadas para este día.</span></li>"
+        main_menu_view = "".join(f"<li>{esc(r['name'])}</li>" for r in menu["fondo"]) or "<li><span class='muted'>No hay platos de fondo publicados para este día.</span></li>" 
+        host = self.headers.get("Host", f"localhost:{PORT}")
+        scheme = "https" if self.headers.get("X-Forwarded-Proto") == "https" else "http"
+
+        company_options = '<option value="">Todas</option>' + "".join(
+            f'<option value="{c["id"]}" {"selected" if str(c["id"])==selected_company else ""}>{esc(c["name"])}</option>' for c in companies
+        )
+        company_rows = "".join(
+            f"""<tr><td>{esc(c['name'])}</td><td><code>{esc(scheme)}://{esc(host)}/empresa/{esc(c['slug'])}?token={esc(c['token'])}</code></td>
+<td>{'Activa' if c['active'] else 'Inactiva'}</td><td><form method="post" action="/admin/empresa/toggle"><input type="hidden" name="id" value="{c['id']}"><button class="btn small secondary">{'Desactivar' if c['active'] else 'Activar'}</button></form></td></tr>"""
+            for c in companies
+        ) or '<tr><td colspan="4">No hay empresas.</td></tr>'
+        order_rows = "".join(
+            f"""<tr><td>{esc(o['company_name'])}</td><td>{esc(o['dni']) if o['company_name'].lower() == 'talma' and o['dni'] else '—'}</td><td>{esc(o['employee_name'])}</td><td>{esc(o['area'])}</td><td>{esc(o['entry_item'])}</td><td>{esc(o['main_item'])}</td><td>{esc(o['delivery_type'])}</td><td>{esc(o['notes'])}</td><td>{esc(o['created_at'][11:16])}</td>
+<td><form method="post" action="/admin/pedido/eliminar" onsubmit="return confirm('¿Eliminar pedido?')"><input type="hidden" name="id" value="{o['id']}"><input type="hidden" name="fecha" value="{esc(selected_date)}"><button class="btn small danger">Eliminar</button></form></td></tr>"""
+            for o in orders
+        ) or '<tr><td colspan="10">No hay pedidos para el filtro seleccionado.</td></tr>'
+        entry_rows = "".join(f"<li>{esc(r['entry_item'])}: <b>{r['qty']}</b></li>" for r in entry_summary) or "<li>Sin pedidos</li>"
+        main_rows = "".join(f"<li>{esc(r['main_item'])}: <b>{r['qty']}</b></li>" for r in main_summary) or "<li>Sin pedidos</li>"
+        export_params = urlencode({"fecha": selected_date, "empresa": selected_company})
+        if query.get("ok"):
+            notice = f'<div class="notice ok"> Menú guardado correctamente para <b>{esc(selected_date)}</b>. Se volvió a leer desde la base de datos para comprobar que quedó almacenado.</div>'
+        elif query.get("menu_error"):
+            notice = f'<div class="notice error">{esc(query["menu_error"])}</div>'
+        else:
+            notice = ""
+
+        body = f"""
+<main class="wrap">
+<div class="actions no-print" style="justify-content:space-between;margin-bottom:16px"><h1 style="margin:0">Panel administrador</h1><a href="/admin/logout">Cerrar sesión</a></div>
+<div class="admin-tabs no-print"><a class="active" href="/admin/pedidos">Pedidos</a><a href="/admin/personas"> Personas y consumo</a><a href="/admin/resumen"> Resumen visual</a><a href="/admin/talma/">TALMA</a><a href="/admin/policia/">POLICÍA</a></div>
+{notice}
+<div class="grid grid3">
+<div class="stat">Pedidos del día<b>{total_today}</b></div><div class="stat">Empresas activas<b>{company_total}</b></div><div class="stat">Fecha seleccionada<b style="font-size:18px">{esc(selected_date)}</b></div>
+</div>
+<div class="card no-print">
+<h2>Gestión de pedidos</h2>
+<p class="muted">Configura el horario, reabre pedidos después del cierre sin cambiar la hora configurada o registra un pedido manual.</p>
+<div class="actions">
+<a class="btn secondary" href="/admin/pedidos/configuracion">⚙️ Configurar hora de cierre</a>
+<form method="post" action="/admin/pedidos/reabrir" style="display:inline"><button type="submit">🔓 Abrir pedidos ahora</button></form>
+<a class="btn" href="/admin/pedidos/manual">📝 Ingresar pedido manual</a>
+</div>
+</div>
+
+<div class="card no-print">
+<h2> Consultar menú de cualquier día</h2>
+<form method="get" action="/admin/dashboard" class="actions" style="align-items:end;gap:12px;flex-wrap:wrap">
+  <div>
+    <label>Selecciona una fecha</label>
+    <input type="date" name="fecha" value="{esc(selected_date)}" required>
+  </div>
+  <input type="hidden" name="empresa" value="{esc(selected_company)}">
+  <button type="submit">Ver menú</button>
+</form>
+<div class="grid grid2" style="margin-top:14px">
+  <div>
+    <h3>Entradas — {esc(fecha_con_dia(selected_date))}</h3>
+    <ul>{entry_menu_view}</ul>
+  </div>
+  <div>
+    <h3>Platos de fondo — {esc(fecha_con_dia(selected_date))}</h3>
+    <ul>{main_menu_view}</ul>
+  </div>
+</div>
+<p class="muted" style="margin-bottom:0">Al cambiar la fecha y pulsar <b>Ver menú</b>, se carga directamente el menú guardado para ese día desde la base de datos.</p>
+</div>
+
+<div class="card no-print">
+<h2>Menú diario</h2>
+<form method="post" action="/admin/menu">
+<div class="grid grid2"><div><label>Fecha</label><input type="date" name="fecha" value="{esc(selected_date)}" required></div><div><p class="muted">Escriba un plato por línea. Al guardar, reemplaza el menú de esa fecha.</p></div></div>
+<div class="grid grid2"><div><label>Entradas</label><textarea name="entradas" required>{esc(entries_text)}</textarea></div><div><label>Platos de fondo</label><textarea name="fondos" required>{esc(mains_text)}</textarea></div></div>
+<button>Guardar menú de esta fecha</button>
+</form>
+<div class="notice" style="margin-top:10px">
+  <b>Menú cargado para {esc(selected_date)}</b><br>
+  Entradas guardadas: <b>{len(menu["entrada"])}</b> · Platos de fondo guardados: <b>{len(menu["fondo"])}</b>.
+  <a href="/admin/dashboard?fecha={esc(selected_date)}">Volver a cargar esta fecha</a>
+</div>
+</div>
+
+<div class="card no-print">
+<h2>Empresas y enlaces privados</h2>
+<form method="post" action="/admin/empresa" class="actions"><input name="nombre" required placeholder="Nombre de la nueva empresa" style="max-width:420px"><button>Crear empresa</button></form>
+<div class="table-wrap"><table><thead><tr><th>Empresa</th><th>Enlace para empleados</th><th>Estado</th><th></th></tr></thead><tbody>{company_rows}</tbody></table></div>
+</div>
+
+
 
 <div class="card">
-<h2>Pedidos TALMA — {periodo_label}</h2>
-<div class="table-wrap"><table><thead><tr><th>Fecha</th><th>DNI</th><th>Persona</th><th>Área</th><th>Entrada</th><th>Plato de fondo</th><th>N° Almuerzo</th><th>Hora</th></tr></thead>
-<tbody>{''.join(table_rows) or '<tr><td colspan="8">No hay pedidos en este período.</td></tr>'}</tbody></table></div>
+<h2>Pedidos y resumen</h2>
+<form method="get" action="/admin/dashboard" class="grid grid3 no-print">
+<div><label>Fecha</label><input type="date" name="fecha" value="{esc(selected_date)}"></div><div><label>Empresa</label><select name="empresa">{company_options}</select></div><div style="align-self:end"><button>Aplicar filtro</button></div>
+</form>
+<div class="grid grid2"><div><h3>Entradas</h3><ul>{entry_rows}</ul></div><div><h3>Fondos</h3><ul>{main_rows}</ul></div></div>
+<div class="actions no-print" style="margin-bottom:14px"><a class="btn secondary" href="/admin/export.csv?{export_params}">Descargar CSV/Excel</a><a class="btn" target="_blank" href="/admin/cupones?{export_params}">Generar cupones</a></div>
+<div class="table-wrap"><table><thead><tr><th>Empresa</th><th>DNI</th><th>Empleado</th><th>Área</th><th>Entrada</th><th>Fondo</th><th>Modalidad</th><th>Observación</th><th>Hora</th><th></th></tr></thead><tbody>{order_rows}</tbody></table></div>
 </div>
-"""
-    extra = """<style>
-.hero-total{background:linear-gradient(135deg,#0f5132,#198754);color:white;border-radius:24px;padding:24px;text-align:center;margin-bottom:20px;box-shadow:0 14px 40px rgba(15,81,50,.20)}
-.hero-kicker{font-weight:800;letter-spacing:3px;font-size:14px}.hero-number{font-size:64px;font-weight:900;line-height:1;margin:7px 0}.hero-date{font-size:17px;font-weight:700}
-.highlight-stat b{font-size:34px}.period-stat b{font-size:20px;line-height:1.25;font-weight:750}.period-stat{min-height:0}
-.talma-summary-card{padding:14px 18px;margin-bottom:16px}
-.talma-summary-card h2{font-size:20px;line-height:1.25;margin:0 0 10px}
-.talma-summary-table{table-layout:fixed;font-size:14px}
-.talma-summary-table th,.talma-summary-table td{padding:6px 9px;line-height:1.25}
-.talma-summary-table th:nth-child(1){width:24%}
-.talma-summary-table th:nth-child(2){width:51%}
-.talma-summary-table th:nth-child(3){width:25%}
-.talma-summary-table td{white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
-</style>"""
-    return _talma_page("TALMA", body, extra)
 
+<div class="card no-print" id="excel-historico">
+<h2> Actualizar un Excel pasado / reporte histórico</h2>
+<p class="muted">Esta opción está dentro del panel de <b>Pedidos</b>. Sube aquí un Excel de días o meses anteriores y el sistema lo combinará con los pedidos que ya están registrados actualmente.</p>
+<div class="grid grid2">
+  <div>
+    <h3>1. Seleccionar Excel antiguo</h3>
+    <form method="post" action="/admin/historico-excel" enctype="multipart/form-data">
+      <input type="file" name="excel_historico" accept=".xlsx,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" required style="width:100%;box-sizing:border-box;margin-bottom:10px">
+      <button type="submit">Actualizar Excel y generar reporte</button>
+    </form>
+  </div>
+  <div>
+    <h3>2. ¿Qué genera?</h3>
+    <ul>
+      <li><b>DETALLE UNIFICADO:</b> todos los pedidos antiguos + actuales.</li>
+      <li><b>Orden alfabético:</b> las personas aparecen de A a Z.</li>
+      <li><b>N° Almuerzo:</b> se acumula por persona.</li>
+      <li><b>REPORTE PEDIDOS:</b> totales por persona, día y plato.</li>
+    </ul>
+  </div>
+</div>
+<p class="muted" style="margin-bottom:0"><b>Importante:</b> el archivo original no se modifica. Se descarga una copia nueva con el reporte actualizado.</p>
+</div>
+</main>"""
+        self.send_html(page("Panel administrador", body))
 
-@app.post("/talma/login")
-def talma_login():
-    password = request.form.get("password", "")
-    if not hmac.compare_digest(password, _talma_password()):
-        return _talma_login(True)
-    value = _talma_session_value()
-    secure = "; Secure" if request.headers.get("X-Forwarded-Proto") == "https" else ""
-    response = redirect("/talma/")
-    response.headers["Set-Cookie"] = f"talma_session={value}; Path=/; Max-Age=43200; HttpOnly; SameSite=Lax{secure}"
-    return response
+    def save_menu(self) -> None:
+        """Guarda de forma atómica el menú de una fecha y verifica inmediatamente lo almacenado."""
+        form = self.read_form()
+        raw_date = form.get("fecha", "").strip()
 
-
-@app.get("/talma/logout")
-def talma_logout():
-    response = redirect("/talma")
-    response.headers["Set-Cookie"] = "talma_session=; Path=/; Max-Age=0; HttpOnly; SameSite=Lax"
-    return response
-
-
-@app.get("/talma/usuarios")
-def talma_admin_users():
-    """Gestión de personas TALMA: Excel oficial + personas añadidas manualmente."""
-    if not _valid_talma_session(request.cookies.get("talma_session")):
-        return _talma_login()
-
-    orders_app.init_db()
-    edit_id = request.args.get("editar", "").strip()
-
-    with orders_app.db() as conn:
-        manual_rows = conn.execute(
-            "SELECT id,email,dni,employee_name,area,active,created_at "
-            "FROM talma_manual_users ORDER BY employee_name COLLATE NOCASE"
-        ).fetchall()
-
-    manual_by_key = {(str(r["email"]).lower(), str(r["dni"])): r for r in manual_rows}
-    people = []
-    seen = set()
-
-    for key, record in sorted(
-        orders_app.TALMA_ROSTER.items(),
-        key=lambda x: x[1]["nombre"].lower()
-    ):
-        email, dni = key.split("|", 1)
-        manual = manual_by_key.get((email, dni))
-        people.append({
-            "source": "manual" if manual else "excel",
-            "id": manual["id"] if manual else "",
-            "email": manual["email"] if manual else email,
-            "dni": manual["dni"] if manual else dni,
-            "name": manual["employee_name"] if manual else record["nombre"],
-            "area": manual["area"] if manual else record["area"],
-            "active": bool(manual["active"]) if manual else True,
-            "created": manual["created_at"] if manual else "Excel",
-        })
-        seen.add((email, dni))
-
-    for r in manual_rows:
-        key = (str(r["email"]).lower(), str(r["dni"]))
-        if key not in seen:
-            people.append({
-                "source": "manual",
-                "id": r["id"],
-                "email": r["email"],
-                "dni": r["dni"],
-                "name": r["employee_name"],
-                "area": r["area"],
-                "active": bool(r["active"]),
-                "created": r["created_at"],
-            })
-
-    people.sort(key=lambda r: r["name"].lower())
-    edit_data = next(
-        (r for r in people if r["source"] == "manual" and str(r["id"]) == edit_id),
-        None
-    )
-
-    feedback = ""
-    if request.args.get("ok") == "1":
-        feedback = '<div class="notice success">Persona guardada correctamente.</div>'
-    elif request.args.get("ok") == "deleted":
-        feedback = '<div class="notice success">Persona manual desactivada correctamente.</div>'
-    elif request.args.get("error"):
-        feedback = f'<div class="notice error">{orders_app.esc(request.args.get("error"))}</div>'
-
-    if edit_data:
-        form_title = "Editar persona manual"
-        form_action = "/talma/usuarios/editar"
-        submit = "Guardar cambios"
-        hidden = f'<input type="hidden" name="id" value="{orders_app.esc(str(edit_data["id"]))}">'
-        cancel = '<a class="secondary" href="/talma/usuarios">Cancelar</a>'
-    else:
-        form_title = "Añadir persona manualmente"
-        form_action = "/talma/usuarios"
-        submit = "Añadir persona"
-        hidden = ""
-        cancel = ""
-
-    form_email = orders_app.esc(edit_data["email"] if edit_data else "")
-    form_dni = orders_app.esc(edit_data["dni"] if edit_data else "")
-    form_name = orders_app.esc(edit_data["name"] if edit_data else "")
-    form_area = orders_app.esc(edit_data["area"] if edit_data else "")
-
-    rows = []
-    for r in people:
-        source = "Excel" if r["source"] == "excel" else "Manual"
-        status = "Activo" if r["active"] else "Inactivo"
-        if r["source"] == "manual":
-            edit_href = f'/talma/usuarios?editar={quote(str(r["id"]))}'
-            delete_href = f'/talma/usuarios/eliminar?id={quote(str(r["id"]))}'
-            actions = (
-                f'<a class="small-action" href="{edit_href}">Editar</a> '
-                f'<a class="small-action danger-text" href="{delete_href}" '
-                f'onclick="return confirm(\'¿Desactivar esta persona manual?\');">Desactivar</a>'
-            )
+        # Acepta tanto el valor nativo del <input type="date"> como DD/MM/YYYY
+        # por si el navegador/formulario envía una fecha localizada.
+        menu_date = raw_date
+        for fmt in ("%Y-%m-%d", "%d/%m/%Y", "%d-%m-%Y"):
+            try:
+                parsed_date = datetime.strptime(raw_date, fmt)
+                menu_date = parsed_date.strftime("%Y-%m-%d")
+                break
+            except ValueError:
+                continue
         else:
-            actions = '<span class="muted">Base Excel</span>'
-
-        rows.append(
-            f'<tr><td>{orders_app.esc(r["name"])}</td>'
-            f'<td>{orders_app.esc(r["email"])}</td>'
-            f'<td><b>{orders_app.esc(r["dni"])}</b></td>'
-            f'<td>{orders_app.esc(r["area"])}</td>'
-            f'<td>{source}</td><td>{status}</td><td>{actions}</td></tr>'
-        )
-
-    rows_html = "".join(rows) or '<tr><td colspan="7">No hay personas registradas.</td></tr>'
-
-    body = f"""
-<div class="admin-page">
-{feedback}
-<div class="admin-head">
-  <div><div class="kicker">TALMA</div><h1>Personas y accesos</h1>
-  <p>La base oficial proviene del Excel. También puedes añadir personas manualmente.</p></div>
-  <a class="secondary" href="/talma">Volver al panel administrativo TALMA</a>
-</div>
-
-<section class="card">
-  <h2>{form_title}</h2>
-  <form method="post" action="{form_action}" class="user-form">
-    {hidden}
-    <label>Correo electrónico</label>
-    <input type="email" name="email" maxlength="180" required value="{form_email}" placeholder="correo@empresa.com">
-
-    <label>DNI</label>
-    <input name="dni" inputmode="numeric" maxlength="8" minlength="8" required value="{form_dni}" placeholder="71206879">
-
-    <label>Nombre y apellidos</label>
-    <input name="nombre" maxlength="120" required value="{form_name}" placeholder="Nombre completo">
-
-    <label>Área</label>
-    <input name="area" maxlength="80" required value="{form_area}" placeholder="Área">
-
-    <div class="actions">
-      <button type="submit">{submit}</button>
-      {cancel}
-    </div>
-  </form>
-  <p class="help">Las personas del Excel son de solo lectura. Las añadidas manualmente se guardan en el sistema y también pueden iniciar sesión con correo + DNI.</p>
-</section>
-
-<section class="card">
-  <div class="section-head">
-    <div><h2>Personas registradas ({len(people)})</h2><p class="help">Excel oficial + personas manuales.</p></div>
-    <a class="secondary" href="/talma/usuarios/excel">Descargar Excel de personas</a>
-  </div>
-  <div class="table-wrap">
-    <table><thead><tr><th>Nombre</th><th>Correo</th><th>DNI</th><th>Área</th><th>Origen</th><th>Estado</th><th>Acciones</th></tr></thead>
-    <tbody>{rows_html}</tbody></table>
-  </div>
-</section>
-</div>"""
-    extra = """<style>
-.admin-page{max-width:1240px;margin:30px auto;padding:0 18px}
-.admin-head,.section-head{display:flex;justify-content:space-between;gap:20px;align-items:flex-start;margin-bottom:18px}
-.admin-head h1,.section-head h2{margin:4px 0 6px}
-.kicker{font-size:12px;font-weight:800;letter-spacing:2px;color:#006b78}
-.card{background:#fff;border:1px solid #d8dfe6;border-radius:15px;padding:22px;margin-bottom:18px;box-shadow:0 5px 18px rgba(16,24,40,.05)}
-.user-form{max-width:720px}.user-form label{display:block;font-weight:700;margin:12px 0 6px}
-.user-form input{width:100%;box-sizing:border-box;padding:11px 12px;border:1px solid #cfd8dc;border-radius:9px;font:inherit}
-.user-form button{margin-top:16px;border:0;border-radius:9px;padding:11px 15px;background:#006b78;color:#fff;font-weight:700;cursor:pointer}
-.actions{display:flex;gap:10px;flex-wrap:wrap;align-items:center}
-.secondary{display:inline-block;padding:10px 14px;border-radius:9px;background:#eef3f5;color:#17323a;text-decoration:none;font-weight:700}
-.help,.muted{font-size:12px;color:#667085;line-height:1.5}
-.notice{padding:12px 14px;border-radius:10px;margin-bottom:16px}
-.notice.success{background:#ecfdf3;color:#067647;border:1px solid #abefc6}
-.notice.error{background:#fef3f2;color:#b42318;border:1px solid #fecdca}
-.table-wrap{overflow:auto}table{width:100%;border-collapse:collapse}
-th,td{padding:10px;border-bottom:1px solid #e4e7ec;text-align:left;vertical-align:top;white-space:nowrap}
-.small-action{color:#006b78;font-weight:700;text-decoration:none}.danger-text{color:#b42318}
-@media(max-width:800px){.admin-head,.section-head{flex-direction:column}}
-</style>"""
-    return _talma_page("Personas TALMA", body, extra)
-
-
-@app.post("/talma/usuarios")
-def talma_admin_users_create():
-    if not _valid_talma_session(request.cookies.get("talma_session")):
-        return _talma_login()
-
-    orders_app.init_db()
-    email = request.form.get("email", "").strip().lower()
-    dni = request.form.get("dni", "").strip()
-    name = request.form.get("nombre", "").strip()
-    area = request.form.get("area", "").strip()
-
-    if not re.fullmatch(r"[^@\s]+@[^@\s]+\.[^@\s]+", email) or not re.fullmatch(r"\d{8}", dni) or len(name) < 3 or not area:
-        return redirect("/talma/usuarios?error=Datos+incompletos")
-
-    with orders_app.db() as conn:
-        collision = conn.execute(
-            "SELECT id FROM talma_manual_users WHERE dni=? OR lower(email)=?",
-            (dni, email)
-        ).fetchone()
-        excel_dni = any(str(r["dni"]) == dni for r in orders_app.TALMA_ROSTER.values())
-        excel_email = any(str(r["email"]).lower() == email for r in orders_app.TALMA_ROSTER.values())
-        if collision or excel_dni or excel_email:
-            return redirect("/talma/usuarios?error=Ese+DNI+o+correo+ya+existe+en+TALMA")
-
-        conn.execute(
-            "INSERT INTO talma_manual_users(email,dni,employee_name,area,active,created_at) VALUES(?,?,?,?,1,?)",
-            (email, dni, name, area, orders_app.now_iso())
-        )
-
-    return redirect("/talma/usuarios?ok=1")
-
-
-@app.post("/talma/usuarios/editar")
-def talma_admin_users_edit():
-    if not _valid_talma_session(request.cookies.get("talma_session")):
-        return _talma_login()
-
-    orders_app.init_db()
-    user_id = request.form.get("id", "").strip()
-    email = request.form.get("email", "").strip().lower()
-    dni = request.form.get("dni", "").strip()
-    name = request.form.get("nombre", "").strip()
-    area = request.form.get("area", "").strip()
-
-    if not user_id or not re.fullmatch(r"[^@\s]+@[^@\s]+\.[^@\s]+", email) or not re.fullmatch(r"\d{8}", dni) or len(name) < 3 or not area:
-        return redirect("/talma/usuarios?error=Datos+incompletos")
-
-    with orders_app.db() as conn:
-        current = conn.execute("SELECT id FROM talma_manual_users WHERE id=?", (user_id,)).fetchone()
-        collision = conn.execute(
-            "SELECT id FROM talma_manual_users WHERE (dni=? OR lower(email)=?) AND id<>?",
-            (dni, email, user_id)
-        ).fetchone()
-        excel_collision = any(
-            str(r["dni"]) == dni or str(r["email"]).lower() == email
-            for r in orders_app.TALMA_ROSTER.values()
-        )
-        if not current or collision or excel_collision:
-            return redirect("/talma/usuarios?error=Ese+DNI+o+correo+ya+existe+en+TALMA")
-
-        conn.execute(
-            "UPDATE talma_manual_users SET email=?,dni=?,employee_name=?,area=?,active=1 WHERE id=?",
-            (email, dni, name, area, user_id)
-        )
-
-    return redirect("/talma/usuarios?ok=1")
-
-
-@app.get("/talma/usuarios/eliminar")
-def talma_admin_users_delete():
-    if not _valid_talma_session(request.cookies.get("talma_session")):
-        return _talma_login()
-
-    orders_app.init_db()
-    user_id = request.args.get("id", "").strip()
-    if user_id:
-        with orders_app.db() as conn:
-            conn.execute("UPDATE talma_manual_users SET active=0 WHERE id=?", (user_id,))
-    return redirect("/talma/usuarios?ok=deleted")
-
-
-
-
-@app.get("/talma/usuarios/excel")
-def talma_admin_users_excel():
-    if not _valid_talma_session(request.cookies.get("talma_session")):
-        return _talma_login()
-
-    orders_app.init_db()
-
-    people = []
-    seen = set()
-
-    with orders_app.db() as conn:
-        manual_rows = conn.execute(
-            "SELECT email,dni,employee_name,area,active "
-            "FROM talma_manual_users WHERE active=1 ORDER BY employee_name COLLATE NOCASE"
-        ).fetchall()
-
-    manual_by_key = {(str(r["email"]).lower(), str(r["dni"])): r for r in manual_rows}
-
-    for key, record in sorted(
-        orders_app.TALMA_ROSTER.items(),
-        key=lambda x: x[1]["nombre"].lower()
-    ):
-        email, dni = key.split("|", 1)
-        manual = manual_by_key.get((email, dni))
-        people.append([
-            manual["employee_name"] if manual else record["nombre"],
-            manual["email"] if manual else email,
-            manual["dni"] if manual else dni,
-            manual["area"] if manual else record["area"],
-            "Manual" if manual else "Excel",
-        ])
-        seen.add((email, dni))
-
-    for r in manual_rows:
-        key = (str(r["email"]).lower(), str(r["dni"]))
-        if key not in seen:
-            people.append([
-                r["employee_name"], r["email"], r["dni"], r["area"], "Manual"
-            ])
-
-    wb = Workbook()
-    ws = wb.active
-    ws.title = "Personas TALMA"
-    ws.append(["Nombre y apellidos", "Correo", "DNI", "Área", "Origen"])
-    for row in sorted(people, key=lambda x: x[0].lower()):
-        ws.append(row)
-
-    for i, width in enumerate([36, 40, 18, 24, 14], 1):
-        ws.column_dimensions[get_column_letter(i)].width = width
-
-    fill = PatternFill("solid", fgColor="176B43")
-    for cell in ws[1]:
-        cell.font = Font(bold=True, color="FFFFFF")
-        cell.fill = fill
-        cell.alignment = Alignment(horizontal="center", vertical="center")
-
-    ws.freeze_panes = "A2"
-    ws.auto_filter.ref = ws.dimensions
-
-    for row in ws.iter_rows(min_row=2):
-        for cell in row:
-            cell.alignment = Alignment(vertical="top", wrap_text=True)
-
-    output = io.BytesIO()
-    wb.save(output)
-    output.seek(0)
-
-    return send_file(
-        output,
-        as_attachment=True,
-        download_name=f"personas_talma_{datetime.now():%Y%m%d_%H%M%S}.xlsx",
-        mimetype="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-    )
-
-
-@app.get("/talma/excel")
-def talma_excel():
-    if not _valid_talma_session(request.cookies.get("talma_session")):
-        return _talma_login()
-    orders_app.init_db()
-    fecha_desde = request.args.get("desde", "").strip()
-    fecha_hasta = request.args.get("hasta", "").strip()
-    dni_filter = request.args.get("dni", "").strip()[:20]
-
-    def _valid_iso(value):
-        try:
-            datetime.strptime(value, "%Y-%m-%d")
-            return True
-        except ValueError:
-            return False
-
-    if fecha_desde and not _valid_iso(fecha_desde): fecha_desde = ""
-    if fecha_hasta and not _valid_iso(fecha_hasta): fecha_hasta = ""
-    if fecha_desde and not fecha_hasta: fecha_hasta = fecha_desde
-    if fecha_hasta and not fecha_desde: fecha_desde = fecha_hasta
-    if fecha_desde and fecha_hasta and fecha_desde > fecha_hasta:
-        fecha_desde, fecha_hasta = fecha_hasta, fecha_desde
-
-    with orders_app.db() as conn:
-        sql = """SELECT o.order_date, o.employee_name,
-                      o.dni AS dni,
-                      o.area, o.entry_item, o.main_item, o.notes, o.created_at
-               FROM orders o JOIN companies c ON c.id=o.company_id
-               WHERE c.slug='talma'"""
-        args = []
-        if dni_filter:
-            sql += " AND o.dni=?"; args.append(dni_filter)
-        if fecha_desde:
-            sql += " AND o.order_date>=?"; args.append(fecha_desde)
-        if fecha_hasta:
-            sql += " AND o.order_date<=?"; args.append(fecha_hasta)
-        sql += " ORDER BY o.order_date, CASE WHEN o.dni='' THEN 1 ELSE 0 END, o.dni, o.employee_name COLLATE NOCASE, o.id"
-        rows = conn.execute(sql, args).fetchall()
-    wb = Workbook()
-    ws = wb.active
-    ws.title = "Pedidos TALMA"
-    headers = ["Fecha", "DNI", "Persona", "Área", "Entrada", "Plato de fondo", "Observación", "N° Almuerzo", "Hora"]
-    ws.append(headers)
-    counts = {}
-    for r in rows:
-        key = r["dni"] or f"legacy:{orders_app.normalize_key(r['employee_name'])}"
-        counts[key] = counts.get(key, 0) + 1
-        ws.append([r["order_date"], r["dni"], r["employee_name"], r["area"], r["entry_item"], r["main_item"],
-                   r["notes"], counts[key], (r["created_at"] or "")[11:16]])
-    for i, width in enumerate([14, 14, 34, 16, 32, 36, 40, 14, 10], 1):
-        ws.column_dimensions[get_column_letter(i)].width = width
-    for cell in ws[1]:
-        cell.font = Font(bold=True, color="FFFFFF")
-        cell.fill = PatternFill("solid", fgColor="176B43")
-        cell.alignment = Alignment(horizontal="center")
-    for row in ws.iter_rows(min_row=2):
-        for cell in row:
-            cell.alignment = Alignment(vertical="top", wrap_text=True)
-    summary = wb.create_sheet("Resumen")
-    summary.append(["DNI", "PERSONA", "TOTAL ALMUERZOS"])
-    for key, total in sorted(counts.items()):
-        rr = next((r for r in rows if (r["dni"] or f"legacy:{orders_app.normalize_key(r['employee_name'])}") == key), None)
-        summary.append([rr["dni"] if rr and rr["dni"] else "Sin DNI", rr["employee_name"] if rr else key, total])
-    summary.column_dimensions["A"].width = 16
-    summary.column_dimensions["B"].width = 34
-    summary.column_dimensions["C"].width = 20
-    output = io.BytesIO()
-    wb.save(output)
-    output.seek(0)
-    suffix = f"_{fecha_desde}_a_{fecha_hasta}" if fecha_desde and fecha_hasta else "_historial_completo"
-    return send_file(output, as_attachment=True, download_name=f"pedidos_talma{suffix}.xlsx",
-                     mimetype="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
-
-
-@app.get("/talma/cupones")
-def talma_cupones():
-    """Genera la cuponera TALMA desde los pedidos persistidos del portal."""
-    if not _valid_talma_session(request.cookies.get("talma_session")):
-        return _talma_login()
-
-    orders_app.init_db()
-    fecha_desde = request.args.get("desde", "").strip()
-    fecha_hasta = request.args.get("hasta", "").strip()
-    dni_filter = request.args.get("dni", "").strip()[:20]
-
-    def _valid_iso(value):
-        try:
-            datetime.strptime(value, "%Y-%m-%d")
-            return True
-        except ValueError:
-            return False
-
-    if fecha_desde and not _valid_iso(fecha_desde):
-        fecha_desde = ""
-    if fecha_hasta and not _valid_iso(fecha_hasta):
-        fecha_hasta = ""
-    if fecha_desde and not fecha_hasta:
-        fecha_hasta = fecha_desde
-    if fecha_hasta and not fecha_desde:
-        fecha_desde = fecha_hasta
-    if fecha_desde and fecha_hasta and fecha_desde > fecha_hasta:
-        fecha_desde, fecha_hasta = fecha_hasta, fecha_desde
-
-    with orders_app.db() as conn:
-        sql = """SELECT o.order_date, o.employee_name, o.dni, o.area,
-                        o.entry_item, o.main_item, o.notes, o.created_at
-                 FROM orders o
-                 JOIN companies c ON c.id=o.company_id
-                 WHERE c.slug='talma'"""
-        args = []
-        if dni_filter:
-            sql += " AND o.dni=?"
-            args.append(dni_filter)
-        if fecha_desde:
-            sql += " AND o.order_date>=?"
-            args.append(fecha_desde)
-        if fecha_hasta:
-            sql += " AND o.order_date<=?"
-            args.append(fecha_hasta)
-        sql += """ ORDER BY o.order_date,
-                   CASE WHEN o.dni='' THEN 1 ELSE 0 END,
-                   o.dni, o.employee_name COLLATE NOCASE, o.id"""
-        db_rows = conn.execute(sql, args).fetchall()
-
-    rows = [
-        {
-            "fecha": r["order_date"],
-            "nombre": r["employee_name"],
-            "area": r["area"],
-            "entrada": r["entry_item"],
-            "segundo": r["main_item"],
-            "observacion": r["notes"],
-        }
-        for r in db_rows
-    ]
-    if not rows:
-        raise RuntimeError("No hay pedidos TALMA en el período seleccionado para generar los cupones.")
-
-    suffix = ""
-    if fecha_desde and fecha_hasta:
-        suffix = f"_{fecha_desde}_a_{fecha_hasta}"
-    elif dni_filter:
-        suffix = f"_dni_{dni_filter}"
-
-    return create_pdf_from_rows("talma", rows, suffix=suffix)
-
-
-
-# ---------------------------------------------------------------------------
-# Integración con el sistema principal de pedidos
-# ---------------------------------------------------------------------------
-_INTERNAL_ORDERS_PORT = int(os.environ.get("INTERNAL_ORDERS_PORT", "18081"))
-_orders_server = None
-_orders_thread = None
-_orders_lock = threading.Lock()
-
-
-def _ensure_orders_server():
-    """Inicia el servidor original de pedidos en localhost una sola vez."""
-    global _orders_server, _orders_thread
-    with _orders_lock:
-        if _orders_thread and _orders_thread.is_alive():
+            params = urlencode({
+                "fecha": today_iso(),
+                "menu_error": "Fecha inválida. Seleccione una fecha válida del calendario."
+            })
+            self.redirect(f"/admin/dashboard?{params}")
             return
-        orders_app.init_db()
-        _orders_server = ThreadingHTTPServer(("127.0.0.1", _INTERNAL_ORDERS_PORT), orders_app.AppHandler)
-        _orders_thread = threading.Thread(target=_orders_server.serve_forever, name="pedidos-interno", daemon=True)
-        _orders_thread.start()
+
+        def unique_dishes(raw_text: str) -> list[str]:
+            result: list[str] = []
+            seen: set[str] = set()
+            for line in (raw_text or "").splitlines():
+                # También acepta platos separados por ';' o por salto de línea.
+                for part in re.split(r"[;\n]+", line):
+                    dish = re.sub(r"\s+", " ", part).strip()
+                    if not dish:
+                        continue
+                    dish = dish[:120]
+                    key = normalize_key(dish)
+                    if key and key not in seen:
+                        seen.add(key)
+                        result.append(dish)
+            return result
+
+        entries = unique_dishes(form.get("entradas", ""))
+        mains = unique_dishes(form.get("fondos", ""))
+
+        if not entries or not mains:
+            params = urlencode({
+                "fecha": menu_date,
+                "menu_error": "Debes ingresar al menos una entrada y un plato de fondo para esa fecha."
+            })
+            self.redirect(f"/admin/dashboard?{params}")
+            return
+
+        try:
+            with db() as conn:
+                # Una única transacción: nunca queda una fecha parcialmente guardada.
+                conn.execute("BEGIN IMMEDIATE")
+                conn.execute("DELETE FROM menu_items WHERE menu_date=?", (menu_date,))
+                conn.executemany(
+                    "INSERT INTO menu_items(menu_date, category, name) VALUES (?, 'entrada', ?)",
+                    [(menu_date, dish) for dish in entries],
+                )
+                conn.executemany(
+                    "INSERT INTO menu_items(menu_date, category, name) VALUES (?, 'fondo', ?)",
+                    [(menu_date, dish) for dish in mains],
+                )
+
+                # Verificación antes del COMMIT.
+                stored_entries = conn.execute(
+                    "SELECT name FROM menu_items WHERE menu_date=? AND category='entrada' AND active=1 ORDER BY id",
+                    (menu_date,),
+                ).fetchall()
+                stored_mains = conn.execute(
+                    "SELECT name FROM menu_items WHERE menu_date=? AND category='fondo' AND active=1 ORDER BY id",
+                    (menu_date,),
+                ).fetchall()
+
+                saved_entries = [r["name"] for r in stored_entries]
+                saved_mains = [r["name"] for r in stored_mains]
+                if saved_entries != entries or saved_mains != mains:
+                    raise sqlite3.Error("La verificación del menú guardado no coincide con los datos enviados.")
+
+                conn.commit()
+
+        except sqlite3.Error as error:
+            print(f"Error al guardar/verificar el menú de {menu_date}: {error}", file=sys.stderr)
+            params = urlencode({
+                "fecha": menu_date,
+                "menu_error": f"No se pudo guardar el menú del {menu_date}. Inténtelo nuevamente."
+            })
+            self.redirect(f"/admin/dashboard?{params}")
+            return
+
+        # Redirige a la misma fecha y muestra el menú recién guardado.
+        self.redirect(
+            f"/admin/dashboard?{urlencode({'fecha': menu_date, 'ok': '1', 'menu_guardado': '1'})}"
+        )
+
+    def create_company(self) -> None:
+        form = self.read_form()
+        name = form.get("nombre", "").strip()
+        if not name:
+            self.redirect("/admin/dashboard")
+            return
+        base = slugify(name)
+        slug = base
+        with db() as conn:
+            n = 2
+            while conn.execute("SELECT 1 FROM companies WHERE slug=?", (slug,)).fetchone():
+                slug = f"{base}-{n}"
+                n += 1
+            conn.execute(
+                "INSERT INTO companies(name, slug, token, created_at) VALUES (?, ?, ?, ?)",
+                (name[:120], slug, secrets.token_urlsafe(18), now_iso()),
+            )
+        self.redirect("/admin/dashboard?ok=1")
+
+    def toggle_company(self) -> None:
+        form = self.read_form()
+        if form.get("id", "").isdigit():
+            with db() as conn:
+                conn.execute("UPDATE companies SET active=CASE active WHEN 1 THEN 0 ELSE 1 END WHERE id=?", (int(form["id"]),))
+        self.redirect("/admin/dashboard?ok=1")
+
+    def update_historical_excel(self) -> None:
+        try:
+            filename, data = read_multipart_file(self, "excel_historico")
+            if not filename.lower().endswith(".xlsx"):
+                raise ValueError("Solo se aceptan archivos .xlsx.")
+            workbook = load_workbook(io.BytesIO(data))
+            historical = extract_historical_orders(workbook)
+
+            with db() as conn:
+                current_rows = conn.execute(
+                    """SELECT o.order_date, c.name AS company_name, o.employee_name, o.area,
+                              o.entry_item, o.main_item, o.notes
+                       FROM orders o JOIN companies c ON c.id=o.company_id
+                       ORDER BY o.order_date, c.name, o.employee_name"""
+                ).fetchall()
+
+            current = [{
+                "fecha": r["order_date"],
+                "empresa": r["company_name"],
+                "nombre": r["employee_name"],
+                "dni": r["dni"] if "dni" in r.keys() else "",
+                "area": r["area"],
+                "entrada": r["entry_item"],
+                "fondo": r["main_item"],
+                "observacion": r["notes"],
+            } for r in current_rows]
+
+            total, people = build_historical_report(workbook, historical, current)
+            output = io.BytesIO()
+            workbook.save(output)
+            output.seek(0)
+
+            safe_name = re.sub(r"[^A-Za-z0-9._-]+", "_", Path(filename).stem) or "pedidos_historico"
+            download_name = f"{safe_name}_reporte_actualizado.xlsx"
+            self.send_bytes(output.getvalue(),
+                            "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                            download_name)
+        except Exception as error:
+            print(f"Error al actualizar Excel histórico: {error}", file=sys.stderr)
+            message = esc(str(error))
+            self.send_html(page("Error de Excel", f'<main class="wrap narrow"><div class="card"><h1>No se pudo actualizar el Excel</h1><p>{message}</p><a class="btn" href="/admin/dashboard">Volver al panel</a></div></main>'), 400)
+
+    def delete_order(self) -> None:
+        form = self.read_form()
+        if form.get("id", "").isdigit():
+            with db() as conn:
+                conn.execute("DELETE FROM orders WHERE id=?", (int(form["id"]),))
+        self.redirect(f"/admin/dashboard?{urlencode({'fecha':form.get('fecha',today_iso()),'ok':'1'})}")
+
+    def filtered_orders(self, query: dict[str, str]):
+        selected_date = query.get("fecha", today_iso())
+        company = query.get("empresa", "")
+        filters = ["o.order_date=?"]
+        args: list[object] = [selected_date]
+        if company.isdigit():
+            filters.append("o.company_id=?")
+            args.append(int(company))
+        with db() as conn:
+            rows = conn.execute(
+                f"""SELECT o.*, c.name company_name FROM orders o JOIN companies c ON c.id=o.company_id
+                    WHERE {' AND '.join(filters)} ORDER BY o.employee_name COLLATE NOCASE, c.name COLLATE NOCASE, o.created_at""",
+                args,
+            ).fetchall()
+        return selected_date, rows
+
+    def export_csv(self, query: dict[str, str]) -> None:
+        selected_date, rows = self.filtered_orders(query)
+        output = io.StringIO(newline="")
+        writer = csv.writer(output, delimiter=";")
+        writer.writerow(["Empresa", "DNI", "Empleado", "Área", "Entrada", "Plato de fondo", "Modalidad", "Observación", "Fecha", "Hora"])
+        for r in rows:
+            dni = r["dni"] if r["company_name"].lower() == "talma" else ""
+            writer.writerow([r["company_name"], dni, r["employee_name"], r["area"], r["entry_item"], r["main_item"], r["delivery_type"], r["notes"], r["order_date"], r["created_at"][11:16]])
+        data = ("\ufeff" + output.getvalue()).encode("utf-8")
+        self.send_bytes(data, "text/csv; charset=utf-8", f"pedidos-{selected_date}.csv")
+
+    def coupons(self, query: dict[str, str]) -> None:
+        selected_date, rows = self.filtered_orders(query)
+
+        def dish_style(value: str, kind: str = "entry") -> str:
+            # Ajusta automáticamente el tamaño para que ambos platos se vean grandes,
+            # centrados y sin cortarse, respetando tildes y textos largos.
+            length = len(value.strip())
+            if kind == "entry":
+                if length > 34:
+                    return "font-size:22px;line-height:1.04"
+                if length > 24:
+                    return "font-size:27px;line-height:1.04"
+                return "font-size:33px;line-height:1.02"
+            if length > 42:
+                return "font-size:18px;line-height:1.06"
+            if length > 30:
+                return "font-size:21px;line-height:1.06"
+            return "font-size:25px;line-height:1.04"
+
+        ticket_cards = []
+        for idx, r in enumerate(rows, start=1):
+            ticket_cards.append(
+                f"""<section class="ticket">
+<div class="ticket-top"><div class="ticket-number">TICKET {idx:03d}</div><div class="ticket-company">{esc((r['company_name'] or '').upper())}</div></div>
+<div class="ticket-head">
+  <div class="ticket-area">{esc(self.display_area((r['company_name'] or ''), (r['area'] or 'Sin área')).upper())}</div>
+  <div class="ticket-person">{esc((r['employee_name'] or '').upper())}</div>
+</div>
+<div class="dish-entry" style="{dish_style(r['entry_item'], 'entry')}">{esc(r['entry_item'])}</div>
+<div class="dish-main" style="{dish_style(r['main_item'], 'main')}">{esc(r['main_item'])}</div>
+<div class="ticket-notes-title">OBSERVACIÓN</div>
+<div class="ticket-notes">{esc(r['notes'] or '—')}</div>
+</section>"""
+            )
+
+        pages = []
+        for i in range(0, len(ticket_cards), 8):
+            pages.append(f'<div class="ticket-page">{"".join(ticket_cards[i:i+8])}</div>')
+        tickets = "".join(pages) or '<div class="notice error">No hay pedidos para imprimir.</div>'
+
+        coupon_css = """
+<style>
+.coupon-wrap{max-width:1180px;margin:18px auto;padding:0 14px}
+.coupon-card{background:#fff;border:1px solid var(--line);border-radius:14px;padding:16px;box-shadow:0 2px 10px rgba(16,24,40,.04)}
+.ticket-page{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));grid-template-rows:repeat(4,1fr);gap:0;margin:12px auto 24px;max-width:190mm;min-height:273mm;background:#fff;border:1px solid #222}
+.ticket{margin:0!important;border:1px solid #222!important;padding:4.5mm 4.5mm 4mm!important;min-width:0;min-height:0;display:flex;flex-direction:column;justify-content:flex-start;text-align:left;overflow:hidden;background:#fff}
+.ticket-top{display:flex;justify-content:space-between;align-items:flex-start;min-height:16px}
+.ticket-number{font-size:9px;font-weight:900;letter-spacing:.3px}
+.ticket-company{font-size:8px;line-height:1;font-weight:900;letter-spacing:.5px;border:1px solid #222;padding:1px 3px;white-space:nowrap}
+.ticket-head{text-align:center;margin-top:0;margin-bottom:8px}
+.ticket-area{font-size:14px;line-height:1.02;font-weight:800;white-space:normal;overflow-wrap:anywhere}
+.ticket-person{font-size:14px;line-height:1.02;font-weight:800;white-space:normal;overflow-wrap:anywhere;margin-top:1px}
+.dish-entry,.dish-main{font-weight:1000;text-align:center;overflow-wrap:anywhere;word-break:normal;margin:0 auto}
+.dish-entry{margin-top:4px;margin-bottom:22px}
+.dish-main{margin-bottom:22px}
+.ticket-notes-title{font-size:10px;line-height:1.05;font-weight:1000;margin-top:auto;margin-bottom:2px}
+.ticket-notes{font-size:10px;line-height:1.15;font-weight:700;white-space:normal;overflow-wrap:anywhere}
+@media(max-width:760px){.ticket-page{grid-template-columns:1fr;grid-template-rows:none;min-height:0}.ticket{min-height:250px}}
+@page{size:A4 portrait;margin:8mm}
+@media print{
+  html,body{margin:0!important;padding:0!important;background:#fff!important}
+  .coupon-wrap{max-width:none!important;margin:0!important;padding:0!important}
+  .coupon-card{border:0!important;border-radius:0!important;box-shadow:none!important;padding:0!important;margin:0!important}
+  .ticket-page{
+    display:grid!important;
+    width:194mm!important;
+    max-width:194mm!important;
+    height:281mm!important;
+    min-height:281mm!important;
+    box-sizing:border-box!important;
+    grid-template-columns:repeat(2,minmax(0,1fr))!important;
+    grid-template-rows:repeat(4,minmax(0,1fr))!important;
+    grid-auto-rows:calc(281mm / 4)!important;
+    gap:0!important;
+    margin:0!important;
+    page-break-after:always;
+    break-after:page;
+  }
+  .ticket-page:last-child{page-break-after:auto;break-after:auto}
+  .ticket{
+    width:auto!important;
+    height:auto!important;
+    min-height:0!important;
+    max-height:none!important;
+    box-sizing:border-box!important;
+    break-inside:avoid;
+    page-break-inside:avoid;
+  }
+}
+</style>
+"""
+        body = f"""
+<main class="coupon-wrap"><div class="coupon-card">
+<div class="actions no-print" style="margin-bottom:10px"><button onclick="window.print()">Imprimir / Guardar PDF</button><a class="btn secondary" href="/admin/dashboard?fecha={esc(selected_date)}">Volver</a></div>
+<h1 class="no-print">Cupones — 8 por hoja</h1>
+<p class="muted no-print" style="margin-top:-6px">Diseño ajustado al modelo solicitado, sin fecha y sin las etiquetas “Entrada” ni “Plato de fondo”.</p>
+{tickets}
+</div></main>"""
+        self.send_html(page("Cupones", body, coupon_css))
 
 
-@app.before_request
-def _protect_scanner_admin():
-    protected = (
-        "/admin/talma",
-        "/admin/policia",
-        "/admin/scanners",
-        "/admin/scanner-imagen",
-        "/admin/scanner-diagnostico",
-    )
-    if request.path.startswith(protected):
-        if not orders_app.valid_session(request.cookies.get("admin_session")):
-            return redirect("/admin")
-
-
-def _proxy_to_orders(path=""):
-    """Reenvía al sistema de pedidos original cualquier ruta que no sea del scanner."""
-    _ensure_orders_server()
-    target = "/" + path if path else "/"
-    if request.query_string:
-        target += "?" + request.query_string.decode("latin-1")
-
-    body = request.get_data(cache=False)
-    headers = {}
-    skipped = {"connection", "content-length", "transfer-encoding"}
-    for key, value in request.headers.items():
-        if key.lower() not in skipped:
-            headers[key] = value
-    # Mantener el host público para que los enlaces privados se generen con el dominio real.
-    headers["Host"] = request.host
-    headers["X-Forwarded-Proto"] = request.headers.get("X-Forwarded-Proto", request.scheme)
-
-    connection = http.client.HTTPConnection("127.0.0.1", _INTERNAL_ORDERS_PORT, timeout=180)
+def run() -> None:
+    global PORT
+    if len(sys.argv) > 1:
+        try:
+            PORT = int(sys.argv[1])
+        except ValueError:
+            print("Puerto inválido; usando 8080.")
+            PORT = 8080
+    init_db()
+    server = ThreadingHTTPServer((HOST, PORT), AppHandler)
+    print("=" * 62)
+    print(f"Sistema iniciado: http://localhost:{PORT}")
+    print(f"Panel administrador: http://localhost:{PORT}/admin")
+    print(f"Contraseña inicial: {CONFIG.get('admin_password')}")
+    print("Presione Ctrl+C para detener.")
+    print("=" * 62)
     try:
-        connection.request(request.method, target, body=body if body else None, headers=headers)
-        upstream = connection.getresponse()
-        data = upstream.read()
-        response_headers = []
-        for key, value in upstream.getheaders():
-            if key.lower() not in {"connection", "transfer-encoding", "content-length", "server", "date"}:
-                response_headers.append((key, value))
-        return Response(data, status=upstream.status, headers=response_headers)
+        server.serve_forever()
+    except KeyboardInterrupt:
+        print("\nServidor detenido.")
     finally:
-        connection.close()
-
-
-@app.route("/", defaults={"path": ""}, methods=["GET", "POST", "HEAD"])
-@app.route("/<path:path>", methods=["GET", "POST", "HEAD"])
-def orders_proxy(path):
-    return _proxy_to_orders(path)
-
-
-# Se inicia también al importar la aplicación (por ejemplo, con Gunicorn).
-_ensure_orders_server()
+        server.server_close()
 
 
 if __name__ == "__main__":
-    public_port = int(os.environ.get("PORT", "8080"))
-    app.run(host="0.0.0.0", port=public_port, debug=False, threaded=True)
+    run()
+
+
+WEEKDAYS_ES = ["lunes", "martes", "miércoles", "jueves", "viernes", "sábado", "domingo"]
+
+def fecha_con_dia(fecha_iso):
+    try:
+        d = datetime.strptime(str(fecha_iso), "%Y-%m-%d").date()
+        meses = ["enero","febrero","marzo","abril","mayo","junio","julio","agosto","septiembre","octubre","noviembre","diciembre"]
+        return f"{WEEKDAYS_ES[d.weekday()]} {d.day} de {meses[d.month-1]} de {d.year}"
+    except Exception:
+        return str(fecha_iso)
+

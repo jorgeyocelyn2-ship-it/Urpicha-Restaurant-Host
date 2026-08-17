@@ -535,6 +535,20 @@ def esc(value: object) -> str:
     return html.escape(str(value), quote=True)
 
 
+def _logo_data_uri(filename: str, mime: str) -> str:
+    """Carga el logo localmente para que el encabezado no dependa del proxy /static/."""
+    try:
+        import base64
+        raw = (BASE_DIR / "static" / filename).read_bytes()
+        return f"data:{mime};base64," + base64.b64encode(raw).decode("ascii")
+    except (OSError, ValueError):
+        return ""
+
+
+LOGO_HEADER_URI = _logo_data_uri("urpicha-logo-header.png", "image/png")
+LOGO_WATERMARK_URI = _logo_data_uri("urpicha-logo-watermark.png", "image/png")
+
+
 def page(title: str, body: str, extra_head: str = "") -> str:
     restaurant = esc(CONFIG.get("restaurant_name", "Mi Restaurante"))
     return f"""<!doctype html>
@@ -570,8 +584,8 @@ footer{{text-align:center;color:var(--muted);padding:28px 16px;font-size:13px;li
 {extra_head}
 </head>
 <body>
-<div class="topbar"><div class="topbar-brand"><img class="topbar-logo" src="/static/urpicha-logo-header.png" alt="Logo Urpicha"><strong>{restaurant}</strong></div></div>
-<img class="brand-watermark" src="/static/urpicha-logo-watermark.png" alt="" aria-hidden="true">
+<div class="topbar"><div class="topbar-brand"><img class="topbar-logo" src="{LOGO_HEADER_URI}" alt="Logo Urpicha"><strong>{restaurant}</strong></div></div>
+<img class="brand-watermark" src="{LOGO_WATERMARK_URI}" alt="" aria-hidden="true">
 {body}
 <footer>
 <div class="support-footer">
