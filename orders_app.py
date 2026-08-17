@@ -1018,6 +1018,45 @@ class AppHandler(BaseHTTPRequestHandler):
         path = parsed.path.rstrip("/") or "/"
         query = {k: v[0] for k, v in parse_qs(parsed.query).items()}
 
+        # Recursos estáticos del sistema de pedidos.
+        # El portal principal puede actuar como proxy hacia este servidor interno,
+        # por lo que estos archivos deben poder servirse también desde aquí.
+        if path.startswith("/static/"):
+            relative = path[len("/static/"):].lstrip("/")
+            static_root = BASE_DIR / "static"
+            candidate = (static_root / relative).resolve()
+            try:
+                candidate.relative_to(static_root.resolve())
+            except ValueError:
+                self.send_text("Not found", 404)
+                return
+            if not candidate.is_file():
+                self.send_text("Not found", 404)
+                return
+            mime = {
+                ".png": "image/png",
+                ".jpg": "image/jpeg",
+                ".jpeg": "image/jpeg",
+                ".webp": "image/webp",
+                ".gif": "image/gif",
+                ".svg": "image/svg+xml",
+                ".ico": "image/x-icon",
+                ".css": "text/css; charset=utf-8",
+                ".js": "application/javascript; charset=utf-8",
+            }.get(candidate.suffix.lower(), "application/octet-stream")
+            try:
+                data = candidate.read_bytes()
+            except OSError:
+                self.send_text("Not found", 404)
+                return
+            self.send_response(200)
+            self.send_header("Content-Type", mime)
+            self.send_header("Content-Length", str(len(data)))
+            self.send_header("Cache-Control", "public, max-age=86400")
+            self.end_headers()
+            self.wfile.write(data)
+            return
+
         if path == "/":
             self.home()
         elif path == "/health":
@@ -1177,7 +1216,7 @@ class AppHandler(BaseHTTPRequestHandler):
 
         settings = get_order_settings()
         manual_open = settings["manual_open_date"] == requested_date and not settings["manual_closed"]
-        if is_order_closed(requested_date):
+        if closed_for_date:
             wa=self.whatsapp_link(f"Hola, necesito realizar un pedido fuera de horario para {company['name']}.")
             wa_button=(f'<a class="btn" target="_blank" rel="noopener" href="{esc(wa)}"> Comunicarme por WhatsApp</a>'
                        if wa else '<p><b>Comunícate por WhatsApp con el responsable de la empresa para coordinar la entrega.</b></p>')
@@ -1206,7 +1245,10 @@ class AppHandler(BaseHTTPRequestHandler):
 </div>"""
             submit = '<button type="submit">Enviar mi pedido</button>'
 
-        observation_html = "" if is_order_closed(requested_date) else '<label>Observación (opcional)</label><textarea name="observaciones" maxlength="300" placeholder="Ejemplo: sin cebolla, poco arroz..."></textarea>'
+        # Cuando los pedidos están cerrados no se muestra el campo Observación
+        # ni se permite interactuar con él desde la interfaz.
+        closed_for_date = is_order_closed(requested_date)
+        observation_html = "" if closed_for_date else '<label>Observación (opcional)</label><textarea name="observaciones" maxlength="300" placeholder="Ejemplo: sin cebolla, poco arroz..."></textarea>'
 
         if public_orders:
             public_order_rows = "".join(

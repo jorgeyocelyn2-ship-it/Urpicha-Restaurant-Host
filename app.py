@@ -71,7 +71,7 @@ def page(title: str, body: str) -> str:
 @media print{{.brand-watermark{{display:none!important}}}}
 </style>
 </head>
-<body><div class="topbar"><div class="topbar-brand"><img class="topbar-logo" src="/static/urpicha-logo-header.png" alt="Logo Urpicha"><strong>Urpicha Restaurante</strong></div></div><img class="brand-watermark" src="/static/urpicha-logo-watermark.png" alt="" aria-hidden="true">
+<body><div class="topbar"><div class="topbar-brand"><img class="topbar-logo" src="{url_for('static', filename='urpicha-logo-header.png')}" alt="Logo Urpicha"><strong>Urpicha Restaurante</strong></div></div><img class="brand-watermark" src="{url_for('static', filename='urpicha-logo-watermark.png')}" alt="" aria-hidden="true">
 {body}
 <footer class="site-footer">
 <strong>Soporte del sistema</strong><br>
