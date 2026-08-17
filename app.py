@@ -1230,6 +1230,9 @@ class AppHandler(BaseHTTPRequestHandler):
 
         settings = get_order_settings()
         manual_open = settings["manual_open_date"] == requested_date and not settings["manual_closed"]
+        # Calcular el estado de cierre antes de usarlo. Esto evita que una visita
+        # al formulario de empresa provoque UnboundLocalError.
+        closed_for_date = is_order_closed(requested_date)
         if closed_for_date:
             wa=self.whatsapp_link(f"Hola, necesito realizar un pedido fuera de horario para {company['name']}.")
             wa_button=(f'<a class="btn" target="_blank" rel="noopener" href="{esc(wa)}"> Comunicarme por WhatsApp</a>'
@@ -1261,7 +1264,6 @@ class AppHandler(BaseHTTPRequestHandler):
 
         # Cuando los pedidos están cerrados no se muestra el campo Observación
         # ni se permite interactuar con él desde la interfaz.
-        closed_for_date = is_order_closed(requested_date)
         observation_html = "" if closed_for_date else '<label>Observación (opcional)</label><textarea name="observaciones" maxlength="300" placeholder="Ejemplo: sin cebolla, poco arroz..."></textarea>'
 
         if public_orders:
