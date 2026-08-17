@@ -62,12 +62,16 @@ def page(title: str, body: str) -> str:
 .stat b{{display:block;font-size:28px;margin-top:6px}}
 .table-wrap{{overflow:auto}}
 @media(max-width:800px){{.grid3{{grid-template-columns:1fr}}}}
-.brand-watermark{{position:fixed;right:18px;bottom:18px;width:118px;height:118px;object-fit:contain;opacity:.16;z-index:999;pointer-events:none;user-select:none}}
-@media(max-width:800px){{.brand-watermark{{width:82px;height:82px;right:8px;bottom:8px;opacity:.13}}}}
+.topbar{{background:#101828;color:#fff;padding:10px 20px;display:flex;align-items:center;gap:12px;box-shadow:0 2px 10px rgba(0,0,0,.12)}}
+.topbar-brand{{display:flex;align-items:center;gap:12px;min-width:0}}
+.topbar-logo{{width:52px;height:44px;object-fit:contain;flex:0 0 auto;filter:drop-shadow(0 2px 4px rgba(0,0,0,.28))}}
+.topbar strong{{font-size:18px;line-height:1.2}}
+.brand-watermark{{position:fixed;right:18px;bottom:18px;width:154px;height:154px;object-fit:contain;padding:8px;background:rgba(255,255,255,.90);border:1px solid rgba(16,24,40,.10);border-radius:18px;box-shadow:0 8px 28px rgba(16,24,40,.18);opacity:1;z-index:999;pointer-events:none;user-select:none}}
+@media(max-width:800px){{.topbar{{padding:8px 12px}}.topbar-logo{{width:46px;height:40px}}.brand-watermark{{width:104px;height:104px;right:8px;bottom:8px;padding:5px;border-radius:13px}}}}
 @media print{{.brand-watermark{{display:none!important}}}}
 </style>
 </head>
-<body><img class="brand-watermark" src="/static/urpicha-logo-watermark.png" alt="" aria-hidden="true">
+<body><div class="topbar"><div class="topbar-brand"><img class="topbar-logo" src="/static/urpicha-logo-header.png" alt="Logo Urpicha"><strong>Urpicha Restaurante</strong></div></div><img class="brand-watermark" src="/static/urpicha-logo-watermark.png" alt="" aria-hidden="true">
 {body}
 <footer class="site-footer">
 <strong>Soporte del sistema</strong><br>

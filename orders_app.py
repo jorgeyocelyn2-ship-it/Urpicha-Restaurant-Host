@@ -47,7 +47,7 @@ except ValueError:
 DATA_DIR.mkdir(exist_ok=True)
 
 DEFAULT_CONFIG = {
-    "restaurant_name": "Mi Restaurante",
+    "restaurant_name": "Urpicha Restaurante",
     "admin_password": "cambiar123",
     "secret_key": secrets.token_hex(32),
     "order_deadline": "11:30",
@@ -546,8 +546,10 @@ def page(title: str, body: str, extra_head: str = "") -> str:
 <style>
 :root{{--bg:#f4f6f8;--card:#fff;--text:#18212b;--muted:#667085;--brand:#175cd3;--brand2:#0b4bab;--danger:#b42318;--ok:#067647;--line:#e4e7ec}}
 *{{box-sizing:border-box}} body{{margin:0;font-family:Inter,Segoe UI,Arial,sans-serif;background:var(--bg);color:var(--text)}}
-a{{color:var(--brand);text-decoration:none}} .topbar{{background:#101828;color:#fff;padding:14px 20px;display:flex;justify-content:space-between;align-items:center;gap:15px}}
-.topbar strong{{font-size:18px}} .topbar a{{color:#fff}} .wrap{{max-width:1180px;margin:24px auto;padding:0 16px}} .narrow{{max-width:720px}}
+a{{color:var(--brand);text-decoration:none}} .topbar{{background:#101828;color:#fff;padding:10px 20px;display:flex;justify-content:space-between;align-items:center;gap:15px}}
+.topbar-brand{{display:flex;align-items:center;gap:12px;min-width:0}}
+.topbar-logo{{width:52px;height:44px;object-fit:contain;flex:0 0 auto;filter:drop-shadow(0 2px 4px rgba(0,0,0,.28))}}
+.topbar strong{{font-size:18px;line-height:1.2}} .topbar a{{color:#fff}} .wrap{{max-width:1180px;margin:24px auto;padding:0 16px}} .narrow{{max-width:720px}}
 .card{{background:var(--card);border:1px solid var(--line);border-radius:14px;padding:20px;margin-bottom:18px;box-shadow:0 2px 10px rgba(16,24,40,.04)}}
 h1,h2,h3{{margin-top:0}} h1{{font-size:28px}} h2{{font-size:21px}} .muted{{color:var(--muted)}} .grid{{display:grid;gap:16px}} .grid2{{grid-template-columns:repeat(2,minmax(0,1fr))}} .grid3{{grid-template-columns:repeat(3,minmax(0,1fr))}}
 label{{display:block;font-weight:600;margin:12px 0 6px}} input,select,textarea{{width:100%;padding:11px 12px;border:1px solid #d0d5dd;border-radius:9px;font:inherit;background:#fff}} textarea{{min-height:96px;resize:vertical}}
@@ -560,15 +562,15 @@ table{{width:100%;border-collapse:collapse;font-size:14px}} th,td{{border-bottom
 footer{{text-align:center;color:var(--muted);padding:28px 16px;font-size:13px;line-height:1.6;border-top:1px solid var(--line);margin-top:28px}} .support-footer{{max-width:1180px;margin:0 auto}}
 .admin-tabs{{display:flex;gap:8px;flex-wrap:wrap;background:#fff;border:1px solid var(--line);border-radius:12px;padding:8px;margin:0 0 18px;box-shadow:0 2px 10px rgba(16,24,40,.04)}}
 .admin-tabs a{{padding:10px 16px;border-radius:9px;font-weight:800;color:#344054}} .admin-tabs a:hover{{background:#f2f4f7}} .admin-tabs a.active{{background:var(--brand);color:#fff}}
-.brand-watermark{{position:fixed;right:18px;bottom:18px;width:118px;height:118px;object-fit:contain;opacity:.16;z-index:999;pointer-events:none;user-select:none}}
-@media(max-width:760px){{.brand-watermark{{width:82px;height:82px;right:8px;bottom:8px;opacity:.13}}}}
+.brand-watermark{{position:fixed;right:18px;bottom:18px;width:154px;height:154px;object-fit:contain;padding:8px;background:rgba(255,255,255,.90);border:1px solid rgba(16,24,40,.10);border-radius:18px;box-shadow:0 8px 28px rgba(16,24,40,.18);opacity:1;z-index:999;pointer-events:none;user-select:none}}
+@media(max-width:760px){{.brand-watermark{{width:104px;height:104px;right:8px;bottom:8px;padding:5px;border-radius:13px}}}}
 @media(max-width:760px){{.grid2,.grid3{{grid-template-columns:1fr}} .topbar{{align-items:flex-start;flex-direction:column}}}}
 @media print{{.no-print,.topbar,footer,.brand-watermark{{display:none!important}} body{{background:#fff}} .wrap{{max-width:none;margin:0;padding:0}} .card{{border:0;box-shadow:none;padding:0}} .ticket{{page-break-inside:avoid}}}}
 </style>
 {extra_head}
 </head>
 <body>
-<div class="topbar"><strong>{restaurant}</strong></div>
+<div class="topbar"><div class="topbar-brand"><img class="topbar-logo" src="/static/urpicha-logo-header.png" alt="Logo Urpicha"><strong>{restaurant}</strong></div></div>
 <img class="brand-watermark" src="/static/urpicha-logo-watermark.png" alt="" aria-hidden="true">
 {body}
 <footer>
@@ -1204,6 +1206,8 @@ class AppHandler(BaseHTTPRequestHandler):
 </div>"""
             submit = '<button type="submit">Enviar mi pedido</button>'
 
+        observation_html = "" if is_order_closed(requested_date) else '<label>Observación (opcional)</label><textarea name="observaciones" maxlength="300" placeholder="Ejemplo: sin cebolla, poco arroz..."></textarea>'
+
         if public_orders:
             public_order_rows = "".join(
                 f'<li><b>{esc(o["employee_name"])}</b> — pedido registrado a las <b>{esc(o["created_at"][11:16])}</b></li>'
@@ -1276,8 +1280,7 @@ class AppHandler(BaseHTTPRequestHandler):
 {f'<div class="notice ok talma-welcome">Acceso correcto. Hola de nuevo, <b>{esc(talma_employee["nombre"])}</b>.<br><span>Área: {esc(self.display_area("talma", talma_employee["area"]))}</span></div>' if is_talma else ''}
 {'' if is_talma else '<div class="grid grid2">\n<div>\n<label>Nombre y apellido</label>\n<input name="nombre" required maxlength="100" placeholder="Ejemplo: Juan Pérez">\n</div>\n<div>\n<label>Área o sede</label>\n<input name="area" required maxlength="80" placeholder="Ejemplo: RAMPA">\n</div>\n</div>'}
 {menu_html}
-<label>Observación (opcional)</label>
-<textarea name="observaciones" maxlength="300" placeholder="Ejemplo: sin cebolla, poco arroz..."></textarea>
+{observation_html}
 {submit}
 </form>
 </div>
