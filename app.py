@@ -62,9 +62,13 @@ def page(title: str, body: str) -> str:
 .stat b{{display:block;font-size:28px;margin-top:6px}}
 .table-wrap{{overflow:auto}}
 @media(max-width:800px){{.grid3{{grid-template-columns:1fr}}}}
+.brand-watermark{{position:fixed;right:18px;bottom:18px;width:118px;height:118px;object-fit:contain;opacity:.16;z-index:999;pointer-events:none;user-select:none}}
+@media(max-width:800px){{.brand-watermark{{width:82px;height:82px;right:8px;bottom:8px;opacity:.13}}}}
+@media print{{.brand-watermark{{display:none!important}}}}
 </style>
 </head>
-<body>{body}
+<body><img class="brand-watermark" src="/static/urpicha-logo-watermark.png" alt="" aria-hidden="true">
+{body}
 <footer class="site-footer">
 <strong>Soporte del sistema</strong><br>
 Cualquier duda o sugerencia respecto al sistema, comunicarse por:<br>

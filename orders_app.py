@@ -560,13 +560,16 @@ table{{width:100%;border-collapse:collapse;font-size:14px}} th,td{{border-bottom
 footer{{text-align:center;color:var(--muted);padding:28px 16px;font-size:13px;line-height:1.6;border-top:1px solid var(--line);margin-top:28px}} .support-footer{{max-width:1180px;margin:0 auto}}
 .admin-tabs{{display:flex;gap:8px;flex-wrap:wrap;background:#fff;border:1px solid var(--line);border-radius:12px;padding:8px;margin:0 0 18px;box-shadow:0 2px 10px rgba(16,24,40,.04)}}
 .admin-tabs a{{padding:10px 16px;border-radius:9px;font-weight:800;color:#344054}} .admin-tabs a:hover{{background:#f2f4f7}} .admin-tabs a.active{{background:var(--brand);color:#fff}}
+.brand-watermark{{position:fixed;right:18px;bottom:18px;width:118px;height:118px;object-fit:contain;opacity:.16;z-index:999;pointer-events:none;user-select:none}}
+@media(max-width:760px){{.brand-watermark{{width:82px;height:82px;right:8px;bottom:8px;opacity:.13}}}}
 @media(max-width:760px){{.grid2,.grid3{{grid-template-columns:1fr}} .topbar{{align-items:flex-start;flex-direction:column}}}}
-@media print{{.no-print,.topbar,footer{{display:none!important}} body{{background:#fff}} .wrap{{max-width:none;margin:0;padding:0}} .card{{border:0;box-shadow:none;padding:0}} .ticket{{page-break-inside:avoid}}}}
+@media print{{.no-print,.topbar,footer,.brand-watermark{{display:none!important}} body{{background:#fff}} .wrap{{max-width:none;margin:0;padding:0}} .card{{border:0;box-shadow:none;padding:0}} .ticket{{page-break-inside:avoid}}}}
 </style>
 {extra_head}
 </head>
 <body>
 <div class="topbar"><strong>{restaurant}</strong></div>
+<img class="brand-watermark" src="/static/urpicha-logo-watermark.png" alt="" aria-hidden="true">
 {body}
 <footer>
 <div class="support-footer">
@@ -595,6 +598,32 @@ def get_menu(menu_date: str):
         "entrada": [r for r in rows if r["category"] == "entrada"],
         "fondo": [r for r in rows if r["category"] == "fondo"],
     }
+
+
+def get_public_menu(menu_date: str):
+    """Obtiene el menú público y recupera el menú del día si quedó vacío."""
+    menu = get_menu(menu_date)
+    if menu["entrada"] and menu["fondo"]:
+        return menu
+    if menu_date == today_iso():
+        defaults = [
+            ("entrada", "Sopa del día"),
+            ("entrada", "Ensalada fresca"),
+            ("fondo", "Pollo al horno con arroz"),
+            ("fondo", "Lomo saltado"),
+        ]
+        with db() as conn:
+            existing = {(r["category"], r["name"]) for r in conn.execute(
+                "SELECT category,name FROM menu_items WHERE menu_date=?", (menu_date,)
+            ).fetchall()}
+            missing = [(menu_date,c,n) for c,n in defaults if (c,n) not in existing]
+            if missing:
+                conn.executemany(
+                    "INSERT OR IGNORE INTO menu_items(menu_date,category,name) VALUES (?,?,?)", missing
+                )
+                conn.commit()
+        menu = get_menu(menu_date)
+    return menu
 
 
 def session_value() -> str:
@@ -945,6 +974,8 @@ class AppHandler(BaseHTTPRequestHandler):
         self.send_header("X-Content-Type-Options", "nosniff")
         self.send_header("X-Frame-Options", "SAMEORIGIN")
         self.send_header("Referrer-Policy", "same-origin")
+        self.send_header("Cache-Control", "no-store, no-cache, must-revalidate, max-age=0")
+        self.send_header("Pragma", "no-cache")
         if headers:
             for key, value in headers.items():
                 self.send_header(key, value)
@@ -1128,7 +1159,7 @@ class AppHandler(BaseHTTPRequestHandler):
             datetime.strptime(requested_date, "%Y-%m-%d")
         except ValueError:
             requested_date = today_iso()
-        menu = get_menu(requested_date)
+        menu = get_public_menu(requested_date)
         with db() as conn:
             public_orders = conn.execute(
                 """SELECT employee_name, dni, created_at FROM orders
@@ -1142,6 +1173,8 @@ class AppHandler(BaseHTTPRequestHandler):
         elif query.get("error"):
             notice = f'<div class="notice error">{esc(query["error"])}</div>'
 
+        settings = get_order_settings()
+        manual_open = settings["manual_open_date"] == requested_date and not settings["manual_closed"]
         if is_order_closed(requested_date):
             wa=self.whatsapp_link(f"Hola, necesito realizar un pedido fuera de horario para {company['name']}.")
             wa_button=(f'<a class="btn" target="_blank" rel="noopener" href="{esc(wa)}"> Comunicarme por WhatsApp</a>'
@@ -1153,7 +1186,7 @@ class AppHandler(BaseHTTPRequestHandler):
 </div>"""
             submit=""
         elif not menu["entrada"] or not menu["fondo"]:
-            menu_html = '<div class="notice error">Todavía no se ha publicado un menú completo para esta fecha.</div>'
+            menu_html = '<div class="notice error">Todavía no se ha publicado un menú completo para esta fecha. Vuelve a cargar la página después de abrir los pedidos.</div>'
             submit = ""
         else:
             entries = "".join(
@@ -1189,12 +1222,16 @@ class AppHandler(BaseHTTPRequestHandler):
 <p class="muted">Todavía no hay pedidos registrados para esta fecha.</p>
 </div>"""
 
-        if requested_date == today_iso() and not is_order_closed(requested_date):
+        if requested_date == today_iso() and manual_open:
+            countdown_html = f"""<div class="countdown-box" style="background:#ecfdf3;border:2px solid #12b76a;border-radius:14px;padding:14px;text-align:center;margin:14px 0;color:#05603a">
+ <b>Pedidos abiertos manualmente.</b> La hora normal de cierre sigue siendo <b>{esc(format_close_time(settings["closing_time"]))}</b>.
+ </div>"""
+        elif requested_date == today_iso() and not is_order_closed(requested_date):
             remaining = seconds_until_close()
             countdown_html = f"""<div class="countdown-box" style="background:#fff7ed;border:2px solid #f79009;border-radius:14px;padding:14px;text-align:center;margin:14px 0;color:#7a2e0e">
-<b> Quedan <span id="countdown"></span> para el cierre de pedidos de hoy a las {esc(format_close_time())}.</b>
-</div>
-<script>
+ <b>Quedan <span id="countdown"></span> para el cierre de pedidos de hoy a las {esc(format_close_time())}.</b>
+ </div>
+ <script>
 (function(){{
  const end=Date.now()+{remaining}*1000, out=document.getElementById("countdown");
  function tick(){{
@@ -1205,7 +1242,7 @@ class AppHandler(BaseHTTPRequestHandler):
  }}
  tick();
 }})();
-</script>"""
+ </script>"""
         else:
             countdown_html = ""
 
@@ -1226,6 +1263,7 @@ class AppHandler(BaseHTTPRequestHandler):
       <div id="dia-pedido" class="muted" style="margin-top:6px;font-weight:700"></div>
     </div>
     <button type="submit" class="btn secondary">Ver menú de ese día</button>
+     <a class="btn secondary" href="/empresa/{esc(slug)}?token={esc(token)}&fecha={esc(requested_date)}&actualizar=1">Actualizar</a>
   </form>
   <p class="muted" style="margin-bottom:0">Puedes elegir hoy o una fecha futura. El pedido quedará registrado para la fecha seleccionada.</p>
 </div>
@@ -1298,7 +1336,7 @@ class AppHandler(BaseHTTPRequestHandler):
             error = f"Los pedidos del día actual se cierran a las {format_close_time()} (hora de Perú). Si necesita un pedido fuera de horario, comuníquese por WhatsApp para coordinar la entrega."
         if len(name) < 3:
             error = "Ingrese su nombre y apellido."
-        menu = get_menu(order_date)
+        menu = get_public_menu(order_date)
         valid_entries = {r["name"] for r in menu["entrada"]}
         valid_mains = {r["name"] for r in menu["fondo"]}
         if entry not in valid_entries or main not in valid_mains:
