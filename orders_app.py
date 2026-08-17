@@ -16,7 +16,6 @@ import io
 import json
 import os
 import re
-import base64
 import secrets
 import sqlite3
 import sys
@@ -536,17 +535,6 @@ def esc(value: object) -> str:
     return html.escape(str(value), quote=True)
 
 
-def _logo_data_uri(filename: str, mime: str) -> str:
-    """Embebe el logo en el HTML para que no dependa de rutas/proxy de archivos estáticos."""
-    try:
-        raw = (BASE_DIR / "static" / filename).read_bytes()
-        return f"data:{mime};base64," + base64.b64encode(raw).decode("ascii")
-    except (OSError, ValueError):
-        return ""
-
-LOGO_HEADER_URI = _logo_data_uri("urpicha-logo-header.png", "image/png")
-LOGO_WATERMARK_URI = _logo_data_uri("urpicha-logo-watermark.png", "image/png")
-
 def page(title: str, body: str, extra_head: str = "") -> str:
     restaurant = esc(CONFIG.get("restaurant_name", "Mi Restaurante"))
     return f"""<!doctype html>
@@ -560,7 +548,7 @@ def page(title: str, body: str, extra_head: str = "") -> str:
 *{{box-sizing:border-box}} body{{margin:0;font-family:Inter,Segoe UI,Arial,sans-serif;background:var(--bg);color:var(--text)}}
 a{{color:var(--brand);text-decoration:none}} .topbar{{background:#101828;color:#fff;padding:10px 20px;display:flex;justify-content:space-between;align-items:center;gap:15px}}
 .topbar-brand{{display:flex;align-items:center;gap:12px;min-width:0}}
-.topbar-logo{{width:52px;height:44px;object-fit:contain;flex:0 0 auto;filter:drop-shadow(0 2px 4px rgba(0,0,0,.28))}}
+
 .topbar strong{{font-size:18px;line-height:1.2}} .topbar a{{color:#fff}} .wrap{{max-width:1180px;margin:24px auto;padding:0 16px}} .narrow{{max-width:720px}}
 .card{{background:var(--card);border:1px solid var(--line);border-radius:14px;padding:20px;margin-bottom:18px;box-shadow:0 2px 10px rgba(16,24,40,.04)}}
 h1,h2,h3{{margin-top:0}} h1{{font-size:28px}} h2{{font-size:21px}} .muted{{color:var(--muted)}} .grid{{display:grid;gap:16px}} .grid2{{grid-template-columns:repeat(2,minmax(0,1fr))}} .grid3{{grid-template-columns:repeat(3,minmax(0,1fr))}}
@@ -574,16 +562,13 @@ table{{width:100%;border-collapse:collapse;font-size:14px}} th,td{{border-bottom
 footer{{text-align:center;color:var(--muted);padding:28px 16px;font-size:13px;line-height:1.6;border-top:1px solid var(--line);margin-top:28px}} .support-footer{{max-width:1180px;margin:0 auto}}
 .admin-tabs{{display:flex;gap:8px;flex-wrap:wrap;background:#fff;border:1px solid var(--line);border-radius:12px;padding:8px;margin:0 0 18px;box-shadow:0 2px 10px rgba(16,24,40,.04)}}
 .admin-tabs a{{padding:10px 16px;border-radius:9px;font-weight:800;color:#344054}} .admin-tabs a:hover{{background:#f2f4f7}} .admin-tabs a.active{{background:var(--brand);color:#fff}}
-.brand-watermark{{position:fixed;right:18px;bottom:18px;width:154px;height:154px;object-fit:contain;padding:8px;background:rgba(255,255,255,.90);border:1px solid rgba(16,24,40,.10);border-radius:18px;box-shadow:0 8px 28px rgba(16,24,40,.18);opacity:1;z-index:999;pointer-events:none;user-select:none}}
-@media(max-width:760px){{.brand-watermark{{width:104px;height:104px;right:8px;bottom:8px;padding:5px;border-radius:13px}}}}
 @media(max-width:760px){{.grid2,.grid3{{grid-template-columns:1fr}} .topbar{{align-items:flex-start;flex-direction:column}}}}
-@media print{{.no-print,.topbar,footer,.brand-watermark{{display:none!important}} body{{background:#fff}} .wrap{{max-width:none;margin:0;padding:0}} .card{{border:0;box-shadow:none;padding:0}} .ticket{{page-break-inside:avoid}}}}
+@media print{{.no-print,.topbar,footer{{display:none!important}} body{{background:#fff}} .wrap{{max-width:none;margin:0;padding:0}} .card{{border:0;box-shadow:none;padding:0}} .ticket{{page-break-inside:avoid}}}}
 </style>
 {extra_head}
 </head>
 <body>
-<div class="topbar"><div class="topbar-brand"><img class="topbar-logo" src="{LOGO_HEADER_URI}" alt="Logo Urpicha"><strong>{restaurant}</strong></div></div>
-<img class="brand-watermark" src="{LOGO_WATERMARK_URI}" alt="" aria-hidden="true">
+<div class="topbar"><div class="topbar-brand"><strong>{restaurant}</strong></div></div>
 {body}
 <footer>
 <div class="support-footer">
@@ -1737,7 +1722,7 @@ class AppHandler(BaseHTTPRequestHandler):
             orders = conn.execute(
                 f"""SELECT o.*, c.name AS company_name FROM orders o
                     JOIN companies c ON c.id=o.company_id
-                    WHERE {' AND '.join(filters)} ORDER BY o.employee_name COLLATE NOCASE, c.name COLLATE NOCASE, o.created_at""",
+                    WHERE {' AND '.join(filters)} ORDER BY o.created_at DESC, o.id DESC""",
                 args,
             ).fetchall()
             total_today = conn.execute("SELECT COUNT(*) FROM orders WHERE order_date=?", (selected_date,)).fetchone()[0]
@@ -2061,7 +2046,7 @@ class AppHandler(BaseHTTPRequestHandler):
         with db() as conn:
             rows = conn.execute(
                 f"""SELECT o.*, c.name company_name FROM orders o JOIN companies c ON c.id=o.company_id
-                    WHERE {' AND '.join(filters)} ORDER BY o.employee_name COLLATE NOCASE, c.name COLLATE NOCASE, o.created_at""",
+                    WHERE {' AND '.join(filters)} ORDER BY o.created_at DESC, o.id DESC""",
                 args,
             ).fetchall()
         return selected_date, rows
