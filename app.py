@@ -1637,6 +1637,7 @@ def talma_portal():
 
     orders_app.init_db()
     dni_filter = request.args.get("dni", "").strip()[:20]
+    area_filter = request.args.get("area", "").strip().upper()[:40]
     fecha_desde = request.args.get("desde", "").strip()
     fecha_hasta = request.args.get("hasta", "").strip()
 
@@ -1670,6 +1671,9 @@ def talma_portal():
         if dni_filter:
             sql += " AND o.dni=?"
             args.append(dni_filter)
+        if area_filter:
+            sql += " AND UPPER(TRIM(o.area))=?"
+            args.append(area_filter)
         if fecha_desde:
             sql += " AND o.order_date>=?"
             args.append(fecha_desde)
@@ -1702,6 +1706,13 @@ def talma_portal():
                WHERE c.slug='talma' AND o.order_date=?""",
             (today_iso,),
         ).fetchone()[0]
+        area_count_rows = conn.execute(
+            """SELECT UPPER(TRIM(o.area)) AS area, COUNT(*) AS total
+               FROM orders o JOIN companies c ON c.id=o.company_id
+               WHERE c.slug='talma' AND o.order_date>=? AND o.order_date<=?
+               GROUP BY UPPER(TRIM(o.area)) ORDER BY total DESC, area""",
+            (fecha_desde or "0001-01-01", fecha_hasta or "9999-12-31"),
+        ).fetchall()
 
     running = {}
     table_rows = []
@@ -1722,6 +1733,12 @@ def talma_portal():
         summary.append(
             f"<tr><td><b>{esc(dni_label)}</b></td><td>{esc(label)}</td><td>{total}</td></tr>"
         )
+
+    area_counts = {str(r["area"] or "SIN ÁREA"): int(r["total"]) for r in area_count_rows if str(r["area"] or "").strip()}
+    area_cards = "".join(
+        f'<div class="area-stat"><span>{esc(area)}</span><strong>{total}</strong><small>pedidos</small></div>'
+        for area, total in area_counts.items()
+    ) or '<div class="muted">No hay pedidos por área en el período seleccionado.</div>'
 
     if fecha_desde and fecha_hasta:
         periodo_label = (
@@ -1762,14 +1779,27 @@ def talma_portal():
       <label>DNI del trabajador <span class="muted">(opcional)</span></label>
       <input name="dni" value="{esc(dni_filter)}" maxlength="40" placeholder="Ej. 71206879">
     </div>
+    <div>
+      <label>Área</label>
+      <select name="area">
+        <option value="">Todas las áreas</option>
+        {''.join(f'<option value="{esc(a)}" {"selected" if area_filter == a else ""}>{esc(a)}</option>' for a in SISTEMAS["talma"]["areas"])}
+      </select>
+    </div>
   </div>
   <div class="actions filter-actions">
     <button type="submit">Ver resultados</button>
-    <a class="btn secondary" href="/talma/excel?desde={esc(fecha_desde)}&hasta={esc(fecha_hasta)}&dni={esc(dni_filter)}">Generar reporte Excel</a>
-    <a class="btn secondary" href="/talma/cupones?desde={esc(fecha_desde)}&hasta={esc(fecha_hasta)}&dni={esc(dni_filter)}">Generar cupones</a>
+    <a class="btn secondary" href="/talma/excel?desde={esc(fecha_desde)}&hasta={esc(fecha_hasta)}&dni={esc(dni_filter)}&area={esc(area_filter)}">Generar reporte Excel</a>
+    <a class="btn secondary" href="/talma/cupones?desde={esc(fecha_desde)}&hasta={esc(fecha_hasta)}&dni={esc(dni_filter)}&area={esc(area_filter)}">Generar cupones</a>
     <a class="btn secondary" href="/talma">Limpiar filtros</a>
   </div>
 </form>
+</div>
+
+<div class="card talma-summary-card">
+<h2>Pedidos por área — {periodo_label}</h2>
+<div class="area-stats">{area_cards}</div>
+<p class="muted" style="margin:10px 0 0">El conteo usa el rango de fechas seleccionado. Si eliges un área en el filtro, la tabla de pedidos queda limitada a esa área.</p>
 </div>
 
 <div class="card talma-summary-card">
@@ -1795,7 +1825,7 @@ def talma_portal():
 .talma-summary-table th:nth-child(1){width:24%}
 .talma-summary-table th:nth-child(2){width:51%}
 .talma-summary-table th:nth-child(3){width:25%}
-.talma-summary-table td{white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.talma-summary-table td{white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.area-stats{display:grid;grid-template-columns:repeat(auto-fit,minmax(130px,1fr));gap:10px}.area-stat{border:1px solid #e4e7ec;border-radius:14px;padding:12px;text-align:center;background:#f8fafc}.area-stat span{display:block;font-weight:900;font-size:14px}.area-stat strong{display:block;font-size:34px;line-height:1.05;margin:5px 0;color:#198754}.area-stat small{color:#667085}
 </style>"""
     return _talma_page("TALMA", body, extra)
 

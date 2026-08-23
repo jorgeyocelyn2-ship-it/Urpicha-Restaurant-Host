@@ -1519,7 +1519,21 @@ class AppHandler(BaseHTTPRequestHandler):
                    WHEN 'talma' THEN 3 WHEN 'policia' THEN 4 ELSE 5 END, c.name""",
                 (selected_date,)).fetchall()
         grand_total=sum(int(r["total"]) for r in company_rows)
-        cards="".join(f'<div class="big-company-card"><div class="company-name">{esc(r["name"])}</div><div class="company-total">{r["total"]}</div><div class="company-label">MENÚS / PEDIDOS</div></div>' for r in company_rows)
+        talma_total = next((int(r["total"]) for r in company_rows if r["slug"] == "talma"), 0)
+        with db() as conn:
+            talma_pax = int(conn.execute(
+                """SELECT COUNT(*) FROM orders o JOIN companies c ON c.id=o.company_id
+                   WHERE c.slug='talma' AND o.order_date=? AND UPPER(TRIM(o.area))='PAX'""",
+                (selected_date,)
+            ).fetchone()[0])
+        talma_general = max(talma_total - talma_pax, 0)
+        cards=[]
+        for r in company_rows:
+            if r["slug"] == "talma":
+                cards.append(f'<div class="big-company-card"><div class="company-name">TALMA</div><div class="talma-split"><div><span>TALMA</span><strong>{talma_general}</strong></div><div><span>PAX</span><strong>{talma_pax}</strong></div></div><div class="company-label">PEDIDOS DEL DÍA</div></div>')
+            else:
+                cards.append(f'<div class="big-company-card"><div class="company-name">{esc(r["name"])}</div><div class="company-total">{r["total"]}</div><div class="company-label">MENÚS / PEDIDOS</div></div>')
+        cards="".join(cards)
         body=f"""
 <main class="wrap">
 <div class="actions no-print" style="justify-content:space-between;margin-bottom:16px"><h1 style="margin:0"> Resumen de almuerzos</h1><a href="/admin/dashboard">← Panel</a></div>
@@ -1533,7 +1547,7 @@ class AppHandler(BaseHTTPRequestHandler):
         extra="""<style>
 .hero-total{background:linear-gradient(135deg,#101828,#175cd3);color:white;border-radius:24px;padding:32px;text-align:center;margin-bottom:24px;box-shadow:0 14px 40px rgba(16,24,40,.22)}
 .hero-kicker{font-weight:800;letter-spacing:3px;font-size:14px;opacity:.9}.hero-number{font-size:72px;font-weight:900;line-height:1;margin:10px 0}.hero-date{font-size:20px;font-weight:700}
-.company-cards{display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:20px;margin-bottom:24px}.big-company-card{background:white;border:1px solid #e4e7ec;border-radius:22px;padding:26px;text-align:center;box-shadow:0 8px 24px rgba(16,24,40,.08)}.company-name{font-size:25px;font-weight:900}.company-total{font-size:64px;font-weight:900;margin:12px 0;color:#175cd3}.company-label{font-size:13px;font-weight:800;letter-spacing:1.5px;color:#667085}
+.company-cards{display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:20px;margin-bottom:24px}.big-company-card{background:white;border:1px solid #e4e7ec;border-radius:22px;padding:26px;text-align:center;box-shadow:0 8px 24px rgba(16,24,40,.08)}.company-name{font-size:25px;font-weight:900}.company-total{font-size:64px;font-weight:900;margin:12px 0;color:#175cd3}.company-label{font-size:13px;font-weight:800;letter-spacing:1.5px;color:#667085}.talma-split{display:grid;grid-template-columns:1fr 1fr;gap:10px;margin:14px 0 12px}.talma-split>div{border:1px solid #e4e7ec;border-radius:16px;padding:10px 8px;background:#f8fafc}.talma-split span{display:block;font-size:12px;font-weight:900;letter-spacing:1px;color:#667085}.talma-split strong{display:block;font-size:42px;line-height:1.05;margin-top:5px;color:#175cd3}
 </style>"""
         self.send_html(page("Resumen de almuerzos", body, extra))
 
