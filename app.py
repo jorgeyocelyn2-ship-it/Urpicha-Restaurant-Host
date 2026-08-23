@@ -30,6 +30,22 @@ app.jinja_loader = ChoiceLoader([
 ])
 app.secret_key = os.environ.get("SECRET_KEY", "cuponera-v19-dual")
 
+
+def talma_display_area(area):
+    value = str(area or "").strip().upper()
+    compact = re.sub(r"[^A-Z0-9]", "", value)
+    if compact in {"PAX", "PAXHANDLING", "PAXHANDLINGAREA", "FAX"}:
+        return "PAX"
+    if compact in {"RAMPA", "RANPA", "RAMFA", "RAMP"}:
+        return "RAMPA"
+    if compact in {"CARGA", "CARCA", "CARG"}:
+        return "CARGA"
+    if compact == "OMA":
+        return "OMA"
+    return value
+
+
+
 # Configuración compartida del portal TALMA.
 CONFIG = {"secret_key": app.secret_key}
 
@@ -1637,7 +1653,7 @@ def talma_portal():
 
     orders_app.init_db()
     dni_filter = request.args.get("dni", "").strip()[:20]
-    area_filter = request.args.get("area", "").strip().upper()[:40]
+    area_filter = talma_display_area(request.args.get("area", ""))[:40]
     fecha_desde = request.args.get("desde", "").strip()
     fecha_hasta = request.args.get("hasta", "").strip()
 
@@ -1672,8 +1688,11 @@ def talma_portal():
             sql += " AND o.dni=?"
             args.append(dni_filter)
         if area_filter:
-            sql += " AND UPPER(TRIM(o.area))=?"
-            args.append(area_filter)
+            if area_filter == "PAX":
+                sql += " AND (UPPER(TRIM(o.area))='PAX' OR UPPER(REPLACE(TRIM(o.area),' ',''))='PAXHANDLING' OR UPPER(TRIM(o.area))='FAX')"
+            else:
+                sql += " AND UPPER(TRIM(o.area))=?"
+                args.append(area_filter)
         if fecha_desde:
             sql += " AND o.order_date>=?"
             args.append(fecha_desde)
@@ -1707,10 +1726,10 @@ def talma_portal():
             (today_iso,),
         ).fetchone()[0]
         area_count_rows = conn.execute(
-            """SELECT UPPER(TRIM(o.area)) AS area, COUNT(*) AS total
+            """SELECT o.area, COUNT(*) AS total
                FROM orders o JOIN companies c ON c.id=o.company_id
                WHERE c.slug='talma' AND o.order_date>=? AND o.order_date<=?
-               GROUP BY UPPER(TRIM(o.area)) ORDER BY total DESC, area""",
+               GROUP BY o.area""",
             (fecha_desde or "0001-01-01", fecha_hasta or "9999-12-31"),
         ).fetchall()
 
@@ -1721,7 +1740,7 @@ def talma_portal():
         running[key] = running.get(key, 0) + 1
         table_rows.append(
             f"<tr><td>{esc(r['order_date'])}</td><td><b>{esc(r['dni'] or '—')}</b></td><td>{esc(r['employee_name'])}</td>"
-            f"<td>{esc(r['area'])}</td><td>{esc(r['entry_item'])}</td><td>{esc(r['main_item'])}</td>"
+            f"<td>{esc(talma_display_area(r['area']))}</td><td>{esc(r['entry_item'])}</td><td>{esc(r['main_item'])}</td>"
             f"<td>{running[key]}</td><td>{esc((r['created_at'] or '')[11:16])}</td></tr>"
         )
 
@@ -1734,7 +1753,14 @@ def talma_portal():
             f"<tr><td><b>{esc(dni_label)}</b></td><td>{esc(label)}</td><td>{total}</td></tr>"
         )
 
-    area_counts = {str(r["area"] or "SIN ÁREA"): int(r["total"]) for r in area_count_rows if str(r["area"] or "").strip()}
+    area_counts = {}
+    for r in area_count_rows:
+        raw_area = str(r["area"] or "").strip()
+        if not raw_area:
+            continue
+        canonical = talma_display_area(raw_area)
+        area_counts[canonical] = area_counts.get(canonical, 0) + int(r["total"])
+    area_counts = dict(sorted(area_counts.items(), key=lambda item: (-item[1], item[0])))
     area_cards = "".join(
         f'<div class="area-stat"><span>{esc(area)}</span><strong>{total}</strong><small>pedidos</small></div>'
         for area, total in area_counts.items()
@@ -2190,6 +2216,7 @@ def talma_excel():
     fecha_desde = request.args.get("desde", "").strip()
     fecha_hasta = request.args.get("hasta", "").strip()
     dni_filter = request.args.get("dni", "").strip()[:20]
+    area_filter = talma_display_area(request.args.get("area", ""))[:40]
 
     def _valid_iso(value):
         try:
@@ -2214,6 +2241,10 @@ def talma_excel():
         args = []
         if dni_filter:
             sql += " AND o.dni=?"; args.append(dni_filter)
+        if area_filter == "PAX":
+            sql += " AND (UPPER(TRIM(o.area))='PAX' OR UPPER(REPLACE(TRIM(o.area),' ',''))='PAXHANDLING' OR UPPER(TRIM(o.area))='FAX')"
+        elif area_filter:
+            sql += " AND UPPER(TRIM(o.area))=?"; args.append(area_filter)
         if fecha_desde:
             sql += " AND o.order_date>=?"; args.append(fecha_desde)
         if fecha_hasta:
@@ -2229,7 +2260,7 @@ def talma_excel():
     for r in rows:
         key = r["dni"] or f"legacy:{orders_app.normalize_key(r['employee_name'])}"
         counts[key] = counts.get(key, 0) + 1
-        ws.append([r["order_date"], r["dni"], r["employee_name"], r["area"], r["entry_item"], r["main_item"],
+        ws.append([r["order_date"], r["dni"], r["employee_name"], talma_display_area(r["area"]), r["entry_item"], r["main_item"],
                    r["notes"], counts[key], (r["created_at"] or "")[11:16]])
     for i, width in enumerate([14, 14, 34, 16, 32, 36, 40, 14, 10], 1):
         ws.column_dimensions[get_column_letter(i)].width = width

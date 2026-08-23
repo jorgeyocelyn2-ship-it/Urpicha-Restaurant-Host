@@ -649,6 +649,21 @@ def valid_session(value: str | None) -> bool:
 
 
 
+def normalize_talma_area(area: str) -> str:
+    """Devuelve el nombre estándar del área TALMA para reportes y filtros."""
+    value = str(area or "").strip().upper()
+    compact = re.sub(r"[^A-Z0-9]", "", value)
+    if compact in {"PAX", "PAXHANDLING", "PAXHANDLINGAREA", "FAX"}:
+        return "PAX"
+    if compact in {"RAMPA", "RANPA", "RAMFA", "RAMP"}:
+        return "RAMPA"
+    if compact in {"CARGA", "CARCA", "CARG"}:
+        return "CARGA"
+    if compact == "OMA":
+        return "OMA"
+    return value
+
+
 def resolve_talma_login(email: str, dni: str):
     email = email.strip().lower()
     dni = dni.strip()
@@ -1523,7 +1538,12 @@ class AppHandler(BaseHTTPRequestHandler):
         with db() as conn:
             talma_pax = int(conn.execute(
                 """SELECT COUNT(*) FROM orders o JOIN companies c ON c.id=o.company_id
-                   WHERE c.slug='talma' AND o.order_date=? AND UPPER(TRIM(o.area))='PAX'""",
+                   WHERE c.slug='talma' AND o.order_date=?
+                     AND (
+                        UPPER(TRIM(o.area))='PAX'
+                        OR UPPER(REPLACE(TRIM(o.area),' ',''))='PAXHANDLING'
+                        OR UPPER(TRIM(o.area))='FAX'
+                     )""",
                 (selected_date,)
             ).fetchone()[0])
         talma_general = max(talma_total - talma_pax, 0)
@@ -1614,7 +1634,15 @@ class AppHandler(BaseHTTPRequestHandler):
 
     def reopen_orders(self) -> None:
         settings = get_order_settings()
-        set_order_settings(closing_time=settings["closing_time"], manual_open_date=today_iso(), manual_closed=False)
+        # Dentro del horario normal, una reapertura manual vuelve al estado
+        # normal y no muestra el aviso "Pedidos abiertos manualmente".
+        close_dt = _today_close_datetime()
+        manual_open_date = "" if local_now() < close_dt else today_iso()
+        set_order_settings(
+            closing_time=settings["closing_time"],
+            manual_open_date=manual_open_date,
+            manual_closed=False,
+        )
         self.redirect("/admin/pedidos/configuracion?ok=1")
 
     def close_orders_manual(self) -> None:
