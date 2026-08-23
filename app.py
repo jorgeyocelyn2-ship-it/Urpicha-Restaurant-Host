@@ -1780,13 +1780,17 @@ def talma_portal():
             f"<td>{running[key]}</td><td>{esc((r['created_at'] or '')[11:16])}</td></tr>"
         )
 
+    summary_groups = {}
+    for r in rows:
+        area = talma_display_area(r["area"]) or "SIN ÁREA"
+        person = str(r["employee_name"] or "").strip() or "SIN NOMBRE"
+        key = (area, person)
+        summary_groups[key] = summary_groups.get(key, 0) + 1
+
     summary = []
-    for dni_key, total in sorted(counts.items(), key=lambda x: x[0]):
-        rr = next((r for r in rows if (r["dni"] or f"legacy:{orders_app.normalize_key(r['employee_name'])}") == dni_key), None)
-        label = rr["employee_name"] if rr else dni_key
-        dni_label = rr["dni"] if rr and rr["dni"] else "Sin DNI (registro antiguo)"
+    for (area, person), total in sorted(summary_groups.items(), key=lambda item: (item[0][0], item[0][1].upper())):
         summary.append(
-            f"<tr><td><b>{esc(dni_label)}</b></td><td>{esc(label)}</td><td>{total}</td></tr>"
+            f"<tr><td>{esc(area)}</td><td>{esc(person)}</td><td><b>{total}</b></td></tr>"
         )
 
     area_counts = {}
@@ -1865,8 +1869,8 @@ def talma_portal():
 </div>
 
 <div class="card talma-summary-card">
-<h2>Resumen por DNI — {periodo_label}</h2>
-<div class="table-wrap"><table class="talma-summary-table"><thead><tr><th>DNI</th><th>Persona</th><th>Total almuerzos</th></tr></thead>
+<h2>Resumen por área y persona — {periodo_label}</h2>
+<div class="table-wrap talma-summary-wrap"><table class="talma-summary-table"><thead><tr><th>Área</th><th>Persona</th><th>Total pedidos</th></tr></thead>
 <tbody>{''.join(summary) or '<tr><td colspan="3">No hay pedidos en este período.</td></tr>'}</tbody></table></div>
 </div>
 
@@ -1882,12 +1886,11 @@ def talma_portal():
 .highlight-stat b{font-size:34px}.period-stat b{font-size:20px;line-height:1.25;font-weight:750}.period-stat{min-height:0}
 .talma-summary-card{padding:14px 18px;margin-bottom:16px}
 .talma-summary-card h2{font-size:20px;line-height:1.25;margin:0 0 10px}
-.talma-summary-table{table-layout:fixed;font-size:14px}
-.talma-summary-table th,.talma-summary-table td{padding:6px 9px;line-height:1.25}
-.talma-summary-table th:nth-child(1){width:24%}
-.talma-summary-table th:nth-child(2){width:51%}
-.talma-summary-table th:nth-child(3){width:25%}
-.talma-summary-table td{white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.area-stats{display:grid;grid-template-columns:repeat(auto-fit,minmax(130px,1fr));gap:10px}.area-stat{border:1px solid #e4e7ec;border-radius:14px;padding:12px;text-align:center;background:#f8fafc}.area-stat span{display:block;font-weight:900;font-size:14px}.area-stat strong{display:block;font-size:34px;line-height:1.05;margin:5px 0;color:#198754}.area-stat small{color:#667085}
+.talma-summary-wrap{overflow-x:auto}
+.talma-summary-table{display:inline-table;width:max-content;min-width:0;table-layout:auto;font-size:14px}
+.talma-summary-table th,.talma-summary-table td{padding:4px 7px;line-height:1.2;white-space:nowrap}
+.talma-summary-table td:last-child,.talma-summary-table th:last-child{text-align:center}
+.area-stats{display:grid;grid-template-columns:repeat(auto-fit,minmax(130px,1fr));gap:10px}.area-stat{border:1px solid #e4e7ec;border-radius:14px;padding:12px;text-align:center;background:#f8fafc}.area-stat span{display:block;font-weight:900;font-size:14px}.area-stat strong{display:block;font-size:34px;line-height:1.05;margin:5px 0;color:#198754}.area-stat small{color:#667085}
 </style>"""
     return _talma_page("TALMA", body, extra)
 
@@ -2290,32 +2293,35 @@ def talma_excel():
         rows = conn.execute(sql, args).fetchall()
     wb = Workbook()
     ws = wb.active
-    ws.title = "Pedidos TALMA"
-    headers = ["Fecha", "DNI", "Persona", "Área", "Entrada", "Plato de fondo", "Observación", "N° Almuerzo", "Hora"]
-    ws.append(headers)
-    counts = {}
+    ws.title = "Resumen TALMA"
+
+    # El reporte Excel refleja exactamente el resumen visible del panel:
+    # una fila por combinación Área + Persona y el total de pedidos.
+    grouped = {}
     for r in rows:
-        key = r["dni"] or f"legacy:{orders_app.normalize_key(r['employee_name'])}"
-        counts[key] = counts.get(key, 0) + 1
-        ws.append([r["order_date"], r["dni"], r["employee_name"], talma_display_area(r["area"]), r["entry_item"], r["main_item"],
-                   r["notes"], counts[key], (r["created_at"] or "")[11:16]])
-    for i, width in enumerate([14, 14, 34, 16, 32, 36, 40, 14, 10], 1):
-        ws.column_dimensions[get_column_letter(i)].width = width
+        area = talma_display_area(r["area"]) or "SIN ÁREA"
+        person = str(r["employee_name"] or "").strip() or "SIN NOMBRE"
+        key = (area, person)
+        grouped[key] = grouped.get(key, 0) + 1
+
+    ws.append(["Área", "Persona", "Total pedidos"])
+    for (area, person), total in sorted(grouped.items(), key=lambda item: (item[0][0], item[0][1].upper())):
+        ws.append([area, person, total])
+
     for cell in ws[1]:
         cell.font = Font(bold=True, color="FFFFFF")
         cell.fill = PatternFill("solid", fgColor="176B43")
-        cell.alignment = Alignment(horizontal="center")
+        cell.alignment = Alignment(horizontal="center", vertical="center")
     for row in ws.iter_rows(min_row=2):
         for cell in row:
-            cell.alignment = Alignment(vertical="top", wrap_text=True)
-    summary = wb.create_sheet("Resumen")
-    summary.append(["DNI", "PERSONA", "TOTAL ALMUERZOS"])
-    for key, total in sorted(counts.items()):
-        rr = next((r for r in rows if (r["dni"] or f"legacy:{orders_app.normalize_key(r['employee_name'])}") == key), None)
-        summary.append([rr["dni"] if rr and rr["dni"] else "Sin DNI", rr["employee_name"] if rr else key, total])
-    summary.column_dimensions["A"].width = 16
-    summary.column_dimensions["B"].width = 34
-    summary.column_dimensions["C"].width = 20
+            cell.alignment = Alignment(vertical="center")
+
+    # Anchos compactos: solo lo necesario para el contenido de cada columna.
+    for col_idx, column_cells in enumerate(ws.columns, start=1):
+        max_len = max(len(str(cell.value or "")) for cell in column_cells)
+        ws.column_dimensions[get_column_letter(col_idx)].width = min(max(max_len + 2, 8), 60)
+    ws.freeze_panes = "A2"
+    ws.auto_filter.ref = ws.dimensions
     output = io.BytesIO()
     wb.save(output)
     output.seek(0)
