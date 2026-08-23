@@ -45,6 +45,37 @@ def talma_display_area(area):
     return value
 
 
+def talma_area_sql_filter(area):
+    """Devuelve una condición SQL robusta para el filtro de áreas TALMA.
+
+    Los registros históricos pueden contener pequeñas variaciones de formato
+    (espacios, puntos, guiones, etc.) o nombres equivalentes como
+    PAXHANDLING/FAX. Se normalizan igual que talma_display_area().
+    """
+    canonical = talma_display_area(area)
+    if not canonical:
+        return "", []
+
+    # SQLite no dispone de REGEXP por defecto. Encadenamos REPLACE para
+    # quitar los separadores más habituales y comparar la versión compacta.
+    compact_sql = (
+        "REPLACE(REPLACE(REPLACE(REPLACE(REPLACE("
+        "UPPER(TRIM(o.area)),' ',''),'.',''),'-',''),'/',''),'_','')"
+    )
+    aliases = {
+        "PAX": ("PAX", "PAXHANDLING", "PAXHANDLINGAREA", "FAX"),
+        "RAMPA": ("RAMPA", "RANPA", "RAMFA", "RAMP"),
+        "CARGA": ("CARGA", "CARCA", "CARG"),
+        "OMA": ("OMA",),
+    }
+    values = aliases.get(canonical)
+    if values:
+        placeholders = ",".join("?" for _ in values)
+        return f"{compact_sql} IN ({placeholders})", list(values)
+
+    return "UPPER(TRIM(o.area))=?", [canonical]
+
+
 
 # Configuración compartida del portal TALMA.
 CONFIG = {"secret_key": app.secret_key}
@@ -1688,11 +1719,10 @@ def talma_portal():
             sql += " AND o.dni=?"
             args.append(dni_filter)
         if area_filter:
-            if area_filter == "PAX":
-                sql += " AND (UPPER(TRIM(o.area))='PAX' OR UPPER(REPLACE(TRIM(o.area),' ',''))='PAXHANDLING' OR UPPER(TRIM(o.area))='FAX')"
-            else:
-                sql += " AND UPPER(TRIM(o.area))=?"
-                args.append(area_filter)
+            area_sql, area_args = talma_area_sql_filter(area_filter)
+            if area_sql:
+                sql += " AND " + area_sql
+                args.extend(area_args)
         if fecha_desde:
             sql += " AND o.order_date>=?"
             args.append(fecha_desde)
@@ -1725,13 +1755,19 @@ def talma_portal():
                WHERE c.slug='talma' AND o.order_date=?""",
             (today_iso,),
         ).fetchone()[0]
-        area_count_rows = conn.execute(
+        area_count_sql = (
             """SELECT o.area, COUNT(*) AS total
                FROM orders o JOIN companies c ON c.id=o.company_id
-               WHERE c.slug='talma' AND o.order_date>=? AND o.order_date<=?
-               GROUP BY o.area""",
-            (fecha_desde or "0001-01-01", fecha_hasta or "9999-12-31"),
-        ).fetchall()
+               WHERE c.slug='talma' AND o.order_date>=? AND o.order_date<=?"""
+        )
+        area_count_args = [fecha_desde or "0001-01-01", fecha_hasta or "9999-12-31"]
+        if area_filter:
+            area_sql, area_args = talma_area_sql_filter(area_filter)
+            if area_sql:
+                area_count_sql += " AND " + area_sql
+                area_count_args.extend(area_args)
+        area_count_sql += " GROUP BY o.area"
+        area_count_rows = conn.execute(area_count_sql, area_count_args).fetchall()
 
     running = {}
     table_rows = []
@@ -2241,10 +2277,11 @@ def talma_excel():
         args = []
         if dni_filter:
             sql += " AND o.dni=?"; args.append(dni_filter)
-        if area_filter == "PAX":
-            sql += " AND (UPPER(TRIM(o.area))='PAX' OR UPPER(REPLACE(TRIM(o.area),' ',''))='PAXHANDLING' OR UPPER(TRIM(o.area))='FAX')"
-        elif area_filter:
-            sql += " AND UPPER(TRIM(o.area))=?"; args.append(area_filter)
+        if area_filter:
+            area_sql, area_args = talma_area_sql_filter(area_filter)
+            if area_sql:
+                sql += " AND " + area_sql
+                args.extend(area_args)
         if fecha_desde:
             sql += " AND o.order_date>=?"; args.append(fecha_desde)
         if fecha_hasta:
@@ -2297,6 +2334,8 @@ def talma_cupones():
     fecha_desde = request.args.get("desde", "").strip()
     fecha_hasta = request.args.get("hasta", "").strip()
     dni_filter = request.args.get("dni", "").strip()[:20]
+    area_filter = talma_display_area(request.args.get("area", ""))[:40]
+    area_filter = talma_display_area(request.args.get("area", ""))[:40]
 
     def _valid_iso(value):
         try:
@@ -2326,6 +2365,11 @@ def talma_cupones():
         if dni_filter:
             sql += " AND o.dni=?"
             args.append(dni_filter)
+        if area_filter:
+            area_sql, area_args = talma_area_sql_filter(area_filter)
+            if area_sql:
+                sql += " AND " + area_sql
+                args.extend(area_args)
         if fecha_desde:
             sql += " AND o.order_date>=?"
             args.append(fecha_desde)
