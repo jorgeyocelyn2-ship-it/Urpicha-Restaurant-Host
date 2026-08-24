@@ -1524,7 +1524,9 @@ def create_excel(sistema):
     fecha_desde = request.args.get("desde", "").strip()
     fecha_hasta = request.args.get("hasta", "").strip()
     dni_filter = request.args.get("dni", "").strip()[:20]
-    area_filter = talma_display_area(request.args.get("area", ""))[:40] if sistema == "talma" else ""
+    # Un DNI identifica a una persona; cuando existe, el filtro por área queda desactivado
+    # para evitar combinaciones ambiguas.
+    area_filter = (talma_display_area(request.args.get("area", ""))[:40] if sistema == "talma" and not dni_filter else "")
 
     def _valid_iso(value):
         try:
@@ -1637,6 +1639,9 @@ def create_excel(sistema):
         else:
             report_title = f"PEDIDOS TALMA — {period_excel}"
             file_identity = "historial"
+
+        # La identidad del reporte se usa también en el nombre del archivo para
+        # que ambos Excel sean fáciles de distinguir al descargarlos.
 
         sheet.merge_cells(start_row=1, start_column=1, end_row=1, end_column=len(detailed_headers))
         title_cell = sheet.cell(row=1, column=1, value=report_title)
@@ -1845,7 +1850,8 @@ def talma_portal():
 
     orders_app.init_db()
     dni_filter = request.args.get("dni", "").strip()[:20]
-    area_filter = talma_display_area(request.args.get("area", ""))[:40]
+    # Si se consulta por DNI, el área no se puede combinar con ese filtro.
+    area_filter = talma_display_area(request.args.get("area", ""))[:40] if not dni_filter else ""
     fecha_desde = request.args.get("desde", "").strip()
     fecha_hasta = request.args.get("hasta", "").strip()
 
@@ -2007,8 +2013,8 @@ def talma_portal():
       <input name="dni" value="{esc(dni_filter)}" maxlength="40" placeholder="Ej. 71206879">
     </div>
     <div>
-      <label>Área</label>
-      <select name="area">
+      <label>Área <span id="area-help" class="muted">(se bloquea al ingresar DNI)</span></label>
+      <select id="talma-area-filter" name="area" {"disabled" if dni_filter else ""}>
         <option value="">Todas las áreas</option>
         {''.join(f'<option value="{esc(a)}" {"selected" if area_filter == a else ""}>{esc(a)}</option>' for a in SISTEMAS["talma"]["areas"])}
       </select>
@@ -2023,6 +2029,21 @@ def talma_portal():
   </div>
 </form>
 </div>
+<script>
+(function(){{
+  const dni = document.querySelector('input[name="dni"]');
+  const area = document.getElementById('talma-area-filter');
+  if (!dni || !area) return;
+  function syncArea(){{
+    const hasDni = dni.value.trim().length > 0;
+    area.disabled = hasDni;
+    if (hasDni) area.value = '';
+    area.title = hasDni ? 'El área se desactiva cuando se consulta por DNI.' : '';
+  }}
+  dni.addEventListener('input', syncArea);
+  syncArea();
+}})();
+</script>
 
 <div class="card talma-summary-card">
 <h2>Pedidos por área — {periodo_label}</h2>
@@ -2417,7 +2438,8 @@ def talma_excel():
     fecha_desde = request.args.get("desde", "").strip()
     fecha_hasta = request.args.get("hasta", "").strip()
     dni_filter = request.args.get("dni", "").strip()[:20]
-    area_filter = talma_display_area(request.args.get("area", ""))[:40]
+    # Si se consulta por DNI, el área no se puede combinar con ese filtro.
+    area_filter = talma_display_area(request.args.get("area", ""))[:40] if not dni_filter else ""
 
     def _valid_iso(value):
         try:
@@ -2526,10 +2548,50 @@ def talma_excel():
     ws.auto_filter.ref = f"A4:D{ws.max_row}"
     ws.sheet_view.showGridLines = False
     ws.sheet_view.zoomScale = 100
+
+    # El nombre/encabezado identifica automáticamente persona o área, igual
+    # que el Excel detallado, para que ambos reportes sean consistentes.
+    unique_names = []
+    for r in rows:
+        name = str(r["employee_name"] or "").strip()
+        if name and name not in unique_names:
+            unique_names.append(name)
+
+    def _summary_period_label():
+        if fecha_desde and fecha_hasta:
+            d1 = datetime.strptime(fecha_desde, "%Y-%m-%d")
+            d2 = datetime.strptime(fecha_hasta, "%Y-%m-%d")
+            if d1.date() == d2.date():
+                return d1.strftime("%d-%m-%Y")
+            if d1.year == d2.year:
+                return f"{d1:%d-%m} al {d2:%d-%m %Y}"
+            return f"{d1:%d-%m-%Y} al {d2:%d-%m-%Y}"
+        return "Todo el historial"
+
+    period_for_name = _summary_period_label()
+    if dni_filter and unique_names:
+        summary_identity = person_key(unique_names[0]).replace(" ", "_")[:50]
+        summary_title = f"PEDIDOS {unique_names[0]} — {period_for_name}"
+        if rows:
+            detected_area = talma_display_area(rows[0]["area"] or "").strip()
+            if detected_area:
+                summary_title = f"PEDIDOS {unique_names[0]} — {detected_area} — {period_for_name}"
+                summary_identity = f"{summary_identity}_{detected_area.replace(' ', '_')}"[:65]
+    elif area_filter:
+        summary_identity = talma_display_area(area_filter).replace(" ", "_")
+        summary_title = f"PEDIDOS TALMA {area_filter} — {period_for_name}"
+    else:
+        summary_identity = "historial"
+        summary_title = f"PEDIDOS TALMA — {period_for_name}"
+
+    # Amplía el título del resumen para que tenga el mismo identificador visual
+    # que el reporte detallado.
+    ws["A1"] = summary_title
+
     output = io.BytesIO()
     wb.save(output)
     output.seek(0)
-    suffix = f"_{fecha_desde}_a_{fecha_hasta}" if fecha_desde and fecha_hasta else "_historial_completo"
+    suffix = f"_{summary_identity}_{fecha_desde}_a_{fecha_hasta}" if fecha_desde and fecha_hasta else f"_{summary_identity}_historial_completo"
     return send_file(output, as_attachment=True, download_name=f"pedidos_talma{suffix}.xlsx",
                      mimetype="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
 
@@ -2544,7 +2606,8 @@ def talma_cupones():
     fecha_desde = request.args.get("desde", "").strip()
     fecha_hasta = request.args.get("hasta", "").strip()
     dni_filter = request.args.get("dni", "").strip()[:20]
-    area_filter = talma_display_area(request.args.get("area", ""))[:40]
+    # Si se consulta por DNI, el área no se puede combinar con ese filtro.
+    area_filter = talma_display_area(request.args.get("area", ""))[:40] if not dni_filter else ""
     area_filter = talma_display_area(request.args.get("area", ""))[:40]
 
     def _valid_iso(value):
