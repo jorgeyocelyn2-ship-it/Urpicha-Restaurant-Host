@@ -1516,23 +1516,136 @@ def prepare_orders_sheet(workbook, headers, preserve_accents=False):
 @app.get("/admin/<any(talma,policia):sistema>/excel")
 def create_excel(sistema):
     c = cfg(sistema)
-    rows = load_rows(sistema)
-    if not rows:
-        raise RuntimeError("No hay pedidos guardados para exportar.")
+
+    # Para TALMA, este es el Excel detallado/"anterior". Debe respetar
+    # exactamente el período y los filtros que el usuario tenga en /talma.
+    fecha_desde = request.args.get("desde", "").strip()
+    fecha_hasta = request.args.get("hasta", "").strip()
+    dni_filter = request.args.get("dni", "").strip()[:20]
+    area_filter = talma_display_area(request.args.get("area", ""))[:40] if sistema == "talma" else ""
+
+    def _valid_iso(value):
+        try:
+            datetime.strptime(value, "%Y-%m-%d")
+            return True
+        except ValueError:
+            return False
+
+    if fecha_desde and not _valid_iso(fecha_desde):
+        fecha_desde = ""
+    if fecha_hasta and not _valid_iso(fecha_hasta):
+        fecha_hasta = ""
+    if fecha_desde and not fecha_hasta:
+        fecha_hasta = fecha_desde
+    if fecha_hasta and not fecha_desde:
+        fecha_desde = fecha_hasta
+    if fecha_desde and fecha_hasta and fecha_desde > fecha_hasta:
+        fecha_desde, fecha_hasta = fecha_hasta, fecha_desde
+
+    if sistema == "talma":
+        orders_app.init_db()
+        with orders_app.db() as conn:
+            sql = """SELECT o.id, o.order_date, o.employee_name, o.dni, o.area,
+                           o.entry_item, o.main_item, o.notes, o.delivery_type,
+                           o.created_at
+                    FROM orders o
+                    JOIN companies c ON c.id=o.company_id
+                    WHERE c.slug='talma'"""
+            args = []
+            if fecha_desde:
+                sql += " AND o.order_date>=?"
+                args.append(fecha_desde)
+            if fecha_hasta:
+                sql += " AND o.order_date<=?"
+                args.append(fecha_hasta)
+            if dni_filter:
+                sql += " AND o.dni=?"
+                args.append(dni_filter)
+            if area_filter:
+                area_sql, area_args = talma_area_sql_filter(area_filter)
+                if area_sql:
+                    sql += " AND " + area_sql
+                    args.extend(area_args)
+            sql += " ORDER BY o.order_date ASC, o.employee_name COLLATE NOCASE ASC, o.id ASC"
+            db_rows = conn.execute(sql, args).fetchall()
+
+        if not db_rows:
+            raise RuntimeError("No hay pedidos TALMA que coincidan con los filtros seleccionados.")
+
+        # Mantener el formato detallado histórico: Registro, Fecha, Sede, Código,
+        # Nombre, N° Almuerzo, Área, Entrada, Segundo y Observación.
+        rows = []
+        lunch_numbers = Counter()
+        for r in db_rows:
+            name = clean_text(str(r["employee_name"] or ""), preserve_accents=True)
+            key = person_key(name)
+            lunch_numbers[key] += 1
+            rows.append({
+                "registro": clean_text(str(r["created_at"] or ""), preserve_accents=True),
+                "fecha": str(r["order_date"] or ""),
+                "sede": "TALMA",
+                "codigo": "",
+                "nombre": name,
+                "N° Almuerzo": lunch_numbers[key],
+                "area": talma_display_area(r["area"]),
+                "entrada": clean_text(str(r["entry_item"] or ""), preserve_accents=True),
+                "segundo": clean_text(str(r["main_item"] or ""), preserve_accents=True),
+                "observacion": clean_text(str(r["notes"] or ""), preserve_accents=True),
+            })
+    else:
+        rows = load_rows(sistema)
+        if not rows:
+            raise RuntimeError("No hay pedidos guardados para exportar.")
+
     OUTPUTS.mkdir(parents=True, exist_ok=True)
-    output = OUTPUTS / f"pedidos_{c['pdf_prefix']}_{datetime.now():%Y_%m}.xlsx"
     workbook = Workbook()
     sheet = workbook.active
     sheet.title = "Pedidos"
     sheet.append(c["excel_headers"])
-    append_orders(sheet, rows, c["cols"], preserve_accents=(sistema == "policia"))
-    recompute_lunch_numbers(sheet, c["excel_headers"])
-    total = count_order_rows(sheet, c["excel_headers"])
-    period = order_date_label(rows, "fecha") if sistema == "talma" else datetime.now().strftime("%d/%m/%Y")
-    append_summary(sheet, added_count=len(rows), accumulated_total=total, cols_count=len(c["excel_headers"]), period_label=period)
+
+    if sistema == "talma":
+        for row in rows:
+            sheet.append([
+                row["registro"], row["fecha"], row["sede"], row["codigo"],
+                row["nombre"], row["N° Almuerzo"], row["area"],
+                row["entrada"], row["segundo"], row["observacion"]
+            ])
+        # Para compatibilidad con el formato histórico, el N° Almuerzo ya viene
+        # calculado en el orden cronológico del período exportado.
+        total = len(rows)
+        if fecha_desde and fecha_hasta:
+            if fecha_desde == fecha_hasta:
+                period = orders_app.fecha_con_dia(fecha_desde)
+            else:
+                period = f"del {orders_app.fecha_con_dia(fecha_desde)} al {orders_app.fecha_con_dia(fecha_hasta)}"
+        else:
+            period = "Todo el historial"
+    else:
+        append_orders(sheet, rows, c["cols"], preserve_accents=False)
+        recompute_lunch_numbers(sheet, c["excel_headers"])
+        total = count_order_rows(sheet, c["excel_headers"])
+        period = order_date_label(rows, "fecha")
+
+    append_summary(
+        sheet,
+        added_count=total,
+        accumulated_total=total,
+        cols_count=len(c["excel_headers"]),
+        period_label=period,
+    )
     append_person_summary(sheet, c["excel_headers"])
     style_orders_sheet(sheet, c["excel_widths"])
+
+    output = OUTPUTS / f"pedidos_{c['pdf_prefix']}_{datetime.now():%Y_%m}_detallado.xlsx"
     workbook.save(output)
+
+    if sistema == "talma":
+        suffix = (f"_{fecha_desde}_a_{fecha_hasta}" if fecha_desde and fecha_hasta else "_historial_completo")
+        return send_file(
+            output, as_attachment=True,
+            download_name=f"pedidos_talma_detallado{suffix}.xlsx",
+            mimetype="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+        )
     return send_file(output, as_attachment=True, download_name=output.name)
 
 
@@ -1856,7 +1969,7 @@ def talma_portal():
   <div class="actions filter-actions">
     <button type="submit">Ver resultados</button>
     <a class="btn secondary" href="/talma/excel?desde={esc(fecha_desde)}&hasta={esc(fecha_hasta)}&dni={esc(dni_filter)}&area={esc(area_filter)}">Generar reporte Excel</a>
-    <a class="btn secondary" href="/admin/talma/excel">Excel detallado (anterior)</a>
+    <a class="btn secondary" href="/admin/talma/excel?desde={esc(fecha_desde)}&hasta={esc(fecha_hasta)}&dni={esc(dni_filter)}&area={esc(area_filter)}">Excel detallado (anterior)</a>
     <a class="btn secondary" href="/talma/cupones?desde={esc(fecha_desde)}&hasta={esc(fecha_hasta)}&dni={esc(dni_filter)}&area={esc(area_filter)}">Generar cupones</a>
     <a class="btn secondary" href="/talma">Limpiar filtros</a>
   </div>
