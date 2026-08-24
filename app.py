@@ -1321,7 +1321,7 @@ def sheet_date_range(sheet, date_col_index=2):
     return f"{lo.strftime('%d/%m/%Y')} - {hi.strftime('%d/%m/%Y')}"
 
 
-def style_orders_sheet(sheet, widths):
+def style_orders_sheet(sheet, widths, header_row=1, data_start_row=None):
     header_fill = PatternFill("solid", fgColor="176B43")
     header_font = Font(color="FFFFFF", bold=True)
     thin = Border(
@@ -1330,14 +1330,16 @@ def style_orders_sheet(sheet, widths):
         top=Side(style="thin", color="B0B0B0"),
         bottom=Side(style="thin", color="B0B0B0"),
     )
+    if data_start_row is None:
+        data_start_row = header_row + 1
     for col_idx, width in enumerate(widths, start=1):
         sheet.column_dimensions[get_column_letter(col_idx)].width = width
-    for cell in sheet[1]:
+    for cell in sheet[header_row]:
         cell.fill = header_fill
         cell.font = header_font
         cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
         cell.border = thin
-    for row in sheet.iter_rows(min_row=2, max_row=sheet.max_row, max_col=len(widths)):
+    for row in sheet.iter_rows(min_row=data_start_row, max_row=sheet.max_row, max_col=len(widths)):
         for cell in row:
             cell.border = thin
             cell.alignment = Alignment(vertical="center", wrap_text=True)
@@ -1420,7 +1422,7 @@ def recompute_lunch_numbers(sheet, headers):
         sheet.cell(row=row_idx, column=num_col).value = counts[key]
 
 
-def append_person_summary(sheet, headers):
+def append_person_summary(sheet, headers, data_start_row=2):
     """Añade al final de la hoja el total acumulado de almuerzos por persona."""
     name_col = headers.index("Nombre") + 1 if "Nombre" in headers else (
         headers.index("Nombre y apellido") + 1 if "Nombre y apellido" in headers else None
@@ -1429,7 +1431,7 @@ def append_person_summary(sheet, headers):
         return
     counts = Counter()
     labels = {}
-    for row_idx in range(2, sheet.max_row + 1):
+    for row_idx in range(data_start_row, sheet.max_row + 1):
         value = clean_text_unicode(str(sheet.cell(row=row_idx, column=name_col).value or "")).strip()
         if not value:
             continue
@@ -1581,6 +1583,7 @@ def create_excel(sistema):
             key = person_key(name)
             lunch_numbers[key] += 1
             rows.append({
+                "dni": str(r["dni"] or ""),
                 "registro": clean_text(str(r["created_at"] or ""), preserve_accents=True),
                 "fecha": str(r["order_date"] or ""),
                 "sede": "TALMA",
@@ -1601,26 +1604,62 @@ def create_excel(sistema):
     workbook = Workbook()
     sheet = workbook.active
     sheet.title = "Pedidos"
-    sheet.append(c["excel_headers"])
 
     if sistema == "talma":
+        detailed_headers = ["DNI", "Registro", "Fecha", "Sede", "Código", "Nombre", "N° Almuerzo", "Área", "Entrada", "Segundo", "Observación"]
+
+        unique_names = []
+        for row in rows:
+            name = clean_text(str(row["nombre"] or ""), preserve_accents=True).strip()
+            if name and name not in unique_names:
+                unique_names.append(name)
+
+        def _excel_period_label():
+            if fecha_desde and fecha_hasta:
+                d1 = datetime.strptime(fecha_desde, "%Y-%m-%d")
+                d2 = datetime.strptime(fecha_hasta, "%Y-%m-%d")
+                if d1.year == d2.year:
+                    if d1.date() == d2.date():
+                        return d1.strftime("%d-%m-%Y")
+                    return f"{d1:%d-%m} al {d2:%d-%m %Y}"
+                return f"{d1:%d-%m-%Y} al {d2:%d-%m-%Y}"
+            return "Todo el historial"
+
+        period_excel = _excel_period_label()
+        if dni_filter and unique_names:
+            report_title = f"PEDIDOS {unique_names[0]} — {period_excel}"
+            if area_filter:
+                report_title = f"PEDIDOS {unique_names[0]} — {area_filter} — {period_excel}"
+            file_identity = person_key(unique_names[0]).replace(" ", "_")[:50]
+        elif area_filter:
+            report_title = f"PEDIDOS TALMA {area_filter} — {period_excel}"
+            file_identity = talma_display_area(area_filter).replace(" ", "_")
+        else:
+            report_title = f"PEDIDOS TALMA — {period_excel}"
+            file_identity = "historial"
+
+        sheet.merge_cells(start_row=1, start_column=1, end_row=1, end_column=len(detailed_headers))
+        title_cell = sheet.cell(row=1, column=1, value=report_title)
+        title_cell.font = Font(bold=True, size=18, color="FFFFFF")
+        title_cell.fill = PatternFill("solid", fgColor="176B43")
+        title_cell.alignment = Alignment(horizontal="center", vertical="center")
+        sheet.row_dimensions[1].height = 30
+
+        sheet.append(detailed_headers)
         for row in rows:
             sheet.append([
-                row["registro"], row["fecha"], row["sede"], row["codigo"],
-                row["nombre"], row["N° Almuerzo"], row["area"],
-                row["entrada"], row["segundo"], row["observacion"]
+                row["dni"], row["registro"], row["fecha"], row["sede"], row["codigo"],
+                row["nombre"], row["N° Almuerzo"], row["area"], row["entrada"],
+                row["segundo"], row["observacion"]
             ])
-        # Para compatibilidad con el formato histórico, el N° Almuerzo ya viene
-        # calculado en el orden cronológico del período exportado.
         total = len(rows)
-        if fecha_desde and fecha_hasta:
-            if fecha_desde == fecha_hasta:
-                period = orders_app.fecha_con_dia(fecha_desde)
-            else:
-                period = f"del {orders_app.fecha_con_dia(fecha_desde)} al {orders_app.fecha_con_dia(fecha_hasta)}"
-        else:
-            period = "Todo el historial"
+        period = (
+            orders_app.fecha_con_dia(fecha_desde)
+            if fecha_desde and fecha_hasta and fecha_desde == fecha_hasta
+            else (f"del {orders_app.fecha_con_dia(fecha_desde)} al {orders_app.fecha_con_dia(fecha_hasta)}" if fecha_desde and fecha_hasta else "Todo el historial")
+        )
     else:
+        sheet.append(c["excel_headers"])
         append_orders(sheet, rows, c["cols"], preserve_accents=False)
         recompute_lunch_numbers(sheet, c["excel_headers"])
         total = count_order_rows(sheet, c["excel_headers"])
@@ -1630,11 +1669,20 @@ def create_excel(sistema):
         sheet,
         added_count=total,
         accumulated_total=total,
-        cols_count=len(c["excel_headers"]),
+        cols_count=(len(detailed_headers) if sistema == "talma" else len(c["excel_headers"])),
         period_label=period,
     )
-    append_person_summary(sheet, c["excel_headers"])
-    style_orders_sheet(sheet, c["excel_widths"])
+
+    if sistema == "talma":
+        talma_widths = [14, 24, 14, 12, 14, 32, 14, 14, 28, 34, 50]
+        style_orders_sheet(sheet, talma_widths, header_row=2, data_start_row=3)
+        sheet.freeze_panes = "A3"
+        if total:
+            sheet.auto_filter.ref = f"A2:{get_column_letter(len(detailed_headers))}{2 + total}"
+        append_person_summary(sheet, detailed_headers, data_start_row=3)
+    else:
+        append_person_summary(sheet, c["excel_headers"])
+        style_orders_sheet(sheet, c["excel_widths"])
 
     output = OUTPUTS / f"pedidos_{c['pdf_prefix']}_{datetime.now():%Y_%m}_detallado.xlsx"
     workbook.save(output)
@@ -1643,7 +1691,7 @@ def create_excel(sistema):
         suffix = (f"_{fecha_desde}_a_{fecha_hasta}" if fecha_desde and fecha_hasta else "_historial_completo")
         return send_file(
             output, as_attachment=True,
-            download_name=f"pedidos_talma_detallado{suffix}.xlsx",
+            download_name=f"pedidos_talma_{file_identity}{suffix}.xlsx",
             mimetype="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
         )
     return send_file(output, as_attachment=True, download_name=output.name)
