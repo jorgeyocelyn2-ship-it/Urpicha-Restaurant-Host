@@ -1856,6 +1856,7 @@ def talma_portal():
   <div class="actions filter-actions">
     <button type="submit">Ver resultados</button>
     <a class="btn secondary" href="/talma/excel?desde={esc(fecha_desde)}&hasta={esc(fecha_hasta)}&dni={esc(dni_filter)}&area={esc(area_filter)}">Generar reporte Excel</a>
+    <a class="btn secondary" href="/admin/talma/excel">Excel detallado (anterior)</a>
     <a class="btn secondary" href="/talma/cupones?desde={esc(fecha_desde)}&hasta={esc(fecha_hasta)}&dni={esc(dni_filter)}&area={esc(area_filter)}">Generar cupones</a>
     <a class="btn secondary" href="/talma">Limpiar filtros</a>
   </div>
