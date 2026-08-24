@@ -2296,32 +2296,74 @@ def talma_excel():
     ws.title = "Resumen TALMA"
 
     # El reporte Excel refleja exactamente el resumen visible del panel:
-    # una fila por combinación Área + Persona y el total de pedidos.
+    # una fila por combinación DNI + Área + Persona y el total de pedidos.
     grouped = {}
     for r in rows:
+        dni = str(r["dni"] or "").strip() or "—"
         area = talma_display_area(r["area"]) or "SIN ÁREA"
         person = str(r["employee_name"] or "").strip() or "SIN NOMBRE"
-        key = (area, person)
+        key = (dni, area, person)
         grouped[key] = grouped.get(key, 0) + 1
 
-    ws.append(["Área", "Persona", "Total pedidos"])
-    for (area, person), total in sorted(grouped.items(), key=lambda item: (item[0][0], item[0][1].upper())):
-        ws.append([area, person, total])
+    # Encabezado visual amplio para que el archivo sea legible de inmediato
+    # y muestre el período usado para generar el reporte.
+    if fecha_desde and fecha_hasta:
+        if fecha_desde == fecha_hasta:
+            period_label = orders_app.fecha_con_dia(fecha_desde)
+        else:
+            period_label = f"del {orders_app.fecha_con_dia(fecha_desde)} al {orders_app.fecha_con_dia(fecha_hasta)}"
+    else:
+        period_label = "Todo el historial"
 
-    for cell in ws[1]:
-        cell.font = Font(bold=True, color="FFFFFF")
-        cell.fill = PatternFill("solid", fgColor="176B43")
+    ws.merge_cells("A1:D1")
+    ws["A1"] = "REPORTE TALMA — RESUMEN DE PEDIDOS"
+    ws["A1"].font = Font(bold=True, size=18, color="FFFFFF")
+    ws["A1"].fill = PatternFill("solid", fgColor="176B43")
+    ws["A1"].alignment = Alignment(horizontal="center", vertical="center")
+    ws.row_dimensions[1].height = 30
+
+    ws.merge_cells("A2:D2")
+    ws["A2"] = f"Período consultado: {period_label}"
+    ws["A2"].font = Font(bold=True, size=12, color="17324D")
+    ws["A2"].fill = PatternFill("solid", fgColor="EAF4EF")
+    ws["A2"].alignment = Alignment(horizontal="center", vertical="center")
+    ws.row_dimensions[2].height = 22
+
+    ws.append([])  # fila 3: separación visual
+    ws.append(["DNI", "Área", "Persona", "Total pedidos"])
+
+    header_fill = PatternFill("solid", fgColor="176B43")
+    header_font = Font(bold=True, color="FFFFFF", size=11)
+    thin = Side(style="thin", color="D6DEE5")
+    for cell in ws[4]:
+        cell.font = header_font
+        cell.fill = header_fill
         cell.alignment = Alignment(horizontal="center", vertical="center")
-    for row in ws.iter_rows(min_row=2):
+        cell.border = Border(left=thin, right=thin, top=thin, bottom=thin)
+    ws.row_dimensions[4].height = 24
+
+    for (dni, area, person), total in sorted(
+        grouped.items(),
+        key=lambda item: (item[0][1].upper(), item[0][2].upper(), item[0][0])
+    ):
+        ws.append([dni, area, person, total])
+
+    for row in ws.iter_rows(min_row=5, max_row=ws.max_row):
         for cell in row:
             cell.alignment = Alignment(vertical="center")
+            cell.border = Border(left=thin, right=thin, top=thin, bottom=thin)
+        row[3].alignment = Alignment(horizontal="center", vertical="center")
 
-    # Anchos compactos: solo lo necesario para el contenido de cada columna.
-    for col_idx, column_cells in enumerate(ws.columns, start=1):
-        max_len = max(len(str(cell.value or "")) for cell in column_cells)
-        ws.column_dimensions[get_column_letter(col_idx)].width = min(max(max_len + 2, 8), 60)
-    ws.freeze_panes = "A2"
-    ws.auto_filter.ref = ws.dimensions
+    # Anchos equilibrados: el reporte ocupa una zona cómoda de una pantalla
+    # de laptop sin generar columnas gigantes. La Persona recibe más espacio.
+    ws.column_dimensions["A"].width = 14
+    ws.column_dimensions["B"].width = 24
+    ws.column_dimensions["C"].width = 42
+    ws.column_dimensions["D"].width = 16
+    ws.freeze_panes = "A5"
+    ws.auto_filter.ref = f"A4:D{ws.max_row}"
+    ws.sheet_view.showGridLines = False
+    ws.sheet_view.zoomScale = 100
     output = io.BytesIO()
     wb.save(output)
     output.seek(0)
