@@ -1723,7 +1723,10 @@ class AppHandler(BaseHTTPRequestHandler):
 <input name="dni" inputmode="numeric" maxlength="8" minlength="8" pattern="[0-9]{{8}}" required placeholder="Ejemplo: 71206879">
 <p class="muted" style="margin-top:6px">El sistema identificará automáticamente nombre y área desde la base de personas TALMA. El DNI es el único identificador de la persona.</p>
 """
-            extra_fields = ""
+            extra_fields = f"""
+<label>Observación</label>
+<textarea name="observaciones" maxlength="300" placeholder="Ejemplo: sin cebolla, poco arroz..."></textarea>
+"""
         else:
             manual_person_fields = f"""
 <label>Nombre y apellido *</label><input name="nombre" maxlength="100" required placeholder="Ejemplo: Juan Pérez">
