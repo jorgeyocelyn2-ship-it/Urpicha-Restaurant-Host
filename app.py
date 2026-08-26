@@ -1951,13 +1951,14 @@ def talma_portal():
     for r in rows:
         area = talma_display_area(r["area"]) or "SIN ÁREA"
         person = str(r["employee_name"] or "").strip() or "SIN NOMBRE"
-        key = (area, person)
+        dni = str(r["dni"] or "").strip() or "—"
+        key = (area, person, dni)
         summary_groups[key] = summary_groups.get(key, 0) + 1
 
     summary = []
-    for (area, person), total in sorted(summary_groups.items(), key=lambda item: (item[0][0], item[0][1].upper())):
+    for (area, person, dni), total in sorted(summary_groups.items(), key=lambda item: (item[0][0], item[0][1].upper(), item[0][2])):
         summary.append(
-            f"<tr><td>{esc(area)}</td><td>{esc(person)}</td><td><b>{total}</b></td></tr>"
+            f"<tr><td>{esc(area)}</td><td>{esc(person)}</td><td><b>{esc(dni)}</b></td><td><b>{total}</b></td></tr>"
         )
 
     area_counts = {}
@@ -2022,8 +2023,8 @@ def talma_portal():
   </div>
   <div class="actions filter-actions">
     <button type="submit">Ver resultados</button>
-    <a class="btn secondary" href="/talma/excel?desde={esc(fecha_desde)}&hasta={esc(fecha_hasta)}&dni={esc(dni_filter)}&area={esc(area_filter)}">Generar reporte Excel</a>
-    <a class="btn secondary" href="/admin/talma/excel?desde={esc(fecha_desde)}&hasta={esc(fecha_hasta)}&dni={esc(dni_filter)}&area={esc(area_filter)}">Excel detallado (anterior)</a>
+    <a class="btn talma-summary-report" href="/talma/excel?desde={esc(fecha_desde)}&hasta={esc(fecha_hasta)}&dni={esc(dni_filter)}&area={esc(area_filter)}">Generar reporte resumido</a>
+    <a class="btn secondary" href="/admin/talma/excel?desde={esc(fecha_desde)}&hasta={esc(fecha_hasta)}&dni={esc(dni_filter)}&area={esc(area_filter)}">Generar reporte Excel detallado</a>
     <a class="btn secondary" href="/talma/cupones?desde={esc(fecha_desde)}&hasta={esc(fecha_hasta)}&dni={esc(dni_filter)}&area={esc(area_filter)}">Generar cupones</a>
     <a class="btn secondary" href="/talma">Limpiar filtros</a>
   </div>
@@ -2053,8 +2054,8 @@ def talma_portal():
 
 <div class="card talma-summary-card">
 <h2>Resumen por área y persona — {periodo_label}</h2>
-<div class="table-wrap talma-summary-wrap"><table class="talma-summary-table"><thead><tr><th>Área</th><th>Persona</th><th>Total pedidos</th></tr></thead>
-<tbody>{''.join(summary) or '<tr><td colspan="3">No hay pedidos en este período.</td></tr>'}</tbody></table></div>
+<div class="table-wrap talma-summary-wrap"><table class="talma-summary-table"><thead><tr><th>Área</th><th>Persona</th><th>DNI</th><th>Total pedidos</th></tr></thead>
+<tbody>{''.join(summary) or '<tr><td colspan="4">No hay pedidos en este período.</td></tr>'}</tbody></table></div>
 </div>
 
 <div class="card">
@@ -2072,7 +2073,7 @@ def talma_portal():
 .talma-summary-wrap{overflow-x:auto}
 .talma-summary-table{display:inline-table;width:max-content;min-width:0;table-layout:auto;font-size:14px}
 .talma-summary-table th,.talma-summary-table td{padding:4px 7px;line-height:1.2;white-space:nowrap}
-.talma-summary-table td:last-child,.talma-summary-table th:last-child{text-align:center}
+.talma-summary-table td:nth-child(3),.talma-summary-table th:nth-child(3),.talma-summary-table td:last-child,.talma-summary-table th:last-child{text-align:center}.talma-summary-report{background:#dc2626!important;border-color:#dc2626!important;color:#fff!important}.talma-summary-report:hover{background:#b91c1c!important;border-color:#b91c1c!important}
 .area-stats{display:grid;grid-template-columns:repeat(auto-fit,minmax(130px,1fr));gap:10px}.area-stat{border:1px solid #e4e7ec;border-radius:14px;padding:12px;text-align:center;background:#f8fafc}.area-stat span{display:block;font-weight:900;font-size:14px}.area-stat strong{display:block;font-size:34px;line-height:1.05;margin:5px 0;color:#198754}.area-stat small{color:#667085}
 </style>"""
     return _talma_page("TALMA", body, extra)

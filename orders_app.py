@@ -664,6 +664,44 @@ def normalize_talma_area(area: str) -> str:
     return value
 
 
+def get_talma_person_by_dni(dni: str):
+    """Busca una persona TALMA exclusivamente por DNI.
+
+    La identidad de TALMA para pedidos se basa en el DNI, tanto si la
+    persona proviene del Excel oficial como si fue registrada manualmente.
+    """
+    dni = str(dni or "").strip()
+    if not dni:
+        return None
+
+    # Primero revisar personas manuales, que también tienen DNI único.
+    with db() as conn:
+        exists = conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name='talma_manual_users'"
+        ).fetchone()
+        if exists:
+            row = conn.execute(
+                "SELECT email,dni,employee_name,area,active FROM talma_manual_users WHERE dni=? AND active=1",
+                (dni,),
+            ).fetchone()
+            if row:
+                return {
+                    "email": row["email"],
+                    "dni": row["dni"],
+                    "nombre": row["employee_name"],
+                    "area": row["area"],
+                    "manual": True,
+                }
+
+    # Después, la base oficial de TALMA. Se indexa por DNI y no por correo.
+    for record in TALMA_ROSTER.values():
+        if str(record.get("dni", "")).strip() == dni:
+            result = dict(record)
+            result["manual"] = False
+            return result
+    return None
+
+
 def resolve_talma_login(email: str, dni: str):
     email = email.strip().lower()
     dni = dni.strip()
@@ -1664,6 +1702,13 @@ class AppHandler(BaseHTTPRequestHandler):
             ).fetchall()
         menu = get_menu(requested_date)
         company_id = query.get("empresa", "")
+        selected_slug = ""
+        for company in companies:
+            if company_id == str(company["id"]):
+                selected_slug = str(company["slug"])
+                break
+        is_talma = selected_slug == "talma"
+
         message = '<div class="notice ok">Pedido manual registrado correctamente.</div>' if query.get("ok")=="1" else (
             f'<div class="notice error">{esc(query["error"])}</div>' if query.get("error") else "")
         company_options = "".join(
@@ -1671,6 +1716,25 @@ class AppHandler(BaseHTTPRequestHandler):
             for c in companies)
         entry_options = "".join(f'<option value="{esc(x["name"])}">{esc(x["name"])}</option>' for x in menu["entrada"])
         main_options = "".join(f'<option value="{esc(x["name"])}">{esc(x["name"])}</option>' for x in menu["fondo"])
+
+        if is_talma:
+            manual_person_fields = f"""
+<label>DNI del trabajador *</label>
+<input name="dni" inputmode="numeric" maxlength="8" minlength="8" pattern="[0-9]{{8}}" required placeholder="Ejemplo: 71206879">
+<p class="muted" style="margin-top:6px">El sistema identificará automáticamente nombre y área desde la base de personas TALMA. El DNI es el único identificador de la persona.</p>
+"""
+            extra_fields = ""
+        else:
+            manual_person_fields = f"""
+<label>Nombre y apellido *</label><input name="nombre" maxlength="100" required placeholder="Ejemplo: Juan Pérez">
+<label>DNI</label><input name="dni" maxlength="20" placeholder="Opcional">
+<label>Área o sede</label><input name="area" maxlength="80" placeholder="Ejemplo: RAMPA">
+"""
+            extra_fields = f"""
+<label>Observación</label><textarea name="observaciones" maxlength="300" placeholder="Ejemplo: sin cebolla"></textarea>
+<label>Modalidad de entrega</label><select name="delivery_type"><option value="Entrega en empresa">Entrega en empresa</option><option value="Para llevar">Para llevar</option></select>
+"""
+
         body=f"""
 <main class="wrap narrow">
 <div class="actions no-print" style="justify-content:space-between;margin-bottom:16px">
@@ -1687,16 +1751,13 @@ class AppHandler(BaseHTTPRequestHandler):
 <div class="card">
 <form method="post" action="/admin/pedidos/manual">
 <input type="hidden" name="fecha" value="{esc(requested_date)}">
-<label>Empresa</label><select name="empresa_id" required><option value="">Seleccionar empresa</option>{company_options}</select>
-<label>Nombre y apellido *</label><input name="nombre" maxlength="100" required placeholder="Ejemplo: Juan Pérez">
-<label>DNI</label><input name="dni" maxlength="20" placeholder="Opcional">
-<label>Área o sede</label><input name="area" maxlength="80" placeholder="Ejemplo: RAMPA">
+<input type="hidden" name="empresa_id" value="{esc(company_id)}">
+{manual_person_fields}
 <div class="grid grid2">
 <div><label>Entrada *</label><select name="entrada" required><option value="">Seleccionar entrada</option>{entry_options}</select></div>
 <div><label>Plato de fondo *</label><select name="fondo" required><option value="">Seleccionar plato</option>{main_options}</select></div>
 </div>
-<label>Observación</label><textarea name="observaciones" maxlength="300" placeholder="Ejemplo: sin cebolla"></textarea>
-<label>Modalidad de entrega</label><select name="delivery_type"><option value="Entrega en empresa">Entrega en empresa</option><option value="Para llevar">Para llevar</option></select>
+{extra_fields}
 <button type="submit" style="margin-top:14px">Registrar pedido manual</button>
 </form>
 </div>
@@ -1717,25 +1778,62 @@ class AppHandler(BaseHTTPRequestHandler):
         try: datetime.strptime(order_date,"%Y-%m-%d")
         except ValueError:
             self.redirect("/admin/pedidos/manual?error=Fecha+inválida"); return
-        if not company_id.isdigit() or len(name)<3 or not entry or not main:
+        if not company_id.isdigit() or not entry or not main:
             self.redirect(f"/admin/pedidos/manual?{urlencode({'fecha':order_date,'empresa':company_id,'error':'Completa los campos obligatorios'})}"); return
+
         with db() as conn:
             company=conn.execute("SELECT * FROM companies WHERE id=? AND active=1",(int(company_id),)).fetchone()
             menu=get_menu(order_date)
             valid_entries={r["name"] for r in menu["entrada"]}
             valid_mains={r["name"] for r in menu["fondo"]}
-            if not company: error="Empresa inválida."
-            elif entry not in valid_entries or main not in valid_mains: error="La entrada o el plato de fondo no pertenecen al menú de esa fecha."
-            else: error=None
+            error=None
+            if not company:
+                error="Empresa inválida."
+            elif entry not in valid_entries or main not in valid_mains:
+                error="La entrada o el plato de fondo no pertenecen al menú de esa fecha."
+
+            if not error and company["slug"] == "talma":
+                dni = re.sub(r"\D", "", dni)
+                if len(dni) != 8:
+                    error="Ingresa un DNI TALMA válido de 8 dígitos."
+                else:
+                    person = get_talma_person_by_dni(dni)
+                    if not person:
+                        error=f"No se encontró una persona TALMA con el DNI {dni}."
+                    else:
+                        # Para TALMA el DNI es la identidad única y se reutilizan
+                        # automáticamente el nombre y el área de la base oficial.
+                        name = str(person.get("nombre") or "").strip()
+                        area = str(person.get("area") or "").strip()
+                        employee_key = f"talma:{dni}"
+                        email = str(person.get("email") or "").strip().lower()
+                        login_code = ""
+                        login_email = email
+            elif not error:
+                if len(name) < 3:
+                    error="Completa el nombre y apellido."
+                else:
+                    employee_key=f"manual:{secrets.token_hex(10)}"
+                    login_code = ""
+                    login_email = ""
+
             if error:
                 self.redirect(f"/admin/pedidos/manual?{urlencode({'fecha':order_date,'empresa':company_id,'error':error})}"); return
-            employee_key=f"manual:{secrets.token_hex(10)}"
-            conn.execute(
-                """INSERT INTO orders(company_id,order_date,employee_name,employee_key,dni,area,
-                   entry_item,main_item,notes,delivery_type,created_at,login_code,login_email)
-                   VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)""",
-                (company["id"],order_date,name,employee_key,dni,area,entry,main,notes,delivery,now_iso(),"",""))
-            conn.commit()
+
+            try:
+                conn.execute(
+                    """INSERT INTO orders(company_id,order_date,employee_name,employee_key,dni,area,
+                       entry_item,main_item,notes,delivery_type,created_at,login_code,login_email)
+                       VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                    (company["id"],order_date,name,employee_key,dni,area,entry,main,notes,delivery,now_iso(),login_code,login_email))
+                conn.commit()
+            except sqlite3.IntegrityError as exc:
+                if company["slug"] == "talma" and "UNIQUE" in str(exc).upper():
+                    error=f"El DNI {dni} ya tiene un pedido registrado para el {order_date}."
+                else:
+                    error="No se pudo registrar el pedido porque ya existe un registro equivalente."
+                self.redirect(f"/admin/pedidos/manual?{urlencode({'fecha':order_date,'empresa':company_id,'error':error})}"); return
+
         self.redirect(f"/admin/pedidos/manual?{urlencode({'fecha':order_date,'empresa':company_id,'ok':'1'})}")
 
     def admin_dashboard(self, query: dict[str, str]) -> None:
