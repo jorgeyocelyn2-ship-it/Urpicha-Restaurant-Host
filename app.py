@@ -3,7 +3,7 @@ from flask import Flask, render_template, render_template_string, request, send_
 from jinja2 import ChoiceLoader, FileSystemLoader, DictLoader
 from markupsafe import escape
 from pathlib import Path
-from datetime import datetime
+from datetime import datetime, timedelta
 from PIL import Image, ImageOps, ImageEnhance
 from reportlab.pdfgen import canvas
 from reportlab.lib.pagesizes import A4
@@ -2024,6 +2024,7 @@ def talma_portal():
   <div class="actions filter-actions">
     <button type="submit">Ver resultados</button>
     <a class="btn talma-summary-report" href="/talma/excel?desde={esc(fecha_desde)}&hasta={esc(fecha_hasta)}&dni={esc(dni_filter)}&area={esc(area_filter)}">Generar reporte resumido</a>
+    <a class="btn talma-calendar-report" href="/talma/excel-calendario?desde={esc(fecha_desde)}&hasta={esc(fecha_hasta)}&dni={esc(dni_filter)}&area={esc(area_filter)}">Excel calendario</a>
     <a class="btn secondary" href="/admin/talma/excel?desde={esc(fecha_desde)}&hasta={esc(fecha_hasta)}&dni={esc(dni_filter)}&area={esc(area_filter)}">Generar reporte Excel detallado</a>
     <a class="btn secondary" href="/talma/cupones?desde={esc(fecha_desde)}&hasta={esc(fecha_hasta)}&dni={esc(dni_filter)}&area={esc(area_filter)}">Generar cupones</a>
     <a class="btn secondary" href="/talma">Limpiar filtros</a>
@@ -2073,7 +2074,7 @@ def talma_portal():
 .talma-summary-wrap{overflow-x:auto}
 .talma-summary-table{display:inline-table;width:max-content;min-width:0;table-layout:auto;font-size:14px}
 .talma-summary-table th,.talma-summary-table td{padding:4px 7px;line-height:1.2;white-space:nowrap}
-.talma-summary-table td:nth-child(3),.talma-summary-table th:nth-child(3),.talma-summary-table td:last-child,.talma-summary-table th:last-child{text-align:center}.talma-summary-report{background:#dc2626!important;border-color:#dc2626!important;color:#fff!important}.talma-summary-report:hover{background:#b91c1c!important;border-color:#b91c1c!important}
+.talma-summary-table td:nth-child(3),.talma-summary-table th:nth-child(3),.talma-summary-table td:last-child,.talma-summary-table th:last-child{text-align:center}.talma-summary-report{background:#dc2626!important;border-color:#dc2626!important;color:#fff!important}.talma-summary-report:hover{background:#b91c1c!important;border-color:#b91c1c!important}.talma-calendar-report{background:#2563eb!important;border-color:#2563eb!important;color:#fff!important}.talma-calendar-report:hover{background:#1d4ed8!important;border-color:#1d4ed8!important}
 .area-stats{display:grid;grid-template-columns:repeat(auto-fit,minmax(130px,1fr));gap:10px}.area-stat{border:1px solid #e4e7ec;border-radius:14px;padding:12px;text-align:center;background:#f8fafc}.area-stat span{display:block;font-weight:900;font-size:14px}.area-stat strong{display:block;font-size:34px;line-height:1.05;margin:5px 0;color:#198754}.area-stat small{color:#667085}
 </style>"""
     return _talma_page("TALMA", body, extra)
@@ -2594,6 +2595,137 @@ def talma_excel():
     output.seek(0)
     suffix = f"_{summary_identity}_{fecha_desde}_a_{fecha_hasta}" if fecha_desde and fecha_hasta else f"_{summary_identity}_historial_completo"
     return send_file(output, as_attachment=True, download_name=f"pedidos_talma{suffix}.xlsx",
+                     mimetype="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+
+
+@app.get("/talma/excel-calendario")
+def talma_excel_calendario():
+    """Genera una matriz calendario: personas por fila, fechas por columna y X por pedido."""
+    if not _valid_talma_session(request.cookies.get("talma_session")):
+        return _talma_login()
+
+    orders_app.init_db()
+    fecha_desde = request.args.get("desde", "").strip()
+    fecha_hasta = request.args.get("hasta", "").strip()
+    dni_filter = request.args.get("dni", "").strip()[:20]
+    area_filter = talma_display_area(request.args.get("area", ""))[:40] if not dni_filter else ""
+
+    def _valid_iso(value):
+        try:
+            return datetime.strptime(value, "%Y-%m-%d")
+        except ValueError:
+            return None
+
+    desde_dt = _valid_iso(fecha_desde) if fecha_desde else None
+    hasta_dt = _valid_iso(fecha_hasta) if fecha_hasta else None
+    if not desde_dt:
+        fecha_desde = ""
+    if not hasta_dt:
+        fecha_hasta = ""
+    if fecha_desde and not fecha_hasta:
+        fecha_hasta, hasta_dt = fecha_desde, desde_dt
+    if fecha_hasta and not fecha_desde:
+        fecha_desde, desde_dt = fecha_hasta, hasta_dt
+    if desde_dt and hasta_dt and desde_dt > hasta_dt:
+        fecha_desde, fecha_hasta = fecha_hasta, fecha_desde
+        desde_dt, hasta_dt = hasta_dt, desde_dt
+
+    with orders_app.db() as conn:
+        sql = """SELECT o.order_date, o.employee_name, o.dni, o.area
+                 FROM orders o JOIN companies c ON c.id=o.company_id
+                 WHERE c.slug='talma'"""
+        args = []
+        if dni_filter:
+            sql += " AND o.dni=?"; args.append(dni_filter)
+        if area_filter:
+            area_sql, area_args = talma_area_sql_filter(area_filter)
+            if area_sql:
+                sql += " AND " + area_sql
+                args.extend(area_args)
+        if fecha_desde:
+            sql += " AND o.order_date>=?"; args.append(fecha_desde)
+        if fecha_hasta:
+            sql += " AND o.order_date<=?"; args.append(fecha_hasta)
+        sql += " ORDER BY o.employee_name COLLATE NOCASE, o.dni, o.order_date, o.id"
+        rows = conn.execute(sql, args).fetchall()
+
+    # Una columna por día. Con rango explícito se conservan también los días sin pedidos.
+    order_dates = sorted({str(row["order_date"] or "")[:10] for row in rows if row["order_date"]})
+    if not fecha_desde and order_dates:
+        desde_dt = datetime.strptime(order_dates[0], "%Y-%m-%d")
+    if not fecha_hasta and order_dates:
+        hasta_dt = datetime.strptime(order_dates[-1], "%Y-%m-%d")
+    calendar_dates = []
+    if desde_dt and hasta_dt:
+        current = desde_dt
+        while current <= hasta_dt:
+            calendar_dates.append(current.date())
+            current += timedelta(days=1)
+
+    people = {}
+    for row in rows:
+        name = str(row["employee_name"] or "").strip() or "SIN NOMBRE"
+        dni = str(row["dni"] or "").strip()
+        key = (dni, person_key(name))
+        item = people.setdefault(key, {"name": name, "dates": Counter(), "total": 0})
+        item["dates"][str(row["order_date"] or "")[:10]] += 1
+        item["total"] += 1
+
+    wb = Workbook()
+    ws = wb.active
+    ws.title = "Calendario TALMA"
+    headers = ["PERSONA"] + [date_value for date_value in calendar_dates] + ["TOTAL ALMUERZOS"]
+    last_col = len(headers)
+    last_letter = get_column_letter(last_col)
+    ws.merge_cells(start_row=1, start_column=1, end_row=1, end_column=last_col)
+    ws.cell(1, 1).value = "CALENDARIO DE ALMUERZOS — TALMA"
+    ws.cell(1, 1).font = Font(bold=True, size=16, color="FFFFFF")
+    ws.cell(1, 1).fill = PatternFill("solid", fgColor="176B43")
+    ws.cell(1, 1).alignment = Alignment(horizontal="center", vertical="center")
+    ws.row_dimensions[1].height = 28
+
+    ws.append(headers)
+    header_fill = PatternFill("solid", fgColor="176B43")
+    date_fill = PatternFill("solid", fgColor="E7EDF1")
+    total_fill = PatternFill("solid", fgColor="176B43")
+    thin = Side(style="thin", color="808080")
+    border = Border(left=thin, right=thin, top=thin, bottom=thin)
+    for col_idx, cell in enumerate(ws[2], start=1):
+        cell.font = Font(bold=True, color="FFFFFF" if col_idx in (1, last_col) else "17212B")
+        cell.fill = header_fill if col_idx in (1, last_col) else date_fill
+        cell.alignment = Alignment(horizontal="center", vertical="center")
+        cell.border = border
+        if 1 < col_idx < last_col:
+            cell.number_format = "dd/mm/yyyy"
+    ws.row_dimensions[2].height = 24
+
+    for item in sorted(people.values(), key=lambda value: value["name"].casefold()):
+        values = [item["name"]]
+        values.extend("X" if item["dates"].get(date_value.isoformat(), 0) else "" for date_value in calendar_dates)
+        values.append(item["total"])
+        ws.append(values)
+
+    for row in ws.iter_rows(min_row=3, max_row=ws.max_row, max_col=last_col):
+        for col_idx, cell in enumerate(row, start=1):
+            cell.border = border
+            cell.alignment = Alignment(horizontal="center" if col_idx != 1 else "left", vertical="center")
+            if col_idx == last_col:
+                cell.font = Font(bold=True)
+                cell.fill = PatternFill("solid", fgColor="EAF4EF")
+    ws.column_dimensions["A"].width = 42
+    for col_idx in range(2, last_col):
+        ws.column_dimensions[get_column_letter(col_idx)].width = 13
+    ws.column_dimensions[last_letter].width = 18
+    ws.freeze_panes = "B3"
+    ws.auto_filter.ref = f"A2:{last_letter}{ws.max_row}"
+    ws.sheet_view.showGridLines = False
+    ws.sheet_view.zoomScale = 90
+
+    output = io.BytesIO()
+    wb.save(output)
+    output.seek(0)
+    suffix = f"_{fecha_desde}_a_{fecha_hasta}" if fecha_desde and fecha_hasta else "_historial_completo"
+    return send_file(output, as_attachment=True, download_name=f"excel_calendario_talma{suffix}.xlsx",
                      mimetype="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
 
 
