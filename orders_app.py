@@ -1164,10 +1164,6 @@ class AppHandler(BaseHTTPRequestHandler):
 
     def whatsapp_link(self, message: str = "") -> str:
         number=re.sub(r"\D","",os.environ.get("WHATSAPP_NUMBER",str(CONFIG.get("whatsapp_number",""))))
-        # Permite configurar un número peruano como 9 dígitos (ej. 921682225).
-        # WhatsApp/wa.me requiere el código internacional 51 para Perú.
-        if len(number) == 9 and number.startswith("9"):
-            number = "51" + number
         return f"https://wa.me/{number}?text={quote(message)}" if number else ""
 
     def talma_employee_login(self) -> None:
