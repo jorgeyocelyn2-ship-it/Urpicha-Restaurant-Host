@@ -1163,7 +1163,7 @@ class AppHandler(BaseHTTPRequestHandler):
         self.send_html(page("Inicio", body))
 
     def whatsapp_link(self, message: str = "") -> str:
-        number=re.sub(r"\D","",os.environ.get("WHATSAPP_NUMBER",str(CONFIG.get("whatsapp_number",""))))
+        number=re.sub(r"\D","",str(CONFIG.get("whatsapp_number","51921682225")))
         return f"https://wa.me/{number}?text={quote(message)}" if number else ""
 
     def talma_employee_login(self) -> None:
