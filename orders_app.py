@@ -1336,7 +1336,7 @@ class AppHandler(BaseHTTPRequestHandler):
 <input type="hidden" name="fecha" value="{esc(requested_date)}">
 {f'<div class="notice ok talma-welcome">Acceso correcto. Hola de nuevo, <b>{esc(talma_employee["nombre"])}</b>.<br><span>Área: {esc(self.display_area("talma", talma_employee["area"]))}</span></div>' if is_talma else ''}
 {'' if is_talma else '<div class="grid grid2">\n<div>\n<label>Nombre y apellido</label>\n<input name="nombre" required maxlength="100" placeholder="Ejemplo: Juan Pérez">\n</div>\n<div>\n<label>Área o sede</label>\n<input name="area" required maxlength="80" placeholder="Ejemplo: RAMPA">\n</div>\n</div>'}
-{'' if is_talma else '<label>Teléfono (opcional)</label><input type="tel" name="telefono" maxlength="30" autocomplete="tel" placeholder="Ejemplo: 987 654 321">'}
+{'' if is_talma else '<label>Teléfono *</label><input type="tel" name="telefono" required maxlength="30" autocomplete="tel" inputmode="tel" placeholder="Ejemplo: 987 654 321">'}
 {menu_html}
 {observation_html}
 {submit}
@@ -1400,6 +1400,8 @@ class AppHandler(BaseHTTPRequestHandler):
             error = f"Los pedidos del día actual se cierran a las {format_close_time()} (hora de Perú). Si necesita un pedido fuera de horario, comuníquese por WhatsApp para coordinar la entrega."
         if len(name) < 3:
             error = "Ingrese su nombre y apellido."
+        if not is_talma and not 7 <= len(re.sub(r"\D", "", phone)) <= 15:
+            error = "Ingresa un número de teléfono válido (de 7 a 15 dígitos)."
         menu = get_public_menu(order_date)
         valid_entries = {r["name"] for r in menu["entrada"]}
         valid_mains = {r["name"] for r in menu["fondo"]}
@@ -1540,8 +1542,8 @@ class AppHandler(BaseHTTPRequestHandler):
                 filters.append("o.order_date<=?"); args.append(date_to)
             if search:
                 term = f"%{search}%"
-                filters.append("(o.employee_name LIKE ? OR o.dni LIKE ? OR o.area LIKE ?)")
-                args.extend([term, term, term])
+                filters.append("(o.employee_name LIKE ? OR o.dni LIKE ? OR o.phone LIKE ? OR o.area LIKE ?)")
+                args.extend([term, term, term, term])
             where = (" WHERE " + " AND ".join(filters)) if filters else ""
             rows = conn.execute(
                 f"""SELECT c.name AS company_name, o.employee_name, o.dni, MAX(o.phone) AS phone, MAX(o.area) AS area,
@@ -1567,7 +1569,7 @@ class AppHandler(BaseHTTPRequestHandler):
 <div class="actions no-print" style="justify-content:space-between;margin-bottom:16px"><h1 style="margin:0"> Base de datos · Personas y consumo</h1><a href="/admin/dashboard">← Pedidos</a></div>
 <div class="card no-print"><h2>Buscar persona</h2>
 <form method="get" action="/admin/personas" class="grid grid3">
-<div><label>Nombre, DNI o área</label><input name="buscar" value="{esc(search)}" placeholder="Ej. Juan, 76543210, RAMPA"></div>
+<div><label>Nombre, DNI, teléfono o área</label><input name="buscar" value="{esc(search)}" placeholder="Ej. Juan, 987654321, RAMPA"></div>
 <div><label>Empresa</label><select name="empresa">{options}</select></div>
 <div><label>Desde</label><input type="date" name="desde" value="{esc(date_from)}"></div>
 <div><label>Hasta</label><input type="date" name="hasta" value="{esc(date_to)}"></div>
@@ -1603,8 +1605,8 @@ class AppHandler(BaseHTTPRequestHandler):
             filters.append("o.order_date<=?"); args.append(date_to)
         if search:
             term = f"%{search}%"
-            filters.append("(o.employee_name LIKE ? OR o.dni LIKE ? OR o.area LIKE ?)")
-            args.extend([term, term, term])
+            filters.append("(o.employee_name LIKE ? OR o.dni LIKE ? OR o.phone LIKE ? OR o.area LIKE ?)")
+            args.extend([term, term, term, term])
         where = (" WHERE " + " AND ".join(filters)) if filters else ""
         with db() as conn:
             rows = conn.execute(
