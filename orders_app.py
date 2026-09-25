@@ -215,6 +215,7 @@ def init_db() -> None:
                 employee_name TEXT NOT NULL,
                 employee_key TEXT NOT NULL,
                 dni TEXT NOT NULL DEFAULT '',
+                phone TEXT NOT NULL DEFAULT '',
                 area TEXT NOT NULL DEFAULT '',
                 entry_item TEXT NOT NULL,
                 main_item TEXT NOT NULL,
@@ -314,6 +315,8 @@ def init_db() -> None:
         columns = {row["name"] for row in conn.execute("PRAGMA table_info(orders)").fetchall()}
         if "dni" not in columns:
             conn.execute("ALTER TABLE orders ADD COLUMN dni TEXT NOT NULL DEFAULT ''")
+        if "phone" not in columns:
+            conn.execute("ALTER TABLE orders ADD COLUMN phone TEXT NOT NULL DEFAULT ''")
         if "login_code" not in columns:
             conn.execute("ALTER TABLE orders ADD COLUMN login_code TEXT NOT NULL DEFAULT ''")
         if "login_email" not in columns:
@@ -1088,6 +1091,9 @@ class AppHandler(BaseHTTPRequestHandler):
         elif path == "/admin/personas":
             if self.require_admin():
                 self.admin_personas(query)
+        elif path == "/admin/personas/excel":
+            if self.require_admin():
+                self.admin_personas_excel(query)
         elif path == "/admin/resumen":
             if self.require_admin():
                 self.admin_resumen(query)
@@ -1330,6 +1336,7 @@ class AppHandler(BaseHTTPRequestHandler):
 <input type="hidden" name="fecha" value="{esc(requested_date)}">
 {f'<div class="notice ok talma-welcome">Acceso correcto. Hola de nuevo, <b>{esc(talma_employee["nombre"])}</b>.<br><span>Área: {esc(self.display_area("talma", talma_employee["area"]))}</span></div>' if is_talma else ''}
 {'' if is_talma else '<div class="grid grid2">\n<div>\n<label>Nombre y apellido</label>\n<input name="nombre" required maxlength="100" placeholder="Ejemplo: Juan Pérez">\n</div>\n<div>\n<label>Área o sede</label>\n<input name="area" required maxlength="80" placeholder="Ejemplo: RAMPA">\n</div>\n</div>'}
+{'' if is_talma else '<label>Teléfono (opcional)</label><input type="tel" name="telefono" maxlength="30" autocomplete="tel" placeholder="Ejemplo: 987 654 321">'}
 {menu_html}
 {observation_html}
 {submit}
@@ -1373,8 +1380,11 @@ class AppHandler(BaseHTTPRequestHandler):
             name = form.get("nombre", "").strip()
             dni = ""
             area = form.get("area", "").strip()
+            phone = re.sub(r"[^0-9+() .-]", "", form.get("telefono", "").strip())[:30]
             login_code = ""
             login_email = ""
+        if is_talma:
+            phone = ""
         entry = form.get("entrada", "").strip()
         main = form.get("fondo", "").strip()
         notes = form.get("observaciones", "").strip()
@@ -1403,9 +1413,9 @@ class AppHandler(BaseHTTPRequestHandler):
             with db() as conn:
                 employee_key = f"talma:{dni}" if is_talma else normalize_key(name)
                 conn.execute(
-                    """INSERT INTO orders(company_id, order_date, employee_name, employee_key, dni, area, entry_item, main_item, notes, delivery_type, created_at, login_code, login_email)
-                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-                    (company["id"], order_date, name, employee_key, dni, area, entry, main, notes, delivery, now_iso(), login_code, login_email),
+                    """INSERT INTO orders(company_id, order_date, employee_name, employee_key, dni, phone, area, entry_item, main_item, notes, delivery_type, created_at, login_code, login_email)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    (company["id"], order_date, name, employee_key, dni, phone, area, entry, main, notes, delivery, now_iso(), login_code, login_email),
                 )
         except sqlite3.IntegrityError:
             params = urlencode({"token": token, "fecha": order_date, "error": "Ya existe un pedido para ese usuario en la fecha seleccionada." if is_talma else "Ya existe un pedido con ese nombre en la fecha seleccionada."})
@@ -1415,7 +1425,7 @@ class AppHandler(BaseHTTPRequestHandler):
 
     def _company_orders(self, company_id: int, order_date: str = ""):
         with db() as conn:
-            sql = """SELECT o.id,o.order_date,o.employee_name,o.dni,o.area,o.entry_item,
+            sql = """SELECT o.id,o.order_date,o.employee_name,o.dni,o.phone,o.area,o.entry_item,
                             o.main_item,o.notes,o.delivery_type,o.created_at
                      FROM orders o WHERE o.company_id=?"""
             args=[company_id]
@@ -1436,11 +1446,11 @@ class AppHandler(BaseHTTPRequestHandler):
             return
         rows=self._company_orders(company["id"],requested_date)
         wb=Workbook(); ws=wb.active; ws.title="Pedidos"
-        headers=["Fecha","Nombre","DNI","Área / sede","Entrada","Plato de fondo","Observación","Tipo entrega","Hora"]
+        headers=["Fecha","Nombre","DNI","Teléfono","Área / sede","Entrada","Plato de fondo","Observación","Tipo entrega","Hora"]
         ws.append(headers)
         for r in rows:
-            ws.append([r["order_date"],r["employee_name"],r["dni"] or "",r["area"] or "",r["entry_item"],r["main_item"],r["notes"] or "",r["delivery_type"] or "",(r["created_at"] or "")[11:16]])
-        for i,w in enumerate([14,32,15,20,34,38,45,22,10],1): ws.column_dimensions[get_column_letter(i)].width=w
+            ws.append([r["order_date"],r["employee_name"],r["dni"] or "",r["phone"] or "",r["area"] or "",r["entry_item"],r["main_item"],r["notes"] or "",r["delivery_type"] or "",(r["created_at"] or "")[11:16]])
+        for i,w in enumerate([14,32,15,18,20,34,38,45,22,10],1): ws.column_dimensions[get_column_letter(i)].width=w
         for c in ws[1]:
             c.font=Font(bold=True,color="FFFFFF"); c.fill=PatternFill("solid",fgColor="176B43"); c.alignment=Alignment(horizontal="center")
         for row in ws.iter_rows(min_row=2):
@@ -1471,10 +1481,10 @@ class AppHandler(BaseHTTPRequestHandler):
         small=ParagraphStyle("Small",parent=styles["BodyText"],fontSize=7,leading=9)
         story=[Paragraph(f"Pedidos — {html.escape(company['name'])}",title),
                Paragraph(f"Fecha: {html.escape(requested_date)}",styles["Normal"]),Spacer(1,8)]
-        data=[["Fecha","Nombre","DNI","Área / sede","Entrada","Plato de fondo","Observación","Entrega","Hora"]]
+        data=[["Fecha","Nombre","DNI","Teléfono","Área / sede","Entrada","Plato de fondo","Observación","Entrega","Hora"]]
         for r in rows:
-            data.append([Paragraph(str(r["order_date"]),small),Paragraph(str(r["employee_name"]),small),Paragraph(str(r["dni"] or ""),small),Paragraph(str(r["area"] or ""),small),Paragraph(str(r["entry_item"]),small),Paragraph(str(r["main_item"]),small),Paragraph(str(r["notes"] or ""),small),Paragraph(str(r["delivery_type"] or ""),small),Paragraph(str((r["created_at"] or "")[11:16]),small)])
-        table=Table(data,repeatRows=1,colWidths=[48,95,55,65,100,105,125,65,35])
+            data.append([Paragraph(str(r["order_date"]),small),Paragraph(str(r["employee_name"]),small),Paragraph(str(r["dni"] or ""),small),Paragraph(str(r["phone"] or ""),small),Paragraph(str(r["area"] or ""),small),Paragraph(str(r["entry_item"]),small),Paragraph(str(r["main_item"]),small),Paragraph(str(r["notes"] or ""),small),Paragraph(str(r["delivery_type"] or ""),small),Paragraph(str((r["created_at"] or "")[11:16]),small)])
+        table=Table(data,repeatRows=1,colWidths=[42,78,44,55,55,82,90,100,55,30])
         table.setStyle(TableStyle([("BACKGROUND",(0,0),(-1,0),colors.HexColor("#176B43")),("TEXTCOLOR",(0,0),(-1,0),colors.white),("FONTNAME",(0,0),(-1,0),"Helvetica-Bold"),("GRID",(0,0),(-1,-1),.35,colors.HexColor("#D0D5DD")),("VALIGN",(0,0),(-1,-1),"TOP"),("FONTSIZE",(0,0),(-1,-1),7)]))
         story += [table,Spacer(1,8),Paragraph(f"Total de pedidos: {len(rows)}",styles["Heading3"])]
         doc.build(story); out.seek(0)
@@ -1510,18 +1520,31 @@ class AppHandler(BaseHTTPRequestHandler):
     def admin_personas(self, query: dict[str, str]) -> None:
         company_filter = query.get("empresa", "").strip()
         search = query.get("buscar", "").strip()
+        date_from = query.get("desde", "").strip()
+        date_to = query.get("hasta", "").strip()
+        for key, value in (("desde", date_from), ("hasta", date_to)):
+            if value:
+                try:
+                    datetime.strptime(value, "%Y-%m-%d")
+                except ValueError:
+                    if key == "desde": date_from = ""
+                    else: date_to = ""
         with db() as conn:
             companies = conn.execute("SELECT * FROM companies WHERE active=1 ORDER BY name COLLATE NOCASE").fetchall()
             filters, args = [], []
             if company_filter.isdigit():
                 filters.append("o.company_id=?"); args.append(int(company_filter))
+            if date_from:
+                filters.append("o.order_date>=?"); args.append(date_from)
+            if date_to:
+                filters.append("o.order_date<=?"); args.append(date_to)
             if search:
                 term = f"%{search}%"
                 filters.append("(o.employee_name LIKE ? OR o.dni LIKE ? OR o.area LIKE ?)")
                 args.extend([term, term, term])
             where = (" WHERE " + " AND ".join(filters)) if filters else ""
             rows = conn.execute(
-                f"""SELECT c.name AS company_name, o.employee_name, o.dni, MAX(o.area) AS area,
+                f"""SELECT c.name AS company_name, o.employee_name, o.dni, MAX(o.phone) AS phone, MAX(o.area) AS area,
                            COUNT(*) AS total_consumo, MIN(o.order_date) AS primer_pedido,
                            MAX(o.order_date) AS ultimo_pedido
                     FROM orders o JOIN companies c ON c.id=o.company_id
@@ -1534,10 +1557,10 @@ class AppHandler(BaseHTTPRequestHandler):
         )
         rows_html = "".join(
             f'<tr><td><b>{esc(r["employee_name"])}</b></td><td>{esc(r["company_name"])}</td>'
-            f'<td>{esc(r["dni"]) if r["dni"] else "—"}</td><td>{esc(r["area"]) if r["area"] else "—"}</td>'
+            f'<td>{esc(r["dni"]) if r["dni"] else "—"}</td><td>{esc(r["phone"]) if r["phone"] else "—"}</td><td>{esc(r["area"]) if r["area"] else "—"}</td>'
             f'<td><strong>{r["total_consumo"]}</strong></td><td>{esc(r["primer_pedido"])}</td><td>{esc(r["ultimo_pedido"])}</td></tr>'
             for r in rows
-        ) or '<tr><td colspan="7">No se encontraron personas.</td></tr>'
+        ) or '<tr><td colspan="8">No se encontraron personas.</td></tr>'
 
         body=f"""
 <main class="wrap">
@@ -1546,15 +1569,74 @@ class AppHandler(BaseHTTPRequestHandler):
 <form method="get" action="/admin/personas" class="grid grid3">
 <div><label>Nombre, DNI o área</label><input name="buscar" value="{esc(search)}" placeholder="Ej. Juan, 76543210, RAMPA"></div>
 <div><label>Empresa</label><select name="empresa">{options}</select></div>
+<div><label>Desde</label><input type="date" name="desde" value="{esc(date_from)}"></div>
+<div><label>Hasta</label><input type="date" name="hasta" value="{esc(date_to)}"></div>
 <div style="align-self:end"><button>Buscar</button> <a class="btn secondary" href="/admin/personas">Limpiar</a></div>
+<div style="align-self:end"><a class="btn" href="/admin/personas/excel?{urlencode({'buscar':search,'empresa':company_filter,'desde':date_from,'hasta':date_to})}">Generar reporte Excel</a></div>
 </form></div>
 <div class="grid grid3"><div class="stat">Personas encontradas<b>{len(rows)}</b></div>
-<div class="stat">Empresas<b>{len(companies)}</b></div><div class="stat">Consumo total<b>{sum(int(r["total_consumo"]) for r in rows)}</b></div></div>
+<div class="stat">Empresas<b>{len(companies)}</b></div><div class="stat">Consumos en el período<b>{sum(int(r["total_consumo"]) for r in rows)}</b></div></div>
 <div class="card"><h2>Consumo por persona</h2>
 <p class="muted">TALMA se identifica principalmente por DNI; las demás empresas por nombre.</p>
-<div class="table-wrap"><table><thead><tr><th>Nombre</th><th>Empresa</th><th>DNI</th><th>Área</th><th>Total almuerzos</th><th>Primer pedido</th><th>Último pedido</th></tr></thead>
+<div class="table-wrap"><table><thead><tr><th>Nombre</th><th>Empresa</th><th>DNI</th><th>Teléfono</th><th>Área</th><th>Total almuerzos</th><th>Primer pedido</th><th>Último pedido</th></tr></thead>
 <tbody>{rows_html}</tbody></table></div></div></main>"""
         self.send_html(page("Base de datos · Personas", body))
+
+    def admin_personas_excel(self, query: dict[str, str]) -> None:
+        company_filter = query.get("empresa", "").strip()
+        search = query.get("buscar", "").strip()
+        date_from = query.get("desde", "").strip()
+        date_to = query.get("hasta", "").strip()
+        for key, value in (("desde", date_from), ("hasta", date_to)):
+            if value:
+                try:
+                    datetime.strptime(value, "%Y-%m-%d")
+                except ValueError:
+                    self.send_html(page("Fecha inválida", '<main class="wrap narrow"><div class="card"><h1>Fecha inválida</h1><p>Usa fechas con formato válido para generar el Excel.</p><a href="/admin/personas">Volver</a></div></main>'), 400)
+                    return
+        filters, args = [], []
+        if company_filter.isdigit():
+            filters.append("o.company_id=?"); args.append(int(company_filter))
+        if date_from:
+            filters.append("o.order_date>=?"); args.append(date_from)
+        if date_to:
+            filters.append("o.order_date<=?"); args.append(date_to)
+        if search:
+            term = f"%{search}%"
+            filters.append("(o.employee_name LIKE ? OR o.dni LIKE ? OR o.area LIKE ?)")
+            args.extend([term, term, term])
+        where = (" WHERE " + " AND ".join(filters)) if filters else ""
+        with db() as conn:
+            rows = conn.execute(
+                f"""SELECT c.name AS company_name,o.order_date,o.employee_name,o.dni,o.phone,o.area,
+                           o.entry_item,o.main_item,o.notes,o.delivery_type,o.created_at
+                    FROM orders o JOIN companies c ON c.id=o.company_id
+                    {where}
+                    ORDER BY o.order_date,c.name COLLATE NOCASE,o.employee_name COLLATE NOCASE,o.id""", args
+            ).fetchall()
+        wb = Workbook(); ws = wb.active; ws.title = "Consumos"
+        period = f"{date_from or 'Inicio del historial'} al {date_to or 'Fin del historial'}"
+        ws.append([f"REPORTE DE CONSUMOS — {period}"])
+        ws.append(["Empresa", "Fecha", "Nombre", "DNI", "Teléfono", "Área / sede", "Entrada", "Plato de fondo", "Observación", "Modalidad", "Hora"])
+        for r in rows:
+            ws.append([r["company_name"],r["order_date"],r["employee_name"],r["dni"] or "",r["phone"] or "",r["area"] or "",r["entry_item"],r["main_item"],r["notes"] or "",r["delivery_type"] or "",(r["created_at"] or "")[11:16]])
+        total_row = ws.max_row + 1
+        ws.cell(total_row, 1, "TOTAL DE CONSUMOS EN EL PERÍODO")
+        ws.cell(total_row, 2, len(rows))
+        ws.merge_cells(start_row=1, start_column=1, end_row=1, end_column=11)
+        for c in ws[1]:
+            c.font = Font(bold=True, color="FFFFFF", size=14); c.fill = PatternFill("solid", fgColor="176B43")
+        for c in ws[2]:
+            c.font = Font(bold=True, color="FFFFFF"); c.fill = PatternFill("solid", fgColor="176B43"); c.alignment = Alignment(horizontal="center")
+        for c in ws[total_row]:
+            c.font = Font(bold=True); c.fill = PatternFill("solid", fgColor="D9EAD3")
+        for i, width in enumerate([22,14,32,15,18,20,32,38,42,22,10], 1):
+            ws.column_dimensions[get_column_letter(i)].width = width
+        ws.freeze_panes = "A3"; ws.auto_filter.ref = f"A2:K{max(2, total_row-1)}"
+        out = io.BytesIO(); wb.save(out)
+        from_name = date_from or "inicio"
+        to_name = date_to or "hoy"
+        self.send_bytes(out.getvalue(), "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", f"reporte_consumos_{from_name}_{to_name}.xlsx")
 
     def admin_resumen(self, query: dict[str, str]) -> None:
         selected_date = query.get("fecha", today_iso())
@@ -2198,10 +2280,10 @@ class AppHandler(BaseHTTPRequestHandler):
         selected_date, rows = self.filtered_orders(query)
         output = io.StringIO(newline="")
         writer = csv.writer(output, delimiter=";")
-        writer.writerow(["Empresa", "DNI", "Empleado", "Área", "Entrada", "Plato de fondo", "Modalidad", "Observación", "Fecha", "Hora"])
+        writer.writerow(["Empresa", "DNI", "Teléfono", "Empleado", "Área", "Entrada", "Plato de fondo", "Modalidad", "Observación", "Fecha", "Hora"])
         for r in rows:
             dni = r["dni"] if r["company_name"].lower() == "talma" else ""
-            writer.writerow([r["company_name"], dni, r["employee_name"], r["area"], r["entry_item"], r["main_item"], r["delivery_type"], r["notes"], r["order_date"], r["created_at"][11:16]])
+            writer.writerow([r["company_name"], dni, r["phone"] or "", r["employee_name"], r["area"], r["entry_item"], r["main_item"], r["delivery_type"], r["notes"], r["order_date"], r["created_at"][11:16]])
         data = ("\ufeff" + output.getvalue()).encode("utf-8")
         self.send_bytes(data, "text/csv; charset=utf-8", f"pedidos-{selected_date}.csv")
 
@@ -2343,4 +2425,3 @@ def fecha_con_dia(fecha_iso):
         return f"{WEEKDAYS_ES[d.weekday()]} {d.day} de {meses[d.month-1]} de {d.year}"
     except Exception:
         return str(fecha_iso)
-
