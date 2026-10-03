@@ -2681,7 +2681,7 @@ def talma_report_pu():
     fecha_hasta = hasta.isoformat() if hasta else ""
 
     with orders_app.db() as conn:
-        sql = """SELECT o.order_date,o.employee_name,o.dni
+        sql = """SELECT o.order_date,o.employee_name,o.dni,o.area
                  FROM orders o JOIN companies c ON c.id=o.company_id
                  WHERE c.slug='talma'"""
         args = []
@@ -2691,7 +2691,7 @@ def talma_report_pu():
             sql += " AND o.order_date<=?"; args.append(fecha_hasta)
         sql += " ORDER BY o.employee_name COLLATE NOCASE,o.dni,o.order_date,o.id"
         orders = conn.execute(sql, args).fetchall()
-        settings = {str(row["dni"]): row for row in conn.execute("SELECT dni,pu FROM talma_person_settings")}
+        settings = {str(row["dni"]): row for row in conn.execute("SELECT dni,pu,employee_name,area FROM talma_person_settings")}
 
     order_dates = sorted({str(row["order_date"] or "")[:10] for row in orders if row["order_date"]})
     if not desde and order_dates:
@@ -2711,7 +2711,13 @@ def talma_report_pu():
     for order in orders:
         dni = str(order["dni"] or "").strip()
         key = dni or person_key(order["employee_name"])
-        person = people.setdefault(key, {"name": str(order["employee_name"] or "SIN NOMBRE").strip(), "dni": dni, "dates": Counter(), "pu": float(settings.get(dni, {}).get("pu", 1.54) if isinstance(settings.get(dni), dict) else (settings[dni]["pu"] if dni in settings else 1.54))})
+        current_person = settings.get(dni)
+        person = people.setdefault(key, {
+            "name": str((current_person["employee_name"] if current_person else "") or order["employee_name"] or "SIN NOMBRE").strip(),
+            "area": talma_display_area((current_person["area"] if current_person else "") or order["area"]),
+            "dni": dni, "dates": Counter(),
+            "pu": float(current_person["pu"] if current_person else 1.54),
+        })
         date_key = str(order["order_date"] or "")[:10]
         person["dates"][date_key] += 1
         daily_counts[date_key] += 1
@@ -2729,7 +2735,7 @@ def talma_report_pu():
         wb = Workbook()
         ws = wb.active
         ws.title = "Reporte P-U"
-        headers = ["PERSONA"] + [day_headers[d] for d in calendar] + ["TOTAL P/U", "PAGA EMPRESA"]
+        headers = ["PERSONA", "ÁREA", "DNI"] + [day_headers[d] for d in calendar] + ["TOTAL P/U", "PAGA EMPRESA", "TOTAL MENÚS"]
         ws.append(["REPORTE P/U — TALMA"])
         ws.merge_cells(start_row=1, start_column=1, end_row=1, end_column=len(headers))
         ws["A1"].font = Font(bold=True, size=16, color="FFFFFF")
@@ -2746,51 +2752,53 @@ def talma_report_pu():
             cell.alignment = Alignment(horizontal="center", vertical="center")
             cell.border = border
         for person in people_list:
-            row = [person["name"]]
+            row = [person["name"], person["area"], person["dni"]]
             row.extend(person["pu"] if person["dates"].get(date_value) else None for date_value in calendar)
             ws.append(row)
             row_number = ws.max_row
-            first_day_col = 2
-            last_day_col = 1 + len(calendar)
+            first_day_col = 4
+            last_day_col = 3 + len(calendar)
+            menus_col = len(headers)
+            ws.cell(row_number, menus_col, person["count"])
             if calendar:
                 day_range = f"{get_column_letter(first_day_col)}{row_number}:{get_column_letter(last_day_col)}{row_number}"
-                ws.cell(row_number, len(headers)-1, f"=SUM({day_range})")
-                ws.cell(row_number, len(headers), f"=COUNT({day_range})*11-SUM({day_range})")
+                ws.cell(row_number, len(headers)-2, f"=SUM({day_range})")
+                ws.cell(row_number, len(headers)-1, f"=COUNT({day_range})*11-SUM({day_range})")
             else:
+                ws.cell(row_number, len(headers)-2, 0)
                 ws.cell(row_number, len(headers)-1, 0)
-                ws.cell(row_number, len(headers), 0)
         total_row = ws.max_row + 1
         ws.cell(total_row, 1, "PEDIDOS DEL DÍA")
-        for idx, date_value in enumerate(calendar, 2):
+        for idx, date_value in enumerate(calendar, 4):
             col = get_column_letter(idx)
-            if people_list:
-                ws.cell(total_row, idx, f'=COUNT({col}3:{col}{total_row-1})')
-            else:
-                ws.cell(total_row, idx, 0)
+            ws.cell(total_row, idx, f'=COUNT({col}3:{col}{total_row-1})' if people_list else 0)
+        ws.cell(total_row, len(headers), f"=SUM({get_column_letter(len(headers))}3:{get_column_letter(len(headers))}{total_row-1})" if people_list else 0)
         summary_row = total_row + 1
         ws.cell(summary_row, 1, "TOTAL APORTA EL PERSONAL")
-        ws.cell(summary_row, len(headers)-1, f"=SUM({get_column_letter(len(headers)-1)}3:{get_column_letter(len(headers)-1)}{total_row-1})" if people_list else 0)
+        ws.cell(summary_row, len(headers)-2, f"=SUM({get_column_letter(len(headers)-2)}3:{get_column_letter(len(headers)-2)}{total_row-1})" if people_list else 0)
         ws.cell(summary_row + 1, 1, "TOTAL EMPRESA")
-        ws.cell(summary_row + 1, len(headers), f"=SUM({get_column_letter(len(headers))}3:{get_column_letter(len(headers))}{total_row-1})" if people_list else 0)
+        ws.cell(summary_row + 1, len(headers)-1, f"=SUM({get_column_letter(len(headers)-1)}3:{get_column_letter(len(headers)-1)}{total_row-1})" if people_list else 0)
         ws.cell(summary_row + 2, 1, "TOTAL A FACTURAR (S/ 11,00 × pedidos)")
-        ws.cell(summary_row + 2, len(headers), f"=SUM({get_column_letter(len(headers)-1)}{summary_row},{get_column_letter(len(headers))}{summary_row+1})")
+        ws.cell(summary_row + 2, len(headers)-1, f"=SUM({get_column_letter(len(headers)-2)}{summary_row},{get_column_letter(len(headers)-1)}{summary_row+1})")
         for row in ws.iter_rows(min_row=2, max_row=ws.max_row, max_col=len(headers)):
             for cell in row:
                 cell.border = border
                 cell.alignment = Alignment(horizontal="left" if cell.column == 1 else "center", vertical="center")
-                if cell.column > 1 and cell.row not in (total_row,):
+                if cell.column >= 4 and cell.row not in (total_row,) and cell.column < len(headers):
                     cell.number_format = '"S/ "#,##0.00;[Red]-"S/ "#,##0.00;–'
         for cell in ws[total_row]:
             cell.font = Font(bold=True)
             cell.fill = PatternFill("solid", fgColor="FFF2CC")
-            if cell.column > 1:
+            if 4 <= cell.column < len(headers):
                 cell.number_format = "0"
         for row_idx in range(summary_row, summary_row + 3):
             for cell in ws[row_idx]:
                 cell.font = Font(bold=True)
                 cell.fill = PatternFill("solid", fgColor="EAF4EF")
         ws.column_dimensions["A"].width = 38
-        for idx in range(2, len(headers)+1):
+        ws.column_dimensions["B"].width = 24
+        ws.column_dimensions["C"].width = 16
+        for idx in range(4, len(headers)+1):
             ws.column_dimensions[get_column_letter(idx)].width = 15
         ws.freeze_panes = "B3"
         ws.auto_filter.ref = f"A2:{get_column_letter(len(headers))}{total_row-1}" if people_list else f"A2:{get_column_letter(len(headers))}2"
