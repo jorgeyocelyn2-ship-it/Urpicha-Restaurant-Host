@@ -311,6 +311,44 @@ def init_db() -> None:
         conn.execute("CREATE INDEX IF NOT EXISTS idx_talma_manual_email ON talma_manual_users(email)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_talma_manual_dni ON talma_manual_users(dni)")
 
+        # Ajustes administrativos para todas las personas TALMA, incluidas las
+        # que proceden del Excel oficial. La clave por DNI conserva el Excel intacto.
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS talma_person_settings (
+                dni TEXT PRIMARY KEY,
+                email TEXT NOT NULL DEFAULT '',
+                employee_name TEXT NOT NULL DEFAULT '',
+                area TEXT NOT NULL DEFAULT '',
+                pu REAL NOT NULL DEFAULT 1.54,
+                active INTEGER NOT NULL DEFAULT 1,
+                updated_at TEXT NOT NULL DEFAULT ''
+            )
+        """)
+        settings_columns = {row["name"] for row in conn.execute("PRAGMA table_info(talma_person_settings)").fetchall()}
+        for column, definition in (("email", "TEXT NOT NULL DEFAULT ''"),
+                                   ("employee_name", "TEXT NOT NULL DEFAULT ''"),
+                                   ("area", "TEXT NOT NULL DEFAULT ''"),
+                                   ("pu", "REAL NOT NULL DEFAULT 1.54"),
+                                   ("active", "INTEGER NOT NULL DEFAULT 1"),
+                                   ("updated_at", "TEXT NOT NULL DEFAULT ''")):
+            if column not in settings_columns:
+                conn.execute(f"ALTER TABLE talma_person_settings ADD COLUMN {column} {definition}")
+        # Cada persona oficial y manual tiene desde ahora su P/U persistido.
+        # INSERT OR IGNORE conserva cualquier valor o baja que ya configuró el administrador.
+        conn.executemany(
+            """INSERT OR IGNORE INTO talma_person_settings
+               (dni,email,employee_name,area,pu,active,updated_at) VALUES(?,?,?,?,1.54,1,?)""",
+            [(str(person.get("dni", "")).strip(), str(person.get("email", "")).strip().lower(),
+              str(person.get("nombre", "")).strip(), str(person.get("area", "")).strip(), now_iso())
+             for person in TALMA_ROSTER.values() if str(person.get("dni", "")).strip()],
+        )
+        conn.execute(
+            """INSERT OR IGNORE INTO talma_person_settings
+               (dni,email,employee_name,area,pu,active,updated_at)
+               SELECT dni,email,employee_name,area,1.54,active,? FROM talma_manual_users""",
+            (now_iso(),),
+        )
+
         # Migración compatible: versiones anteriores no tenían DNI.
         columns = {row["name"] for row in conn.execute("PRAGMA table_info(orders)").fetchall()}
         if "dni" not in columns:
@@ -677,6 +715,16 @@ def get_talma_person_by_dni(dni: str):
     if not dni:
         return None
 
+    with db() as conn:
+        table = conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='talma_person_settings'").fetchone()
+        if table:
+            setting = conn.execute("SELECT * FROM talma_person_settings WHERE dni=?", (dni,)).fetchone()
+            if setting and not int(setting["active"] or 0):
+                return None
+            if setting and setting["employee_name"]:
+                return {"email": setting["email"], "dni": dni, "nombre": setting["employee_name"],
+                        "area": setting["area"], "manual": False}
+
     # Primero revisar personas manuales, que también tienen DNI único.
     with db() as conn:
         exists = conn.execute(
@@ -710,6 +758,19 @@ def resolve_talma_login(email: str, dni: str):
     dni = dni.strip()
     if not email or not dni:
         return None
+
+    with db() as conn:
+        table = conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='talma_person_settings'").fetchone()
+        if table:
+            setting = conn.execute("SELECT * FROM talma_person_settings WHERE dni=?", (dni,)).fetchone()
+            if setting and not int(setting["active"] or 0):
+                return None
+            if setting and setting["email"] and setting["email"].lower() == email:
+                manual = get_talma_manual_user(email, dni)
+                return {"email": email, "dni": dni,
+                        "nombre": setting["employee_name"] or (manual["employee_name"] if manual else ""),
+                        "area": setting["area"] or (manual["area"] if manual else ""),
+                        "manual": bool(manual)}
 
     manual = get_talma_manual_user(email, dni)
     if manual is not None:

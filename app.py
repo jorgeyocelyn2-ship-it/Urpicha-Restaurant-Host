@@ -1800,13 +1800,20 @@ def _valid_talma_session(value: str | None) -> bool:
 def _talma_page(title: str, body: str, extra: str = "") -> str:
     query = request.query_string.decode("latin-1") if request.query_string else ""
     suffix = f"?{query}" if query else ""
+    if title == "Personas TALMA":
+        excel_href = "/talma/usuarios/excel"
+    elif title == "Report P/U":
+        separator = "&" if query else "?"
+        excel_href = f"/talma/report-pu{suffix}{separator}formato=excel"
+    else:
+        excel_href = "/talma/excel" + suffix
     return page(title, f"""
 <main class="wrap">
 <div class="actions no-print" style="justify-content:space-between;margin-bottom:16px">
   <h1 style="margin:0">Portal TALMA</h1>
   <span class="actions">
   <a class="btn secondary" href="/talma/usuarios">Personas TALMA</a>
-  <a class="btn secondary" href="{"/talma/usuarios/excel" if title == "Personas TALMA" else "/talma/excel"+suffix}">{'Descargar Excel de personas' if title == "Personas TALMA" else 'Descargar Excel'}</a>
+  <a class="btn secondary" href="{excel_href}">{'Descargar Excel de personas' if title == "Personas TALMA" else 'Descargar Excel'}</a>
   <a class="btn secondary" href="/talma/cupones{suffix}">Generar cupones</a>
   <a class="btn secondary" href="/talma/logout">Cerrar sesión</a></span>
 </div>
@@ -2025,6 +2032,7 @@ def talma_portal():
     <button type="submit">Ver resultados</button>
     <a class="btn talma-summary-report" href="/talma/excel?desde={esc(fecha_desde)}&hasta={esc(fecha_hasta)}&dni={esc(dni_filter)}&area={esc(area_filter)}">Generar reporte resumido</a>
     <a class="btn talma-calendar-report" href="/talma/excel-calendario?desde={esc(fecha_desde)}&hasta={esc(fecha_hasta)}&dni={esc(dni_filter)}&area={esc(area_filter)}">Excel calendario</a>
+    <a class="btn talma-pu-report" href="/talma/report-pu?desde={esc(fecha_desde)}&hasta={esc(fecha_hasta)}">Report P/U</a>
     <a class="btn secondary" href="/admin/talma/excel?desde={esc(fecha_desde)}&hasta={esc(fecha_hasta)}&dni={esc(dni_filter)}&area={esc(area_filter)}">Generar reporte Excel detallado</a>
     <a class="btn secondary" href="/talma/cupones?desde={esc(fecha_desde)}&hasta={esc(fecha_hasta)}&dni={esc(dni_filter)}&area={esc(area_filter)}">Generar cupones</a>
     <a class="btn secondary" href="/talma">Limpiar filtros</a>
@@ -2074,7 +2082,7 @@ def talma_portal():
 .talma-summary-wrap{overflow-x:auto}
 .talma-summary-table{display:inline-table;width:max-content;min-width:0;table-layout:auto;font-size:14px}
 .talma-summary-table th,.talma-summary-table td{padding:4px 7px;line-height:1.2;white-space:nowrap}
-.talma-summary-table td:nth-child(3),.talma-summary-table th:nth-child(3),.talma-summary-table td:last-child,.talma-summary-table th:last-child{text-align:center}.talma-summary-report{background:#dc2626!important;border-color:#dc2626!important;color:#fff!important}.talma-summary-report:hover{background:#b91c1c!important;border-color:#b91c1c!important}.talma-calendar-report{background:#2563eb!important;border-color:#2563eb!important;color:#fff!important}.talma-calendar-report:hover{background:#1d4ed8!important;border-color:#1d4ed8!important}
+.talma-summary-table td:nth-child(3),.talma-summary-table th:nth-child(3),.talma-summary-table td:last-child,.talma-summary-table th:last-child{text-align:center}.talma-summary-report{background:#dc2626!important;border-color:#dc2626!important;color:#fff!important}.talma-summary-report:hover{background:#b91c1c!important;border-color:#b91c1c!important}.talma-calendar-report{background:#2563eb!important;border-color:#2563eb!important;color:#fff!important}.talma-calendar-report:hover{background:#1d4ed8!important;border-color:#1d4ed8!important}.talma-pu-report{background:#0f766e!important;border-color:#0f766e!important;color:#fff!important}.talma-pu-report:hover{background:#115e59!important;border-color:#115e59!important}
 .area-stats{display:grid;grid-template-columns:repeat(auto-fit,minmax(130px,1fr));gap:10px}.area-stat{border:1px solid #e4e7ec;border-radius:14px;padding:12px;text-align:center;background:#f8fafc}.area-stat span{display:block;font-weight:900;font-size:14px}.area-stat strong{display:block;font-size:34px;line-height:1.05;margin:5px 0;color:#198754}.area-stat small{color:#667085}
 </style>"""
     return _talma_page("TALMA", body, extra)
@@ -2113,8 +2121,10 @@ def talma_admin_users():
             "SELECT id,email,dni,employee_name,area,active,created_at "
             "FROM talma_manual_users ORDER BY employee_name COLLATE NOCASE"
         ).fetchall()
+        settings_rows = conn.execute("SELECT * FROM talma_person_settings").fetchall()
 
     manual_by_key = {(str(r["email"]).lower(), str(r["dni"])): r for r in manual_rows}
+    settings_by_dni = {str(r["dni"]): r for r in settings_rows}
     people = []
     seen = set()
 
@@ -2124,14 +2134,16 @@ def talma_admin_users():
     ):
         email, dni = key.split("|", 1)
         manual = manual_by_key.get((email, dni))
+        settings = settings_by_dni.get(dni)
         people.append({
             "source": "manual" if manual else "excel",
             "id": manual["id"] if manual else "",
-            "email": manual["email"] if manual else email,
-            "dni": manual["dni"] if manual else dni,
-            "name": manual["employee_name"] if manual else record["nombre"],
-            "area": manual["area"] if manual else record["area"],
-            "active": bool(manual["active"]) if manual else True,
+            "email": manual["email"] if manual else ((settings["email"] or email) if settings else email),
+            "dni": dni,
+            "name": manual["employee_name"] if manual else ((settings["employee_name"] or record["nombre"]) if settings else record["nombre"]),
+            "area": manual["area"] if manual else ((settings["area"] or record["area"]) if settings else record["area"]),
+            "pu": settings["pu"] if settings else 1.54,
+            "active": bool(manual["active"]) if manual else (bool(settings["active"]) if settings else True),
             "created": manual["created_at"] if manual else "Excel",
         })
         seen.add((email, dni))
@@ -2139,6 +2151,7 @@ def talma_admin_users():
     for r in manual_rows:
         key = (str(r["email"]).lower(), str(r["dni"]))
         if key not in seen:
+            settings = settings_by_dni.get(str(r["dni"]))
             people.append({
                 "source": "manual",
                 "id": r["id"],
@@ -2146,13 +2159,15 @@ def talma_admin_users():
                 "dni": r["dni"],
                 "name": r["employee_name"],
                 "area": r["area"],
-                "active": bool(r["active"]),
+                "pu": settings["pu"] if settings else 1.54,
+                "active": bool(r["active"]) and (bool(settings["active"]) if settings else True),
                 "created": r["created_at"],
             })
 
     people.sort(key=lambda r: r["name"].lower())
     edit_data = next(
-        (r for r in people if r["source"] == "manual" and str(r["id"]) == edit_id),
+        (r for r in people if str(r["dni"]) == request.args.get("editar_dni", "")
+         or (r["source"] == "manual" and str(r["id"]) == edit_id)),
         None
     )
 
@@ -2165,10 +2180,12 @@ def talma_admin_users():
         feedback = f'<div class="notice error">{orders_app.esc(request.args.get("error"))}</div>'
 
     if edit_data:
-        form_title = "Editar persona manual"
+        form_title = "Editar persona"
         form_action = "/talma/usuarios/editar"
         submit = "Guardar cambios"
-        hidden = f'<input type="hidden" name="id" value="{orders_app.esc(str(edit_data["id"]))}">'
+        hidden = (f'<input type="hidden" name="id" value="{orders_app.esc(str(edit_data["id"]))}">'
+                  f'<input type="hidden" name="source" value="{edit_data["source"]}">'
+                  f'<input type="hidden" name="original_dni" value="{orders_app.esc(edit_data["dni"])}">')
         cancel = '<a class="secondary" href="/talma/usuarios">Cancelar</a>'
     else:
         form_title = "Añadir persona manualmente"
@@ -2181,31 +2198,29 @@ def talma_admin_users():
     form_dni = orders_app.esc(edit_data["dni"] if edit_data else "")
     form_name = orders_app.esc(edit_data["name"] if edit_data else "")
     form_area = orders_app.esc(edit_data["area"] if edit_data else "")
+    form_pu = str(edit_data["pu"] if edit_data else "1.54").replace(".", ",")
 
     rows = []
     for r in people:
         source = "Excel" if r["source"] == "excel" else "Manual"
         status = "Activo" if r["active"] else "Inactivo"
-        if r["source"] == "manual":
-            edit_href = f'/talma/usuarios?editar={quote(str(r["id"]))}'
-            delete_href = f'/talma/usuarios/eliminar?id={quote(str(r["id"]))}'
-            actions = (
-                f'<a class="small-action" href="{edit_href}">Editar</a> '
-                f'<a class="small-action danger-text" href="{delete_href}" '
-                f'onclick="return confirm(\'¿Desactivar esta persona manual?\');">Desactivar</a>'
-            )
-        else:
-            actions = '<span class="muted">Base Excel</span>'
+        edit_href = (f'/talma/usuarios?editar={quote(str(r["id"]))}' if r["source"] == "manual"
+                     else f'/talma/usuarios?editar_dni={quote(str(r["dni"]))}')
+        delete_arg = f'id={quote(str(r["id"]))}' if r["source"] == "manual" else f'dni={quote(str(r["dni"]))}'
+        delete_href = f'/talma/usuarios/eliminar?{delete_arg}'
+        actions = (f'<a class="small-action" href="{edit_href}">Editar</a> '
+                   f'<a class="small-action danger-text" href="{delete_href}" '
+                   f'onclick="return confirm(\'¿Desactivar esta persona?\');">Eliminar</a>')
 
         rows.append(
             f'<tr><td>{orders_app.esc(r["name"])}</td>'
             f'<td>{orders_app.esc(r["email"])}</td>'
             f'<td><b>{orders_app.esc(r["dni"])}</b></td>'
-            f'<td>{orders_app.esc(r["area"])}</td>'
+            f'<td>{orders_app.esc(r["area"])}</td><td>{str(r["pu"]).replace(".", ",")}</td>'
             f'<td>{source}</td><td>{status}</td><td>{actions}</td></tr>'
         )
 
-    rows_html = "".join(rows) or '<tr><td colspan="7">No hay personas registradas.</td></tr>'
+    rows_html = "".join(rows) or '<tr><td colspan="8">No hay personas registradas.</td></tr>'
 
     body = f"""
 <div class="admin-page">
@@ -2224,7 +2239,7 @@ def talma_admin_users():
     <input type="email" name="email" maxlength="180" required value="{form_email}" placeholder="correo@empresa.com">
 
     <label>DNI</label>
-    <input name="dni" inputmode="numeric" maxlength="8" minlength="8" required value="{form_dni}" placeholder="71206879">
+    <input name="dni" inputmode="numeric" maxlength="8" minlength="8" required value="{form_dni}" placeholder="71206879" {"readonly" if edit_data else ""}>
 
     <label>Nombre y apellidos</label>
     <input name="nombre" maxlength="120" required value="{form_name}" placeholder="Nombre completo">
@@ -2232,12 +2247,15 @@ def talma_admin_users():
     <label>Área</label>
     <input name="area" maxlength="80" required value="{form_area}" placeholder="Área">
 
+    <label>P/U — aporte del trabajador (S/)</label>
+    <input name="pu" inputmode="decimal" required value="{form_pu}" placeholder="1,54">
+
     <div class="actions">
       <button type="submit">{submit}</button>
       {cancel}
     </div>
   </form>
-  <p class="help">Las personas del Excel son de solo lectura. Las añadidas manualmente se guardan en el sistema y también pueden iniciar sesión con correo + DNI.</p>
+  <p class="help">El aporte P/U se aplica a los reportes. El valor inicial es S/ 1,54.</p>
 </section>
 
 <section class="card">
@@ -2246,7 +2264,7 @@ def talma_admin_users():
     <a class="secondary" href="/talma/usuarios/excel">Descargar Excel de personas</a>
   </div>
   <div class="table-wrap">
-    <table><thead><tr><th>Nombre</th><th>Correo</th><th>DNI</th><th>Área</th><th>Origen</th><th>Estado</th><th>Acciones</th></tr></thead>
+    <table><thead><tr><th>Nombre</th><th>Correo</th><th>DNI</th><th>Área</th><th>P/U (S/)</th><th>Origen</th><th>Estado</th><th>Acciones</th></tr></thead>
     <tbody>{rows_html}</tbody></table>
   </div>
 </section>
@@ -2284,8 +2302,14 @@ def talma_admin_users_create():
     dni = request.form.get("dni", "").strip()
     name = request.form.get("nombre", "").strip()
     area = request.form.get("area", "").strip()
+    pu_text = request.form.get("pu", "1,54").strip().replace(",", ".")
+    try:
+        pu = round(float(pu_text), 2)
+        valid_pu = 0 <= pu <= 11
+    except ValueError:
+        pu, valid_pu = 1.54, False
 
-    if not re.fullmatch(r"[^@\s]+@[^@\s]+\.[^@\s]+", email) or not re.fullmatch(r"\d{8}", dni) or len(name) < 3 or not area:
+    if not re.fullmatch(r"[^@\s]+@[^@\s]+\.[^@\s]+", email) or not re.fullmatch(r"\d{8}", dni) or len(name) < 3 or not area or not valid_pu:
         return redirect("/talma/usuarios?error=Datos+incompletos")
 
     with orders_app.db() as conn:
@@ -2302,6 +2326,11 @@ def talma_admin_users_create():
             "INSERT INTO talma_manual_users(email,dni,employee_name,area,active,created_at) VALUES(?,?,?,?,1,?)",
             (email, dni, name, area, orders_app.now_iso())
         )
+        conn.execute("""INSERT INTO talma_person_settings(dni,email,employee_name,area,pu,active,updated_at)
+                        VALUES(?,?,?,?,?,1,?) ON CONFLICT(dni) DO UPDATE SET
+                        email=excluded.email,employee_name=excluded.employee_name,area=excluded.area,
+                        pu=excluded.pu,active=1,updated_at=excluded.updated_at""",
+                     (dni, email, name, area, pu, orders_app.now_iso()))
 
     return redirect("/talma/usuarios?ok=1")
 
@@ -2313,31 +2342,39 @@ def talma_admin_users_edit():
 
     orders_app.init_db()
     user_id = request.form.get("id", "").strip()
+    source = request.form.get("source", "manual").strip()
+    original_dni = request.form.get("original_dni", "").strip()
     email = request.form.get("email", "").strip().lower()
     dni = request.form.get("dni", "").strip()
     name = request.form.get("nombre", "").strip()
     area = request.form.get("area", "").strip()
+    pu_text = request.form.get("pu", "1,54").strip().replace(",", ".")
+    try:
+        pu = round(float(pu_text), 2)
+        valid_pu = 0 <= pu <= 11
+    except ValueError:
+        pu, valid_pu = 1.54, False
 
-    if not user_id or not re.fullmatch(r"[^@\s]+@[^@\s]+\.[^@\s]+", email) or not re.fullmatch(r"\d{8}", dni) or len(name) < 3 or not area:
+    if (not original_dni or not re.fullmatch(r"[^@\s]+@[^@\s]+\.[^@\s]+", email)
+            or not re.fullmatch(r"\d{8}", dni) or len(name) < 3 or not area or not valid_pu):
         return redirect("/talma/usuarios?error=Datos+incompletos")
 
     with orders_app.db() as conn:
-        current = conn.execute("SELECT id FROM talma_manual_users WHERE id=?", (user_id,)).fetchone()
-        collision = conn.execute(
-            "SELECT id FROM talma_manual_users WHERE (dni=? OR lower(email)=?) AND id<>?",
-            (dni, email, user_id)
-        ).fetchone()
-        excel_collision = any(
-            str(r["dni"]) == dni or str(r["email"]).lower() == email
-            for r in orders_app.TALMA_ROSTER.values()
-        )
-        if not current or collision or excel_collision:
-            return redirect("/talma/usuarios?error=Ese+DNI+o+correo+ya+existe+en+TALMA")
-
-        conn.execute(
-            "UPDATE talma_manual_users SET email=?,dni=?,employee_name=?,area=?,active=1 WHERE id=?",
-            (email, dni, name, area, user_id)
-        )
+        if source == "manual":
+            current = conn.execute("SELECT id FROM talma_manual_users WHERE id=? AND dni=?", (user_id, original_dni)).fetchone()
+            if not current:
+                return redirect("/talma/usuarios?error=Persona+no+encontrada")
+            conn.execute("UPDATE talma_manual_users SET email=?,employee_name=?,area=?,active=1 WHERE id=?",
+                         (email, name, area, user_id))
+        else:
+            is_roster = any(str(r.get("dni", "")) == original_dni for r in orders_app.TALMA_ROSTER.values())
+            if not is_roster:
+                return redirect("/talma/usuarios?error=Persona+no+encontrada")
+        conn.execute("""INSERT INTO talma_person_settings(dni,email,employee_name,area,pu,active,updated_at)
+                        VALUES(?,?,?,?,?,1,?) ON CONFLICT(dni) DO UPDATE SET
+                        email=excluded.email,employee_name=excluded.employee_name,area=excluded.area,
+                        pu=excluded.pu,active=1,updated_at=excluded.updated_at""",
+                     (original_dni, email, name, area, pu, orders_app.now_iso()))
 
     return redirect("/talma/usuarios?ok=1")
 
@@ -2349,9 +2386,19 @@ def talma_admin_users_delete():
 
     orders_app.init_db()
     user_id = request.args.get("id", "").strip()
+    dni = request.args.get("dni", "").strip()
     if user_id:
         with orders_app.db() as conn:
+            row = conn.execute("SELECT dni FROM talma_manual_users WHERE id=?", (user_id,)).fetchone()
             conn.execute("UPDATE talma_manual_users SET active=0 WHERE id=?", (user_id,))
+            if row:
+                conn.execute("UPDATE talma_person_settings SET active=0,updated_at=? WHERE dni=?",
+                             (orders_app.now_iso(), row["dni"]))
+    elif dni:
+        with orders_app.db() as conn:
+            conn.execute("""INSERT INTO talma_person_settings(dni,active,updated_at) VALUES(?,0,?)
+                            ON CONFLICT(dni) DO UPDATE SET active=0,updated_at=excluded.updated_at""",
+                         (dni, orders_app.now_iso()))
     return redirect("/talma/usuarios?ok=deleted")
 
 
@@ -2372,8 +2419,10 @@ def talma_admin_users_excel():
             "SELECT email,dni,employee_name,area,active "
             "FROM talma_manual_users WHERE active=1 ORDER BY employee_name COLLATE NOCASE"
         ).fetchall()
+        settings_rows = conn.execute("SELECT * FROM talma_person_settings").fetchall()
 
     manual_by_key = {(str(r["email"]).lower(), str(r["dni"])): r for r in manual_rows}
+    settings_by_dni = {str(r["dni"]): r for r in settings_rows}
 
     for key, record in sorted(
         orders_app.TALMA_ROSTER.items(),
@@ -2381,11 +2430,15 @@ def talma_admin_users_excel():
     ):
         email, dni = key.split("|", 1)
         manual = manual_by_key.get((email, dni))
+        settings = settings_by_dni.get(dni)
+        if settings and not bool(settings["active"]):
+            continue
         people.append([
-            manual["employee_name"] if manual else record["nombre"],
-            manual["email"] if manual else email,
+            manual["employee_name"] if manual else ((settings["employee_name"] or record["nombre"]) if settings else record["nombre"]),
+            manual["email"] if manual else ((settings["email"] or email) if settings else email),
             manual["dni"] if manual else dni,
-            manual["area"] if manual else record["area"],
+            manual["area"] if manual else ((settings["area"] or record["area"]) if settings else record["area"]),
+            settings["pu"] if settings else 1.54,
             "Manual" if manual else "Excel",
         ])
         seen.add((email, dni))
@@ -2393,18 +2446,22 @@ def talma_admin_users_excel():
     for r in manual_rows:
         key = (str(r["email"]).lower(), str(r["dni"]))
         if key not in seen:
+            settings = settings_by_dni.get(str(r["dni"]))
+            if settings and not bool(settings["active"]):
+                continue
             people.append([
-                r["employee_name"], r["email"], r["dni"], r["area"], "Manual"
+                r["employee_name"], r["email"], r["dni"], r["area"],
+                settings["pu"] if settings else 1.54, "Manual"
             ])
 
     wb = Workbook()
     ws = wb.active
     ws.title = "Personas TALMA"
-    ws.append(["Nombre y apellidos", "Correo", "DNI", "Área", "Origen"])
+    ws.append(["Nombre y apellidos", "Correo", "DNI", "Área", "P/U (S/)", "Origen"])
     for row in sorted(people, key=lambda x: x[0].lower()):
         ws.append(row)
 
-    for i, width in enumerate([36, 40, 18, 24, 14], 1):
+    for i, width in enumerate([36, 40, 18, 24, 14, 14], 1):
         ws.column_dimensions[get_column_letter(i)].width = width
 
     fill = PatternFill("solid", fgColor="176B43")
@@ -2596,6 +2653,167 @@ def talma_excel():
     suffix = f"_{summary_identity}_{fecha_desde}_a_{fecha_hasta}" if fecha_desde and fecha_hasta else f"_{summary_identity}_historial_completo"
     return send_file(output, as_attachment=True, download_name=f"pedidos_talma{suffix}.xlsx",
                      mimetype="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+
+
+@app.get("/talma/report-pu")
+def talma_report_pu():
+    """Vista y Excel de aportes P/U de trabajadores para un rango de fechas."""
+    if not _valid_talma_session(request.cookies.get("talma_session")):
+        return _talma_login()
+    orders_app.init_db()
+    fecha_desde = request.args.get("desde", "").strip()
+    fecha_hasta = request.args.get("hasta", "").strip()
+
+    def parse_day(value):
+        try:
+            return datetime.strptime(value, "%Y-%m-%d").date() if value else None
+        except ValueError:
+            return None
+
+    desde, hasta = parse_day(fecha_desde), parse_day(fecha_hasta)
+    if desde and not hasta:
+        hasta = desde
+    if hasta and not desde:
+        desde = hasta
+    if desde and hasta and desde > hasta:
+        desde, hasta = hasta, desde
+    fecha_desde = desde.isoformat() if desde else ""
+    fecha_hasta = hasta.isoformat() if hasta else ""
+
+    with orders_app.db() as conn:
+        sql = """SELECT o.order_date,o.employee_name,o.dni
+                 FROM orders o JOIN companies c ON c.id=o.company_id
+                 WHERE c.slug='talma'"""
+        args = []
+        if fecha_desde:
+            sql += " AND o.order_date>=?"; args.append(fecha_desde)
+        if fecha_hasta:
+            sql += " AND o.order_date<=?"; args.append(fecha_hasta)
+        sql += " ORDER BY o.employee_name COLLATE NOCASE,o.dni,o.order_date,o.id"
+        orders = conn.execute(sql, args).fetchall()
+        settings = {str(row["dni"]): row for row in conn.execute("SELECT dni,pu FROM talma_person_settings")}
+
+    order_dates = sorted({str(row["order_date"] or "")[:10] for row in orders if row["order_date"]})
+    if not desde and order_dates:
+        desde = datetime.strptime(order_dates[0], "%Y-%m-%d").date()
+    if not hasta and order_dates:
+        hasta = datetime.strptime(order_dates[-1], "%Y-%m-%d").date()
+    calendar = []
+    if desde and hasta:
+        day = desde
+        while day <= hasta:
+            calendar.append(day.isoformat())
+            day += timedelta(days=1)
+    spanish_days = ["lun", "mar", "mié", "jue", "vie", "sáb", "dom"]
+    day_headers = {value: f"{spanish_days[datetime.strptime(value, '%Y-%m-%d').weekday()]} {datetime.strptime(value, '%Y-%m-%d').day}" for value in calendar}
+    people = {}
+    daily_counts = Counter()
+    for order in orders:
+        dni = str(order["dni"] or "").strip()
+        key = dni or person_key(order["employee_name"])
+        person = people.setdefault(key, {"name": str(order["employee_name"] or "SIN NOMBRE").strip(), "dni": dni, "dates": Counter(), "pu": float(settings.get(dni, {}).get("pu", 1.54) if isinstance(settings.get(dni), dict) else (settings[dni]["pu"] if dni in settings else 1.54))})
+        date_key = str(order["order_date"] or "")[:10]
+        person["dates"][date_key] += 1
+        daily_counts[date_key] += 1
+    for person in people.values():
+        person["count"] = sum(person["dates"].values())
+        person["employee_total"] = round(person["count"] * person["pu"], 2)
+        person["company_total"] = round(person["count"] * (11 - person["pu"]), 2)
+    people_list = sorted(people.values(), key=lambda row: row["name"].casefold())
+    order_count = sum(daily_counts.values())
+    employee_total = round(sum(person["employee_total"] for person in people_list), 2)
+    company_total = round(sum(person["company_total"] for person in people_list), 2)
+    invoice_total = round(order_count * 11, 2)
+
+    if request.args.get("formato") == "excel":
+        wb = Workbook()
+        ws = wb.active
+        ws.title = "Reporte P-U"
+        headers = ["PERSONA"] + [day_headers[d] for d in calendar] + ["TOTAL P/U", "PAGA EMPRESA"]
+        ws.append(["REPORTE P/U — TALMA"])
+        ws.merge_cells(start_row=1, start_column=1, end_row=1, end_column=len(headers))
+        ws["A1"].font = Font(bold=True, size=16, color="FFFFFF")
+        ws["A1"].fill = PatternFill("solid", fgColor="176B43")
+        ws["A1"].alignment = Alignment(horizontal="center")
+        ws.append(headers)
+        header_fill = PatternFill("solid", fgColor="176B43")
+        light_fill = PatternFill("solid", fgColor="E7EDF1")
+        thin = Side(style="thin", color="808080")
+        border = Border(left=thin, right=thin, top=thin, bottom=thin)
+        for col_idx, cell in enumerate(ws[2], 1):
+            cell.font = Font(bold=True, color="FFFFFF" if col_idx in (1, len(headers)) or col_idx == len(headers)-1 else "17212B")
+            cell.fill = header_fill if col_idx in (1, len(headers), len(headers)-1) else light_fill
+            cell.alignment = Alignment(horizontal="center", vertical="center")
+            cell.border = border
+        for person in people_list:
+            row = [person["name"]]
+            row.extend(person["pu"] if person["dates"].get(date_value) else None for date_value in calendar)
+            ws.append(row)
+            row_number = ws.max_row
+            first_day_col = 2
+            last_day_col = 1 + len(calendar)
+            if calendar:
+                day_range = f"{get_column_letter(first_day_col)}{row_number}:{get_column_letter(last_day_col)}{row_number}"
+                ws.cell(row_number, len(headers)-1, f"=SUM({day_range})")
+                ws.cell(row_number, len(headers), f"=COUNT({day_range})*11-SUM({day_range})")
+            else:
+                ws.cell(row_number, len(headers)-1, 0)
+                ws.cell(row_number, len(headers), 0)
+        total_row = ws.max_row + 1
+        ws.cell(total_row, 1, "PEDIDOS DEL DÍA")
+        for idx, date_value in enumerate(calendar, 2):
+            col = get_column_letter(idx)
+            if people_list:
+                ws.cell(total_row, idx, f'=COUNT({col}3:{col}{total_row-1})')
+            else:
+                ws.cell(total_row, idx, 0)
+        summary_row = total_row + 1
+        ws.cell(summary_row, 1, "TOTAL APORTA EL PERSONAL")
+        ws.cell(summary_row, len(headers)-1, f"=SUM({get_column_letter(len(headers)-1)}3:{get_column_letter(len(headers)-1)}{total_row-1})" if people_list else 0)
+        ws.cell(summary_row + 1, 1, "TOTAL EMPRESA")
+        ws.cell(summary_row + 1, len(headers), f"=SUM({get_column_letter(len(headers))}3:{get_column_letter(len(headers))}{total_row-1})" if people_list else 0)
+        ws.cell(summary_row + 2, 1, "TOTAL A FACTURAR (S/ 11,00 × pedidos)")
+        ws.cell(summary_row + 2, len(headers), f"=SUM({get_column_letter(len(headers)-1)}{summary_row},{get_column_letter(len(headers))}{summary_row+1})")
+        for row in ws.iter_rows(min_row=2, max_row=ws.max_row, max_col=len(headers)):
+            for cell in row:
+                cell.border = border
+                cell.alignment = Alignment(horizontal="left" if cell.column == 1 else "center", vertical="center")
+                if cell.column > 1 and cell.row not in (total_row,):
+                    cell.number_format = '"S/ "#,##0.00;[Red]-"S/ "#,##0.00;–'
+        for cell in ws[total_row]:
+            cell.font = Font(bold=True)
+            cell.fill = PatternFill("solid", fgColor="FFF2CC")
+            if cell.column > 1:
+                cell.number_format = "0"
+        for row_idx in range(summary_row, summary_row + 3):
+            for cell in ws[row_idx]:
+                cell.font = Font(bold=True)
+                cell.fill = PatternFill("solid", fgColor="EAF4EF")
+        ws.column_dimensions["A"].width = 38
+        for idx in range(2, len(headers)+1):
+            ws.column_dimensions[get_column_letter(idx)].width = 15
+        ws.freeze_panes = "B3"
+        ws.auto_filter.ref = f"A2:{get_column_letter(len(headers))}{total_row-1}" if people_list else f"A2:{get_column_letter(len(headers))}2"
+        ws.sheet_view.showGridLines = False
+        output = io.BytesIO(); wb.save(output); output.seek(0)
+        suffix = f"_{fecha_desde}_a_{fecha_hasta}" if fecha_desde and fecha_hasta else "_historial"
+        return send_file(output, as_attachment=True, download_name=f"reporte_pu_talma{suffix}.xlsx",
+                         mimetype="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+
+    rows = []
+    def pu_text(value):
+        return f"{value:,.2f}".replace(",", "~").replace(".", ",").replace("~", ".")
+
+    for person in people_list:
+        cells = "".join(f'<td>{pu_text(person["pu"])}</td>' if person["dates"].get(day) else "<td></td>" for day in calendar)
+        rows.append(f'<tr><td>{esc(person["name"])}</td>{cells}<td><b>S/ {pu_text(person["employee_total"])}</b></td><td>S/ {pu_text(person["company_total"])}</td></tr>')
+    count_cells = "".join(f"<td><b>{daily_counts.get(day, 0)}</b></td>" for day in calendar)
+    col_count = len(calendar) + 3
+    body = f'''<div class="admin-page"><section class="card"><div class="section-head"><div><h1>Reporte P/U TALMA</h1><p class="help">Solo aparecen trabajadores con al menos un pedido en el rango. Cada pedido asigna el P/U configurado a la persona; la empresa paga S/ 11,00 menos ese aporte.</p></div><a class="secondary" href="/talma/report-pu?desde={esc(fecha_desde)}&hasta={esc(fecha_hasta)}&formato=excel">Descargar Excel</a></div>
+<form method="get" action="/talma/report-pu" class="report-range"><label>Desde <input type="date" name="desde" value="{esc(fecha_desde)}"></label><label>Hasta <input type="date" name="hasta" value="{esc(fecha_hasta)}"></label><button type="submit">Ver reporte</button></form>
+<div class="table-wrap"><table class="pu-table"><thead><tr><th>Persona</th>{''.join(f'<th>{day_headers[day]}</th>' for day in calendar)}<th>Total P/U</th><th>Paga empresa</th></tr></thead><tbody>{''.join(rows) or f'<tr><td colspan="{col_count}">No hay pedidos en este período.</td></tr>'}<tr class="sum-row"><th>Pedidos del día</th>{count_cells}<th>{order_count}</th><th></th></tr><tr class="sum-row"><th colspan="{len(calendar)+1}">Total aporta el personal</th><th>S/ {pu_text(employee_total)}</th><th></th></tr><tr class="sum-row"><th colspan="{len(calendar)+2}">Total empresa</th><th>S/ {pu_text(company_total)}</th></tr><tr class="sum-row invoice"><th colspan="{len(calendar)+2}">Total a facturar (S/ 11,00 × pedidos)</th><th>S/ {pu_text(invoice_total)}</th></tr></tbody></table></div></section></div>'''
+    extra = """<style>.admin-page{max-width:1500px;margin:28px auto;padding:0 18px}.card{background:#fff;border:1px solid #d8dfe6;border-radius:15px;padding:22px;margin-bottom:18px}.section-head{display:flex;justify-content:space-between;gap:16px;align-items:flex-start}.section-head h1{margin:0 0 8px}.help{color:#667085;font-size:13px;line-height:1.5}.secondary{display:inline-block;padding:10px 14px;border-radius:9px;background:#eef3f5;color:#17323a;text-decoration:none;font-weight:700}.report-range{display:flex;gap:14px;align-items:end;margin:18px 0;flex-wrap:wrap}.report-range label{display:grid;gap:6px;font-weight:700}.report-range input{padding:9px;border:1px solid #cfd8dc;border-radius:7px}.report-range button{border:0;border-radius:8px;padding:10px 14px;background:#176b43;color:#fff;font-weight:700}.table-wrap{overflow:auto}.pu-table{border-collapse:collapse;white-space:nowrap;min-width:100%}.pu-table th,.pu-table td{border:1px solid #cbd5dc;padding:7px 10px;text-align:center}.pu-table thead th{background:#176b43;color:#fff}.pu-table th:first-child,.pu-table td:first-child{text-align:left}.pu-table .sum-row{background:#fff2cc}.pu-table .invoice{background:#eaf4ef}.pu-table tbody tr:nth-child(even):not(.sum-row){background:#f7faf8}</style>"""
+    return _talma_page("Report P/U", body, extra)
 
 
 @app.get("/talma/excel-calendario")
