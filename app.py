@@ -154,7 +154,7 @@ Cualquier duda o sugerencia respecto al sistema, comunicarse por:<br>
 931099267 &nbsp;|&nbsp; 921682225 &nbsp;|&nbsp; sebasoa0711@gmail.com
 <br><span>Todos los derechos reservados · Urpicha Restaurante</span>
 </footer>
-<style>.site-footer{{text-align:center;color:#667085;padding:28px 16px;font-size:13px;line-height:1.6;border-top:1px solid #d8dfe6;margin-top:28px;background:#fff}}.footer-logo{{display:block;width:148px;height:112px;object-fit:contain;border:0;outline:0;box-shadow:none;margin:0 auto 8px;border-radius:0;background:transparent;clip-path:inset(3% 18% 0 0);transform:translateX(13px)}}</style>
+<style>.site-footer{{text-align:center;color:#667085;padding:28px 16px;font-size:13px;line-height:1.6;border-top:1px solid #d8dfe6;margin-top:28px;background:#fff}}.footer-logo{{display:block;width:148px;height:112px;object-fit:contain;border:0;outline:0;box-shadow:none;margin:0 auto 8px;border-radius:0;background:transparent;clip-path:inset(1px 1px 0 0);mix-blend-mode:multiply}}</style>
 </body>
 </html>"""
 DATA_ROOT = Path(os.environ.get("DATA_DIR", str(ROOT / "datos"))).expanduser().resolve()
