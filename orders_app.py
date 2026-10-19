@@ -1285,6 +1285,22 @@ class AppHandler(BaseHTTPRequestHandler):
                    ORDER BY created_at DESC, id DESC""",
                 (company["id"], requested_date),
             ).fetchall()
+            talma_monthly_summary = None
+            if is_talma and talma_employee:
+                current_month = today_iso()[:7]
+                year, month = (int(part) for part in current_month.split("-"))
+                next_month = f"{year + (1 if month == 12 else 0):04d}-{1 if month == 12 else month + 1:02d}-01"
+                monthly_count = conn.execute(
+                    """SELECT COUNT(*) FROM orders
+                       WHERE company_id=? AND dni=? AND order_date>=? AND order_date<?""",
+                    (company["id"], str(talma_employee["dni"]), f"{current_month}-01", next_month),
+                ).fetchone()[0]
+                person_setting = conn.execute(
+                    "SELECT pu FROM talma_person_settings WHERE dni=?",
+                    (str(talma_employee["dni"]),),
+                ).fetchone()
+                pu = float(person_setting["pu"]) if person_setting else 1.54
+                talma_monthly_summary = (int(monthly_count), pu, int(monthly_count) * pu)
         notice = ""
         if query.get("ok") == "1":
             notice = '<div class="notice ok">Pedido registrado correctamente.</div>'
@@ -1324,6 +1340,25 @@ class AppHandler(BaseHTTPRequestHandler):
             submit = '<button type="submit">Enviar mi pedido</button>'
 
         observation_html = "" if closed_for_date else '<label>Observación (opcional)</label><textarea name="observaciones" maxlength="300" placeholder="Ejemplo: sin cebolla, poco arroz..."></textarea>'
+        talma_monthly_html = ""
+        if talma_monthly_summary is not None:
+            monthly_count, pu, monthly_total = talma_monthly_summary
+            month_names = ("enero", "febrero", "marzo", "abril", "mayo", "junio",
+                           "julio", "agosto", "septiembre", "octubre", "noviembre", "diciembre")
+            month_year, month_number = (int(part) for part in today_iso()[:7].split("-"))
+            month_label = f"{month_names[month_number - 1]} {month_year}"
+            talma_monthly_html = f"""
+<section class="card talma-monthly-contribution" aria-label="Resumen mensual de pedidos y aporte">
+  <div><span class="muted">Pedidos de {esc(month_label)}</span><strong>{monthly_count}</strong></div>
+  <div><span class="muted">P/U · Aporte del trabajador</span><strong>S/ {monthly_total:.2f}</strong><small>{monthly_count} × S/ {pu:.2f}</small></div>
+</section>
+<style>
+.talma-monthly-contribution{{display:grid;grid-template-columns:1fr 1fr;gap:14px;margin:18px 0;padding:18px 20px;border:1px solid #cfe1e8;border-radius:14px;background:linear-gradient(135deg,#f5fafc,#fff)}}
+.talma-monthly-contribution>div{{display:flex;flex-direction:column;gap:4px}}
+.talma-monthly-contribution strong{{font-size:24px;color:#1d637a}}
+.talma-monthly-contribution small{{font-size:12px;color:#667085}}
+@media(max-width:520px){{.talma-monthly-contribution{{grid-template-columns:1fr}}}}
+</style>"""
 
         if public_orders:
             public_order_rows = "".join(
@@ -1402,6 +1437,7 @@ class AppHandler(BaseHTTPRequestHandler):
 {submit}
 </form>
 </div>
+{talma_monthly_html}
 {public_orders_html}
 
 <div class="card no-print" style="margin-top:24px">

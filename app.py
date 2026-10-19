@@ -2274,6 +2274,10 @@ def talma_admin_users():
     feedback = ""
     if request.args.get("ok") == "1":
         feedback = '<div class="notice success">Persona guardada correctamente.</div>'
+    elif request.args.get("ok") == "activated":
+        feedback = '<div class="notice success">Persona activada correctamente.</div>'
+    elif request.args.get("ok") == "deactivated":
+        feedback = '<div class="notice success">Persona desactivada correctamente.</div>'
     elif request.args.get("ok") == "deleted":
         feedback = '<div class="notice success">Persona manual desactivada correctamente.</div>'
     elif request.args.get("error"):
@@ -2306,11 +2310,15 @@ def talma_admin_users():
         status = "Activo" if r["active"] else "Inactivo"
         edit_href = (f'/talma/usuarios?editar={quote(str(r["id"]))}' if r["source"] == "manual"
                      else f'/talma/usuarios?editar_dni={quote(str(r["dni"]))}')
-        delete_arg = f'id={quote(str(r["id"]))}' if r["source"] == "manual" else f'dni={quote(str(r["dni"]))}'
-        delete_href = f'/talma/usuarios/eliminar?{delete_arg}'
-        actions = (f'<a class="small-action" href="{edit_href}">Editar</a> '
-                   f'<a class="small-action danger-text" href="{delete_href}" '
-                   f'onclick="return confirm(\'¿Desactivar esta persona?\');">Eliminar</a>')
+        next_active = 0 if r["active"] else 1
+        toggle_label = "Desactivar" if r["active"] else "Activar"
+        toggle_class = "deactivate-action" if r["active"] else "activate-action"
+        actions = (f'<div class="person-actions"><a class="small-action" href="{edit_href}">Editar</a> '
+                   f'<form method="post" action="/talma/usuarios/estado" class="toggle-person-form" '
+                   f'onSubmit="return confirm(\'¿{toggle_label} esta persona?\');">'
+                   f'<input type="hidden" name="dni" value="{orders_app.esc(r["dni"])}">'
+                   f'<input type="hidden" name="active" value="{next_active}">'
+                   f'<button type="submit" class="small-action {toggle_class}">{toggle_label}</button></form></div>')
 
         rows.append(
             f'<tr><td>{orders_app.esc(r["name"])}</td>'
@@ -2387,6 +2395,9 @@ def talma_admin_users():
 .table-wrap{overflow:auto}table{width:100%;border-collapse:collapse}
 th,td{padding:10px;border-bottom:1px solid #e4e7ec;text-align:left;vertical-align:top;white-space:nowrap}
 .small-action{color:#1d637a;font-weight:700;text-decoration:none}.danger-text{color:#b42318}
+.person-actions{display:flex;align-items:center;gap:12px}.toggle-person-form{margin:0}
+.toggle-person-form button{border:0;padding:0;background:none;font:inherit;cursor:pointer}
+.toggle-person-form .activate-action{color:#067647}.toggle-person-form .deactivate-action{color:#b42318}
 @media(max-width:800px){.admin-head,.section-head{flex-direction:column}}
 </style>"""
     return _talma_page("Personas TALMA", body, extra)
@@ -2477,6 +2488,35 @@ def talma_admin_users_edit():
                      (original_dni, email, name, area, pu, orders_app.now_iso()))
 
     return redirect("/talma/usuarios?ok=1")
+
+
+@app.post("/talma/usuarios/estado")
+def talma_admin_users_toggle_status():
+    if not _valid_talma_session(request.cookies.get("talma_session")):
+        return _talma_login()
+
+    dni = request.form.get("dni", "").strip()
+    active_text = request.form.get("active", "").strip()
+    if not re.fullmatch(r"\d{8}", dni) or active_text not in {"0", "1"}:
+        return redirect("/talma/usuarios?error=Datos+inv%C3%A1lidos")
+
+    is_roster_person = any(str(person.get("dni", "")).strip() == dni for person in orders_app.TALMA_ROSTER.values())
+    with orders_app.db() as conn:
+        manual = conn.execute("SELECT dni FROM talma_manual_users WHERE dni=?", (dni,)).fetchone()
+        if not manual and not is_roster_person:
+            return redirect("/talma/usuarios?error=Persona+no+encontrada")
+
+        active = int(active_text)
+        now = orders_app.now_iso()
+        if manual:
+            conn.execute("UPDATE talma_manual_users SET active=? WHERE dni=?", (active, dni))
+        conn.execute(
+            """INSERT INTO talma_person_settings(dni,active,updated_at) VALUES(?,?,?)
+               ON CONFLICT(dni) DO UPDATE SET active=excluded.active,updated_at=excluded.updated_at""",
+            (dni, active, now),
+        )
+
+    return redirect(f"/talma/usuarios?ok={'activated' if active else 'deactivated'}")
 
 
 @app.get("/talma/usuarios/eliminar")
