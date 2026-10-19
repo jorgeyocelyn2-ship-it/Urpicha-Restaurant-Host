@@ -617,7 +617,7 @@ Cualquier duda o sugerencia respecto al sistema, comunicarse por:<br>
 <br><span>Todos los derechos reservados · Urpicha Restaurante</span>
 </div>
 </footer>
-<style>.footer-logo{{display:block;width:148px;height:112px;object-fit:contain;border:0;outline:0;box-shadow:none;margin:0 auto 8px;border-radius:0;background:transparent;clip-path:inset(1px 1px 0 0);mix-blend-mode:multiply}}</style>
+<style>.footer-logo{{display:block;width:148px;height:112px;object-fit:contain;border:0;outline:0;box-shadow:none;margin:0 auto 8px;border-radius:0;background:transparent}}</style>
 </body></html>"""
 
 
