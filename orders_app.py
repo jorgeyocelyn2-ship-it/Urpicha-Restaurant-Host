@@ -152,6 +152,27 @@ def verify_talma_password(password: str, password_hash: str, password_salt: str)
         return False
 
 
+def preserve_legacy_manual_users_table(conn: sqlite3.Connection) -> None:
+    """Keep pre-DNI manual-user rows instead of dropping the legacy table."""
+    exists = conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='talma_manual_users'"
+    ).fetchone()
+    if not exists:
+        return
+    columns = {row["name"] for row in conn.execute("PRAGMA table_info(talma_manual_users)")}
+    if "dni" in columns:
+        return
+
+    legacy_name = "talma_manual_users_legacy"
+    suffix = 2
+    while conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?", (legacy_name,)
+    ).fetchone():
+        legacy_name = f"talma_manual_users_legacy_{suffix}"
+        suffix += 1
+    conn.execute(f'ALTER TABLE talma_manual_users RENAME TO "{legacy_name}"')
+
+
 def get_talma_manual_user(email: str, dni: str, include_inactive: bool = False):
     email = email.strip().lower()
     dni = dni.strip()
@@ -159,14 +180,9 @@ def get_talma_manual_user(email: str, dni: str, include_inactive: bool = False):
         return None
 
     with db() as conn:
-        # Make login independent from whether the admin page was opened first.
-        exists = conn.execute(
-            "SELECT name FROM sqlite_master WHERE type='table' AND name='talma_manual_users'"
-        ).fetchone()
-        if exists:
-            cols = {row["name"] for row in conn.execute("PRAGMA table_info(talma_manual_users)").fetchall()}
-            if "dni" not in cols:
-                conn.execute("DROP TABLE talma_manual_users")
+        # Make login independent from whether the admin page was opened first,
+        # while retaining any legacy rows for manual migration.
+        preserve_legacy_manual_users_table(conn)
 
         conn.execute("""
             CREATE TABLE IF NOT EXISTS talma_manual_users (
@@ -287,15 +303,9 @@ def init_db() -> None:
             (str(CONFIG.get("order_deadline", "11:30")),),
         )
 
-        # Personas TALMA manuales: se mantienen separadas del Excel oficial.
-        # Si existe la antigua tabla basada en "code", se elimina una sola vez.
-        manual_table = conn.execute(
-            "SELECT name FROM sqlite_master WHERE type='table' AND name='talma_manual_users'"
-        ).fetchone()
-        if manual_table:
-            manual_cols = {row["name"] for row in conn.execute("PRAGMA table_info(talma_manual_users)").fetchall()}
-            if "dni" not in manual_cols:
-                conn.execute("DROP TABLE talma_manual_users")
+        # Personas TALMA manuales: preserve legacy rows under an archive table
+        # if the old schema used a code instead of DNI.
+        preserve_legacy_manual_users_table(conn)
 
         conn.execute("""
             CREATE TABLE IF NOT EXISTS talma_manual_users (
@@ -362,35 +372,18 @@ def init_db() -> None:
         conn.execute("CREATE INDEX IF NOT EXISTS idx_orders_talma_dni ON orders(dni)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_orders_talma_code ON orders(login_code)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_orders_talma_email ON orders(login_email)")
-        # Elimina el enlace de demostración de versiones anteriores y garantiza
-        # los cuatro enlaces predeterminados solicitados.
-        conn.execute("DELETE FROM companies WHERE slug='empresa-demo'")
+        # Add missing default companies, but preserve all existing names,
+        # active states, tokens, and historical orders during a deploy.
         for company_name, company_slug in DEFAULT_COMPANIES:
             existing = conn.execute(
                 "SELECT id FROM companies WHERE slug=?",
                 (company_slug,),
             ).fetchone()
-            if existing:
-                conn.execute(
-                    "UPDATE companies SET name=?, active=1 WHERE id=?",
-                    (company_name, existing["id"]),
-                )
-            else:
+            if not existing:
                 conn.execute(
                     "INSERT INTO companies(name, slug, token, created_at) VALUES (?, ?, ?, ?)",
                     (company_name, company_slug, secrets.token_urlsafe(18), now_iso()),
                 )
-
-        today = today_iso()
-        menu_count = conn.execute("SELECT COUNT(*) FROM menu_items WHERE menu_date=?", (today,)).fetchone()[0]
-        if menu_count == 0:
-            demo = [
-                (today, "entrada", "Sopa del día"),
-                (today, "entrada", "Ensalada fresca"),
-                (today, "fondo", "Pollo al horno con arroz"),
-                (today, "fondo", "Lomo saltado"),
-            ]
-            conn.executemany("INSERT INTO menu_items(menu_date, category, name) VALUES (?, ?, ?)", demo)
 
         conn.execute(
         "INSERT OR IGNORE INTO order_settings(id, closing_time, manual_open_date, manual_closed, updated_at) VALUES(1, ?, '', 0, ?)",
@@ -585,40 +578,46 @@ def page(title: str, body: str, extra_head: str = "") -> str:
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>{esc(title)} · {restaurant}</title>
 <style>
-:root{{--bg:#f4f6f8;--card:#fff;--text:#18212b;--muted:#667085;--brand:#175cd3;--brand2:#0b4bab;--danger:#b42318;--ok:#067647;--line:#e4e7ec}}
-*{{box-sizing:border-box}} body{{margin:0;font-family:Inter,Segoe UI,Arial,sans-serif;background:var(--bg);color:var(--text)}}
-a{{color:var(--brand);text-decoration:none}} .topbar{{background:#101828;color:#fff;padding:10px 20px;display:flex;justify-content:space-between;align-items:center;gap:15px}}
+:root{{--bg:#f3f5f8;--card:#fff;--text:#182b39;--muted:#607181;--brand:#1d637a;--brand2:#174e60;--danger:#b5473d;--ok:#147653;--line:#dfe6eb;--surface:#edf3f6;--accent:#2b7183}}
+*{{box-sizing:border-box}} body{{position:relative;margin:0;font-family:"Segoe UI Variable","Segoe UI",system-ui,-apple-system,sans-serif;background:var(--bg);color:var(--text);line-height:1.5}}
+.brand-watermark{{position:absolute;z-index:1;pointer-events:none;right:2vw;bottom:190px;width:min(28vw,340px);height:min(24vh,210px);background:url('/static/urpicha-system-logo.png') center/contain no-repeat;opacity:.075;mix-blend-mode:multiply}}
+body>*:not(.brand-watermark){{position:relative;z-index:2}}
+a{{color:var(--brand);text-decoration:none}} .topbar{{background:linear-gradient(110deg,#142f3e,#1d5264);color:#fff;padding:14px clamp(16px,3vw,32px);display:flex;justify-content:space-between;align-items:center;gap:15px;box-shadow:0 4px 18px rgba(20,47,62,.16)}}
 .topbar-brand{{display:flex;align-items:center;gap:12px;min-width:0}}
+.brand-mark{{display:grid;place-items:center;width:38px;height:38px;flex:0 0 38px;border-radius:11px;background:#1d637a;color:#fff;font-size:19px;font-weight:900}}
 
-.topbar strong{{font-size:18px;line-height:1.2}} .topbar a{{color:#fff}} .wrap{{max-width:1180px;margin:24px auto;padding:0 16px}} .narrow{{max-width:720px}}
-.card{{background:var(--card);border:1px solid var(--line);border-radius:14px;padding:20px;margin-bottom:18px;box-shadow:0 2px 10px rgba(16,24,40,.04)}}
-h1,h2,h3{{margin-top:0}} h1{{font-size:28px}} h2{{font-size:21px}} .muted{{color:var(--muted)}} .grid{{display:grid;gap:16px}} .grid2{{grid-template-columns:repeat(2,minmax(0,1fr))}} .grid3{{grid-template-columns:repeat(3,minmax(0,1fr))}}
-label{{display:block;font-weight:600;margin:12px 0 6px}} input,select,textarea{{width:100%;padding:11px 12px;border:1px solid #d0d5dd;border-radius:9px;font:inherit;background:#fff}} textarea{{min-height:96px;resize:vertical}}
-button,.btn{{display:inline-block;border:0;border-radius:9px;padding:11px 15px;background:var(--brand);color:#fff;font-weight:700;cursor:pointer}} button:hover,.btn:hover{{background:var(--brand2)}} .btn.secondary{{background:#475467}} .btn.danger{{background:var(--danger)}} .btn.small{{padding:7px 10px;font-size:13px}}
+.topbar strong{{font-size:18px;line-height:1.2;letter-spacing:.01em}} .topbar a{{color:#fff}} .wrap{{max-width:1280px;margin:30px auto;padding:0 22px}} .narrow{{max-width:560px}}
+.card{{background:var(--card);border:1px solid var(--line);border-radius:18px;padding:24px;margin-bottom:20px;box-shadow:0 8px 24px rgba(24,54,43,.045)}}
+h1,h2,h3{{margin-top:0;line-height:1.2;letter-spacing:-.02em}} h1{{font-size:30px}} h2{{font-size:21px}} .muted{{color:var(--muted)}} .grid{{display:grid;gap:18px}} .grid2{{grid-template-columns:repeat(2,minmax(0,1fr))}} .grid3{{grid-template-columns:repeat(3,minmax(0,1fr))}}
+label{{display:block;font-weight:650;margin:12px 0 6px}} input,select,textarea{{width:100%;padding:12px 13px;border:1px solid #d1dce3;border-radius:11px;font:inherit;background:#fff;color:var(--text);transition:border-color .16s,box-shadow .16s}} input:focus,select:focus,textarea:focus{{outline:0;border-color:#2b7183;box-shadow:0 0 0 3px rgba(43,113,131,.15)}} textarea{{min-height:108px;resize:vertical}}
+button,.btn{{display:inline-block;border:0;border-radius:11px;padding:11px 16px;background:var(--brand);color:#fff;font-weight:750;cursor:pointer;transition:background .16s,transform .16s,box-shadow .16s}} button:hover,.btn:hover{{background:var(--brand2);box-shadow:0 5px 14px rgba(20,72,91,.17);transform:translateY(-1px)}} .btn.secondary{{background:#e7eff3;color:#294b5d}} .btn.secondary:hover{{background:#d8e6ec}} .btn.danger{{background:var(--danger)}} .btn.small{{padding:7px 10px;font-size:13px}}
 .notice{{padding:12px 14px;border-radius:9px;margin:12px 0}} .notice.ok{{background:#ecfdf3;color:var(--ok);border:1px solid #abefc6}} .notice.error{{background:#fef3f2;color:var(--danger);border:1px solid #fecdca}}
-table{{width:100%;border-collapse:collapse;font-size:14px}} th,td{{border-bottom:1px solid var(--line);padding:10px 8px;text-align:left;vertical-align:top}} th{{background:#f9fafb}} .table-wrap{{overflow:auto}} .actions{{display:flex;gap:8px;flex-wrap:wrap;align-items:center}}
-.stat{{padding:16px;border:1px solid var(--line);border-radius:12px;background:#fff}} .stat b{{display:block;font-size:26px;margin-top:5px}}
+table{{width:100%;border-collapse:collapse;font-size:14px}} th,td{{border-bottom:1px solid var(--line);padding:11px 10px;text-align:left;vertical-align:top}} th{{background:#edf3f6;color:#355368;font-size:12px;letter-spacing:.045em}} .table-wrap{{overflow:auto;border-radius:12px}} .actions{{display:flex;gap:10px;flex-wrap:wrap;align-items:center}}
+.stat{{padding:18px;border:1px solid var(--line);border-radius:16px;background:#fff}} .stat b{{display:block;font-size:28px;margin-top:6px;color:var(--brand)}}
 .menu-choice{{border:1px solid var(--line);border-radius:10px;padding:12px;margin:8px 0}} .menu-choice input{{width:auto;margin-right:8px}} .ticket{{border:2px dashed #333;padding:12px;margin:0 0 12px;break-inside:avoid;background:#fff}} .ticket h3{{margin-bottom:8px}}
 .registered-orders{{margin:0;padding-left:22px}} .registered-orders li{{padding:8px 0;border-bottom:1px solid var(--line)}} .registered-orders li:last-child{{border-bottom:0}}
-footer{{text-align:center;color:var(--muted);padding:28px 16px;font-size:13px;line-height:1.6;border-top:1px solid var(--line);margin-top:28px}} .support-footer{{max-width:1180px;margin:0 auto}}
-.admin-tabs{{display:flex;gap:8px;flex-wrap:wrap;background:#fff;border:1px solid var(--line);border-radius:12px;padding:8px;margin:0 0 18px;box-shadow:0 2px 10px rgba(16,24,40,.04)}}
-.admin-tabs a{{padding:10px 16px;border-radius:9px;font-weight:800;color:#344054}} .admin-tabs a:hover{{background:#f2f4f7}} .admin-tabs a.active{{background:var(--brand);color:#fff}}
-@media(max-width:760px){{.grid2,.grid3{{grid-template-columns:1fr}} .topbar{{align-items:flex-start;flex-direction:column}}}}
-@media print{{.no-print,.topbar,footer{{display:none!important}} body{{background:#fff}} .wrap{{max-width:none;margin:0;padding:0}} .card{{border:0;box-shadow:none;padding:0}} .ticket{{page-break-inside:avoid}}}}
+footer{{text-align:center;color:var(--muted);padding:30px 16px;font-size:13px;line-height:1.65;border-top:1px solid var(--line);margin-top:32px;background:rgba(255,255,255,.55)}} .support-footer{{max-width:1180px;margin:0 auto}}
+.admin-tabs{{display:flex;gap:7px;flex-wrap:wrap;background:#e7eff3;border:1px solid #d4e0e7;border-radius:15px;padding:7px;margin:0 0 20px;box-shadow:0 4px 14px rgba(20,47,62,.035)}}
+.admin-tabs a{{padding:10px 16px;border-radius:10px;font-weight:750;color:#35566a;transition:background .16s,color .16s}} .admin-tabs a:hover{{background:#d7e5eb}} .admin-tabs a.active{{background:var(--brand);color:#fff;box-shadow:0 3px 8px rgba(29,99,122,.2)}}
+@media(max-width:760px){{.grid2,.grid3{{grid-template-columns:1fr}} .topbar{{padding:12px 16px}}.wrap{{margin:22px auto;padding:0 15px}}.card{{padding:19px;border-radius:16px}}h1{{font-size:26px}}h2{{font-size:20px}}button,.btn{{min-height:44px}}}}
+@media print{{.no-print,.topbar,footer,.brand-watermark{{display:none!important}} body{{background:#fff}} .wrap{{max-width:none;margin:0;padding:0}} .card{{border:0;box-shadow:none;padding:0}} .ticket{{page-break-inside:avoid}}}}
 </style>
 {extra_head}
 </head>
 <body>
-<div class="topbar"><div class="topbar-brand"><strong>{restaurant}</strong></div></div>
+<div class="brand-watermark" aria-hidden="true"></div>
+<div class="topbar"><div class="topbar-brand"><span class="brand-mark" aria-hidden="true">U</span><strong>URPICHA</strong></div></div>
 {body}
 <footer>
 <div class="support-footer">
+<img class="footer-logo" src="/static/urpicha-system-logo.png" alt="Urpicha System">
 <strong>Soporte del sistema</strong><br>
 Cualquier duda o sugerencia respecto al sistema, comunicarse por:<br>
-931099267 &nbsp;|&nbsp; 927314911 &nbsp;|&nbsp; sebasoa0711@gmail.com
+931099267 &nbsp;|&nbsp; 921682225 &nbsp;|&nbsp; sebasoa0711@gmail.com
 <br><span>Todos los derechos reservados · Urpicha Restaurante</span>
 </div>
 </footer>
+<style>.footer-logo{{display:block;width:148px;height:112px;object-fit:contain;border:0;outline:0;box-shadow:none;margin:0 auto 8px;border-radius:0;background:transparent;clip-path:inset(3% 18% 0 0);transform:translateX(13px)}}</style>
 </body></html>"""
 
 
@@ -834,11 +833,11 @@ def talma_employee_login_page(token: str, error: str = "") -> str:
 </div>
 </main>"""
     extra="""<style>
-.talma-login-shell{min-height:100vh;display:flex;align-items:center;justify-content:center;padding:30px;background:linear-gradient(145deg,#f4f8fb 0%,#eef6f7 100%)}
-.talma-login-card{width:min(440px,100%);background:#fff;border:1px solid #d5e1e5;border-radius:18px;padding:34px;box-shadow:0 18px 50px rgba(19,60,70,.12)}
-.talma-brand{font-size:28px;font-weight:900;letter-spacing:4px;color:#006b78}.talma-line{height:4px;width:62px;background:#00a7b5;border-radius:6px;margin:10px 0 24px}
-.talma-login-card h1{font-size:25px;margin-bottom:8px;color:#18343b}.talma-subtitle{color:#667085;margin-top:0;margin-bottom:22px}
-.talma-login-card input{margin-bottom:6px}.talma-login-card button{width:100%;margin-top:12px;background:#006b78}.talma-login-card button:hover{background:#005761}
+.talma-login-shell{min-height:100vh;display:flex;align-items:center;justify-content:center;padding:30px;background:linear-gradient(145deg,#eef3f6 0%,#e2edf2 100%)}
+.talma-login-card{width:min(440px,100%);background:#fff;border:1px solid #d3e0e7;border-radius:18px;padding:34px;box-shadow:0 18px 50px rgba(20,55,72,.12)}
+.talma-brand{font-size:28px;font-weight:900;letter-spacing:4px;color:#1d637a}.talma-line{height:4px;width:62px;background:#2b7183;border-radius:6px;margin:10px 0 24px}
+.talma-login-card h1{font-size:25px;margin-bottom:8px;color:#182b39}.talma-subtitle{color:#667085;margin-top:0;margin-bottom:22px}
+.talma-login-card input{margin-bottom:6px}.talma-login-card button{width:100%;margin-top:12px;background:#1d637a}.talma-login-card button:hover{background:#174e60}
 .talma-help{font-size:12px;color:#7b8794;margin-top:10px;line-height:1.45}
 </style>"""
     return page("Acceso TALMA", body, extra)
@@ -1580,6 +1579,46 @@ class AppHandler(BaseHTTPRequestHandler):
         else:
             self.redirect("/admin?error=1")
 
+    def admin_section_page(self, title: str, body: str, active: str, extra_head: str = "") -> None:
+        """Render the main administration sections inside the shared Urpicha sidebar."""
+        links = [
+            ("dashboard", "/admin/dashboard", "Dashboard"),
+            ("personas", "/admin/personas", "Personas y consumo"),
+            ("resumen", "/admin/resumen", "Resumen visual"),
+            ("talma", "/admin/talma/", "TALMA"),
+            ("policia", "/admin/policia/", "POLICÍA"),
+        ]
+        nav = "".join(
+            f'<a class="{"active" if key == active else ""}" href="{href}"'
+            f'{" aria-current=\"page\"" if key == active else ""}>{label}</a>'
+            for key, href, label in links
+        )
+        shell = f"""<div class="admin-shell">
+<aside class="admin-sidebar no-print">
+  <a class="admin-brand" href="/admin/dashboard" aria-label="Urpicha, ir al dashboard"><span class="admin-brand-mark">U</span><span class="admin-brand-copy">URPICHA<small>ADMINISTRACIÓN</small></span></a>
+  <nav class="admin-tabs" aria-label="Navegación de administración">{nav}</nav>
+  <div class="admin-sidebar-footer"><a href="/admin/logout"><span aria-hidden="true">↪</span><span>Cerrar sesión</span></a></div>
+</aside>
+<div class="admin-main">{body}</div>
+</div>"""
+        styles = """<style>
+.topbar{display:none}
+.admin-shell{min-height:calc(100vh - 32px);display:grid;grid-template-columns:256px minmax(0,1fr);background:transparent;color:#18212c}
+.admin-sidebar{position:sticky;top:0;align-self:start;display:flex;flex-direction:column;gap:28px;height:100vh;padding:24px 16px 18px;background:#142f3e;color:#f5f9fc}
+.admin-brand{display:flex;align-items:center;gap:11px;min-height:54px;padding:0 8px 16px;border-bottom:1px solid rgba(229,240,248,.16);color:#fff;font-size:16px;font-weight:850;letter-spacing:.055em}
+.admin-brand-mark{display:grid;place-items:center;width:36px;height:36px;flex:0 0 36px;border-radius:11px;background:#1d637a;color:#fff;font-size:18px;font-weight:900;box-shadow:inset 0 0 0 1px rgba(255,255,255,.14)}
+.admin-brand-copy{display:block}.admin-brand-copy small{display:block;margin-top:3px;color:#a9c0ca;font-size:9px;letter-spacing:.14em;font-weight:700}
+.admin-main{min-width:0}
+.admin-sidebar .admin-tabs{display:flex;flex-direction:column;gap:5px;margin:0;padding:0;border:0;border-radius:0;background:transparent;box-shadow:none}
+.admin-sidebar .admin-tabs a{display:flex;align-items:center;min-height:42px;padding:10px 12px;border-radius:8px;color:#e5eef4;font-size:14px;font-weight:600;transition:background .16s,color .16s}
+.admin-sidebar .admin-tabs a:hover{background:#1d4052;color:#fff}.admin-sidebar .admin-tabs a.active{background:#2b5267;color:#fff;box-shadow:none}
+.admin-sidebar-footer{margin-top:auto;padding-top:13px;border-top:1px solid rgba(229,240,248,.16)}
+.admin-sidebar-footer a{display:flex;align-items:center;gap:11px;min-height:42px;padding:9px 12px;border-radius:8px;color:#d8e5ea;font-size:14px;font-weight:650;transition:background .16s,color .16s}
+.admin-sidebar-footer a:hover{background:#1d4052;color:#fff}
+@media(max-width:760px){.admin-shell{grid-template-columns:minmax(0,1fr);align-content:start}.admin-sidebar{position:static;height:auto;gap:12px;padding:12px 14px 10px}.admin-brand{min-height:40px;padding:0 7px 10px;font-size:15px}.admin-sidebar .admin-tabs{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:5px}.admin-sidebar .admin-tabs a{min-height:40px;padding:8px 10px;font-size:13px}.admin-sidebar-footer{margin-top:0;padding-top:7px}.admin-sidebar-footer a{min-height:38px;padding:7px 10px;font-size:13px}}
+</style>"""
+        self.send_html(page(title, shell, styles + extra_head))
+
     def admin_personas(self, query: dict[str, str]) -> None:
         company_filter = query.get("empresa", "").strip()
         search = query.get("buscar", "").strip()
@@ -1643,7 +1682,7 @@ class AppHandler(BaseHTTPRequestHandler):
 <p class="muted">TALMA se identifica principalmente por DNI; las demás empresas por nombre.</p>
 <div class="table-wrap"><table><thead><tr><th>Nombre</th><th>Empresa</th><th>DNI</th><th>Teléfono</th><th>Área</th><th>Total almuerzos</th><th>Primer pedido</th><th>Último pedido</th></tr></thead>
 <tbody>{rows_html}</tbody></table></div></div></main>"""
-        self.send_html(page("Base de datos · Personas", body))
+        self.admin_section_page("Base de datos · Personas", body, "personas")
 
     def admin_personas_excel(self, query: dict[str, str]) -> None:
         company_filter = query.get("empresa", "").strip()
@@ -1748,11 +1787,11 @@ class AppHandler(BaseHTTPRequestHandler):
 <div class="card" style="text-align:center"><h2>Resumen de {esc(fecha_con_dia(selected_date))}</h2><p class="muted">Esta pantalla se actualiza automáticamente cada 30 segundos.</p></div>
 </main><script>setTimeout(function(){{ location.reload(); }},30000);</script>"""
         extra="""<style>
-.hero-total{background:linear-gradient(135deg,#101828,#175cd3);color:white;border-radius:24px;padding:32px;text-align:center;margin-bottom:24px;box-shadow:0 14px 40px rgba(16,24,40,.22)}
+.hero-total{background:linear-gradient(135deg,#142f3e,#1d637a);color:white;border-radius:24px;padding:32px;text-align:center;margin-bottom:24px;box-shadow:0 14px 40px rgba(20,47,62,.20)}
 .hero-kicker{font-weight:800;letter-spacing:3px;font-size:14px;opacity:.9}.hero-number{font-size:72px;font-weight:900;line-height:1;margin:10px 0}.hero-date{font-size:20px;font-weight:700}
-.company-cards{display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:20px;margin-bottom:24px}.big-company-card{background:white;border:1px solid #e4e7ec;border-radius:22px;padding:26px;text-align:center;box-shadow:0 8px 24px rgba(16,24,40,.08)}.company-name{font-size:25px;font-weight:900}.company-total{font-size:64px;font-weight:900;margin:12px 0;color:#175cd3}.company-label{font-size:13px;font-weight:800;letter-spacing:1.5px;color:#667085}.talma-split{display:grid;grid-template-columns:1fr 1fr;gap:10px;margin:14px 0 12px}.talma-split>div{border:1px solid #e4e7ec;border-radius:16px;padding:10px 8px;background:#f8fafc}.talma-split span{display:block;font-size:12px;font-weight:900;letter-spacing:1px;color:#667085}.talma-split strong{display:block;font-size:42px;line-height:1.05;margin-top:5px;color:#175cd3}
+.company-cards{display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:20px;margin-bottom:24px}.big-company-card{background:white;border:1px solid #dfe6eb;border-radius:22px;padding:26px;text-align:center;box-shadow:0 8px 24px rgba(20,47,62,.07)}.company-name{font-size:25px;font-weight:900}.company-total{font-size:64px;font-weight:900;margin:12px 0;color:#1d637a}.company-label{font-size:13px;font-weight:800;letter-spacing:1.5px;color:#667085}.talma-split{display:grid;grid-template-columns:1fr 1fr;gap:10px;margin:14px 0 12px}.talma-split>div{border:1px solid #dfe6eb;border-radius:16px;padding:10px 8px;background:#f3f7f9}.talma-split span{display:block;font-size:12px;font-weight:900;letter-spacing:1px;color:#667085}.talma-split strong{display:block;font-size:42px;line-height:1.05;margin-top:5px;color:#1d637a}
 </style>"""
-        self.send_html(page("Resumen de almuerzos", body, extra))
+        self.admin_section_page("Resumen de almuerzos", body, "resumen", extra)
 
     def admin_order_settings(self, query: dict[str, str]) -> None:
         settings = get_order_settings()
@@ -1787,7 +1826,7 @@ class AppHandler(BaseHTTPRequestHandler):
   </div>
   <div class="actions">
     <form method="post" action="/admin/pedidos/reabrir">
-      <button type="submit">🔓 Abrir pedidos ahora</button>
+      <button type="submit">Abrir pedidos ahora</button>
     </form>
     <form method="post" action="/admin/pedidos/cerrar-manual" onsubmit="return confirm('¿Cerrar los pedidos manualmente?')">
       <button type="submit" class="btn danger">🔒 Cerrar pedidos ahora</button>
@@ -1798,7 +1837,7 @@ class AppHandler(BaseHTTPRequestHandler):
 <div class="card">
   <h2>Pedido manual</h2>
   <p class="muted">Registra un pedido recibido por teléfono, WhatsApp u otro medio. Esta opción funciona aunque los pedidos públicos estén cerrados.</p>
-  <a class="btn" href="/admin/pedidos/manual">📝 Ingresar pedido manual</a>
+  <a class="btn" href="/admin/pedidos/manual">Ingresar pedido manual</a>
 </div>
 </main>"""
         self.send_html(page("Gestión de pedidos", body))
@@ -2055,24 +2094,36 @@ class AppHandler(BaseHTTPRequestHandler):
             notice = ""
 
         body = f"""
-<main class="wrap">
-<div class="actions no-print" style="justify-content:space-between;margin-bottom:16px"><h1 style="margin:0">Panel administrador</h1><a href="/admin/logout">Cerrar sesión</a></div>
-<div class="admin-tabs no-print"><a class="active" href="/admin/pedidos">Pedidos</a><a href="/admin/personas"> Personas y consumo</a><a href="/admin/resumen"> Resumen visual</a><a href="/admin/talma/">TALMA</a><a href="/admin/policia/">POLICÍA</a></div>
+<div class="admin-shell">
+<aside class="admin-sidebar no-print">
+  <a class="admin-brand" href="/admin/dashboard" aria-label="Urpicha, ir al dashboard"><span class="admin-brand-mark">U</span><span class="admin-brand-copy">URPICHA<small>ADMINISTRACIÓN</small></span></a>
+  <nav class="admin-tabs" aria-label="Navegación de administración">
+    <a class="active" href="/admin/dashboard" aria-current="page">Dashboard</a>
+    <a href="/admin/personas">Personas y consumo</a>
+    <a href="/admin/resumen">Resumen visual</a>
+    <a href="/admin/talma/">TALMA</a>
+    <a href="/admin/policia/">POLICÍA</a>
+  </nav>
+  <div class="admin-sidebar-footer"><a href="/admin/logout"><span aria-hidden="true">↪</span><span>Cerrar sesión</span></a></div>
+</aside>
+<div class="admin-main">
+<main class="admin-dashboard">
+<div class="admin-titlebar no-print"><div><h1>Resumen</h1><p class="muted">Panel de gestión de pedidos y menú</p></div></div>
 {notice}
-<div class="grid grid3">
+<div class="grid grid3 admin-kpis">
 <div class="stat">Pedidos del día<b>{total_today}</b></div><div class="stat">Empresas activas<b>{company_total}</b></div><div class="stat">Fecha seleccionada<b style="font-size:18px">{esc(selected_date)}</b></div>
 </div>
-<div class="card no-print">
+<div class="card no-print admin-operations">
 <h2>Gestión de pedidos</h2>
 <p class="muted">Configura el horario, reabre pedidos después del cierre sin cambiar la hora configurada o registra un pedido manual.</p>
 <div class="actions">
-<a class="btn secondary" href="/admin/pedidos/configuracion">⚙️ Configurar hora de cierre</a>
-<form method="post" action="/admin/pedidos/reabrir" style="display:inline"><button type="submit">🔓 Abrir pedidos ahora</button></form>
-<a class="btn" href="/admin/pedidos/manual">📝 Ingresar pedido manual</a>
+<a class="btn secondary" href="/admin/pedidos/configuracion">Configurar hora de cierre</a>
+<form method="post" action="/admin/pedidos/reabrir" style="display:inline"><button type="submit">Abrir pedidos ahora</button></form>
+<a class="btn" href="/admin/pedidos/manual">Ingresar pedido manual</a>
 </div>
 </div>
 
-<div class="card no-print">
+<div class="card no-print admin-menu-query">
 <h2> Consultar menú de cualquier día</h2>
 <form method="get" action="/admin/dashboard" class="actions" style="align-items:end;gap:12px;flex-wrap:wrap">
   <div>
@@ -2095,7 +2146,7 @@ class AppHandler(BaseHTTPRequestHandler):
 <p class="muted" style="margin-bottom:0">Al cambiar la fecha y pulsar <b>Ver menú</b>, se carga directamente el menú guardado para ese día desde la base de datos.</p>
 </div>
 
-<div class="card no-print">
+<div class="card no-print admin-menu-editor">
 <h2>Menú diario</h2>
 <form method="post" action="/admin/menu">
 <div class="grid grid2"><div><label>Fecha</label><input type="date" name="fecha" value="{esc(selected_date)}" required></div><div><p class="muted">Escriba un plato por línea. Al guardar, reemplaza el menú de esa fecha.</p></div></div>
@@ -2109,7 +2160,7 @@ class AppHandler(BaseHTTPRequestHandler):
 </div>
 </div>
 
-<div class="card no-print">
+<div class="card no-print admin-companies">
 <h2>Empresas y enlaces privados</h2>
 <form method="post" action="/admin/empresa" class="actions"><input name="nombre" required placeholder="Nombre de la nueva empresa" style="max-width:420px"><button>Crear empresa</button></form>
 <div class="table-wrap"><table><thead><tr><th>Empresa</th><th>Enlace para empleados</th><th>Estado</th><th></th></tr></thead><tbody>{company_rows}</tbody></table></div>
@@ -2117,7 +2168,7 @@ class AppHandler(BaseHTTPRequestHandler):
 
 
 
-<div class="card">
+<div class="card admin-order-summary">
 <h2>Pedidos y resumen</h2>
 <form method="get" action="/admin/dashboard" class="grid grid3 no-print">
 <div><label>Fecha</label><input type="date" name="fecha" value="{esc(selected_date)}"></div><div><label>Empresa</label><select name="empresa">{company_options}</select></div><div style="align-self:end"><button>Aplicar filtro</button></div>
@@ -2127,7 +2178,7 @@ class AppHandler(BaseHTTPRequestHandler):
 <div class="table-wrap"><table><thead><tr><th>Empresa</th><th>DNI</th><th>Empleado</th><th>Área</th><th>Entrada</th><th>Fondo</th><th>Modalidad</th><th>Observación</th><th>Hora</th><th></th></tr></thead><tbody>{order_rows}</tbody></table></div>
 </div>
 
-<div class="card no-print" id="excel-historico">
+<div class="card no-print admin-history" id="excel-historico">
 <h2> Actualizar un Excel pasado / reporte histórico</h2>
 <p class="muted">Esta opción está dentro del panel de <b>Pedidos</b>. Sube aquí un Excel de días o meses anteriores y el sistema lo combinará con los pedidos que ya están registrados actualmente.</p>
 <div class="grid grid2">
@@ -2150,8 +2201,84 @@ class AppHandler(BaseHTTPRequestHandler):
 </div>
 <p class="muted" style="margin-bottom:0"><b>Importante:</b> el archivo original no se modifica. Se descarga una copia nueva con el reporte actualizado.</p>
 </div>
-</main>"""
-        self.send_html(page("Panel administrador", body))
+</main>
+</div>
+</div>"""
+        dashboard_styles = """<style>
+.topbar{display:none}
+.admin-shell{min-height:100vh;display:grid;grid-template-columns:256px minmax(0,1fr);background:transparent;color:#18212c}
+.admin-sidebar{position:sticky;top:0;align-self:start;display:flex;flex-direction:column;gap:28px;height:100vh;padding:24px 16px 18px;background:#142f3e;color:#f5f9fc}
+.admin-brand{display:flex;align-items:center;gap:11px;min-height:54px;padding:0 8px 16px;border-bottom:1px solid rgba(229,240,248,.16);color:#fff;font-size:16px;font-weight:850;letter-spacing:.055em}
+.admin-brand-mark{display:grid;place-items:center;width:36px;height:36px;flex:0 0 36px;border-radius:11px;background:#1d637a;color:#fff;font-size:18px;font-weight:900;box-shadow:inset 0 0 0 1px rgba(255,255,255,.14)}
+.admin-brand-copy{display:block}.admin-brand-copy small{display:block;margin-top:3px;color:#a9c0ca;font-size:9px;letter-spacing:.14em;font-weight:700}
+.admin-main{min-width:0}
+.admin-dashboard{max-width:1380px;padding:34px clamp(20px,3.2vw,48px);margin:0 auto}
+.admin-titlebar{display:flex;justify-content:space-between;align-items:center;gap:18px;margin:0 2px 22px}
+.admin-titlebar h1{margin:0;color:#182b39;font-size:30px;letter-spacing:-.035em}
+.admin-titlebar p{margin:5px 0 0;font-size:14px}
+.admin-titlebar>a{display:inline-flex;align-items:center;min-height:40px;padding:8px 14px;border:1px solid #dbe3eb;border-radius:9px;background:#fff;color:#314c5e;font-size:14px;font-weight:750}
+.admin-titlebar>a:hover{background:#edf3f7}
+.admin-sidebar .admin-tabs{display:flex;flex-direction:column;gap:5px;margin:0;padding:0;border:0;border-radius:0;background:transparent;box-shadow:none}
+.admin-sidebar .admin-tabs a{display:flex;align-items:center;min-height:42px;padding:10px 12px;border-radius:8px;color:#e5eef4;font-size:14px;font-weight:600;transition:background .16s,color .16s}
+.admin-sidebar .admin-tabs a:hover{background:#1d4052;color:#fff}
+.admin-sidebar .admin-tabs a.active{background:#2b5267;color:#fff;box-shadow:none}
+.admin-sidebar-footer{margin-top:auto;padding-top:13px;border-top:1px solid rgba(229,240,248,.16)}
+.admin-sidebar-footer a{display:flex;align-items:center;gap:11px;min-height:42px;padding:9px 12px;border-radius:8px;color:#d8e5ea;font-size:14px;font-weight:650;transition:background .16s,color .16s}
+.admin-sidebar-footer a:hover{background:#1d4052;color:#fff}
+.admin-dashboard .notice{border-radius:10px}
+.admin-kpis{grid-template-columns:repeat(3,minmax(0,1fr));gap:14px;margin-bottom:18px}
+.admin-kpis .stat{min-height:88px;padding:15px 18px;border:1px solid #edf0f4;border-radius:10px;background:#fff;box-shadow:none;color:#536275;font-size:13px}
+.admin-kpis .stat>b{font-size:27px;color:#172c3b}
+.admin-kpis .stat:nth-child(2)>b{color:#1d637a}
+.admin-kpis .stat:nth-child(3)>b{font-size:16px!important;color:#42586a}
+.admin-dashboard>.card{padding:22px 23px;margin-bottom:16px;border:1px solid #e6ebf0;border-radius:11px;box-shadow:0 3px 12px rgba(24,44,58,.035)}
+.admin-dashboard>.card h2{margin-bottom:9px;font-size:19px;color:#203849}
+.admin-dashboard>.card h3{font-size:15px;color:#355368}
+.admin-dashboard .muted{line-height:1.55}
+.admin-operations .actions{gap:10px;align-items:stretch}
+.admin-operations .actions>.btn,.admin-operations .actions>form button{display:inline-flex;align-items:center;justify-content:center;min-height:46px;padding:11px 18px;border:1px solid transparent;border-radius:10px;font-family:inherit;font-size:14px;font-weight:700;line-height:1.25;text-align:center}
+.admin-operations .actions>.btn.secondary{background:#e7eff3;border-color:#d5e2e8;color:#294b5d}
+.admin-operations .actions>.btn.secondary:hover{background:#d8e6ec}
+.admin-operations .actions>form button{background:#174e60;color:#fff;cursor:pointer}
+.admin-operations .actions>form button:hover{background:#123e4e}
+.admin-operations .actions>a[href="/admin/pedidos/manual"]{background:#1d637a;color:#fff}
+.admin-operations .actions>a[href="/admin/pedidos/manual"]:hover{background:#174e60}
+.admin-menu-query input[type=date],.admin-order-summary input[type=date]{min-width:190px}
+.admin-menu-editor textarea{min-height:128px}
+.admin-menu-editor .notice{background:#f1f7f2;border-color:#d9e8dd;color:#385c4d}
+.admin-companies .actions input{max-width:460px;padding-right:14px}
+.admin-companies .table-wrap{margin-top:14px;border:1px solid #e6ebf0}
+.admin-companies table{min-width:620px}
+.admin-companies code{display:inline-block;max-width:100%;padding:5px 7px;border-radius:7px;background:#f1f5f8;color:#426074;white-space:normal;word-break:break-all}
+.admin-order-summary .table-wrap{border:1px solid #e6ebf0}
+.admin-order-summary table{min-width:900px}
+.admin-order-summary .grid2{margin:14px 0}
+.admin-history{background:#fff}
+.admin-history h3{margin-bottom:8px}
+@media(max-width:760px){
+ .admin-shell{grid-template-columns:minmax(0,1fr);align-content:start}
+ .admin-sidebar{position:static;height:auto;gap:12px;padding:12px 14px 10px}
+ .admin-brand{min-height:40px;padding:0 7px 10px;font-size:15px}
+ .admin-sidebar .admin-tabs{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:5px}
+ .admin-sidebar .admin-tabs a{min-height:40px;padding:8px 10px;font-size:13px}
+ .admin-sidebar-footer{margin-top:0;padding-top:7px}
+ .admin-sidebar-footer a{min-height:38px;padding:7px 10px;font-size:13px}
+ .admin-dashboard{margin:0 auto;padding:22px 14px}
+ .admin-titlebar{align-items:flex-start;flex-direction:row;margin:0 2px 16px}
+ .admin-titlebar h1{font-size:25px}
+ .admin-titlebar>a{align-self:center;white-space:nowrap}
+ .admin-dashboard>.card{padding:18px 16px;margin-bottom:13px}
+ .admin-kpis{grid-template-columns:repeat(2,minmax(0,1fr));gap:10px;margin-bottom:15px}
+ .admin-kpis .stat{min-height:76px;padding:12px 13px;font-size:12px;line-height:1.3}
+ .admin-kpis .stat>b{font-size:23px}
+ .admin-kpis .stat:nth-child(3){grid-column:1/-1;min-height:66px}
+ .admin-kpis .stat:nth-child(3)>b{font-size:16px!important}
+ .admin-dashboard .actions>.btn,.admin-dashboard .actions>form{flex:1 1 100%}
+ .admin-dashboard .actions>form button{width:100%}
+ .admin-menu-query input[type=date],.admin-order-summary input[type=date]{min-width:0}
+}
+</style>"""
+        self.send_html(page("Panel administrador", body, dashboard_styles))
 
     def save_menu(self) -> None:
         """Guarda de forma atómica el menú de una fecha y verifica inmediatamente lo almacenado."""

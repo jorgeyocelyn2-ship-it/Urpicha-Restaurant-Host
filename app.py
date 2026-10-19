@@ -84,7 +84,7 @@ def esc(value):
     """Escapa valores antes de insertarlos en HTML generado por el portal TALMA."""
     return str(escape("" if value is None else value))
 
-def page(title: str, body: str) -> str:
+def page(title: str, body: str, *, show_topbar: bool = True) -> str:
     """Página HTML base usada por el portal privado TALMA."""
     return f"""<!doctype html>
 <html lang=\"es\">
@@ -94,12 +94,30 @@ def page(title: str, body: str) -> str:
 <meta name=\"robots\" content=\"noindex,nofollow\">
 <title>{esc(title)} — Urpicha Restaurante</title>
 <style>{SCANNER_CSS}
-.wrap{{max-width:1200px;margin:30px auto;padding:20px}}
+:root{{--brand:#1d637a;--brand-dark:#174e60;--ink:#182b39;--muted:#607181;--line:#dfe6eb;--canvas:#f3f5f8;--surface:#edf3f6;--gold:#bd8b3d}}
+body{{position:relative;font-family:"Segoe UI Variable","Segoe UI",system-ui,-apple-system,sans-serif;background:var(--canvas);color:var(--ink);line-height:1.5}}
+.brand-watermark{{position:absolute;z-index:1;pointer-events:none;right:2vw;bottom:190px;width:min(28vw,340px);height:min(24vh,210px);background:url('/static/urpicha-system-logo.png') center/contain no-repeat;opacity:.075;mix-blend-mode:multiply}}
+body>*:not(.brand-watermark){{position:relative;z-index:2}}
+.wrap{{max-width:1280px;margin:30px auto;padding:20px}}
 .narrow{{max-width:560px}}
-.card{{background:#fff;padding:24px;border:1px solid #d8dfe6;border-radius:15px;box-shadow:0 5px 18px rgba(0,0,0,.05);margin-bottom:20px}}
+.card{{background:#fff;padding:26px;border:1px solid var(--line);border-radius:18px;box-shadow:0 8px 24px rgba(20,47,62,.05);margin-bottom:20px}}
+h1,h2,h3{{line-height:1.2;letter-spacing:-.025em;color:#203849}}
+h1{{font-size:30px}}
+input,select,textarea{{border-color:#d1dce3;border-radius:11px;padding:12px 13px;font:inherit;color:var(--ink);transition:border-color .16s,box-shadow .16s}}
+input:focus,select:focus,textarea:focus{{outline:0;border-color:#2b7183;box-shadow:0 0 0 3px rgba(43,113,131,.15)}}
+button,.button,.btn{{border-radius:11px;background:var(--brand);padding:11px 16px;font-weight:750;transition:background .16s,transform .16s,box-shadow .16s}}
+button:hover,.button:hover,.btn:hover{{background:var(--brand-dark);box-shadow:0 5px 14px rgba(20,72,91,.17);transform:translateY(-1px)}}
+.button.secondary,.btn.secondary,.secondary{{background:#e7eff3;color:#294b5d}}
+.button.secondary:hover,.btn.secondary:hover,.secondary:hover{{background:#d8e6ec}}
+.topbar{{background:linear-gradient(110deg,#142f3e,#1d5264);padding:14px clamp(16px,3vw,32px);box-shadow:0 4px 18px rgba(20,47,62,.16)}}
+.topbar strong{{font-size:18px;letter-spacing:.01em}}
+.wrap.narrow{{max-width:520px;margin:clamp(30px,7vh,76px) auto}}
+.wrap.narrow .card{{padding:clamp(22px,5vw,34px)}}
+.wrap.narrow input[type=password]{{width:100%;box-sizing:border-box}}
+.wrap.narrow button{{width:100%;margin-top:10px;min-height:46px}}
 .actions{{display:flex;gap:10px;align-items:center;flex-wrap:wrap}}
-.btn{{display:inline-block;border:0;border-radius:9px;padding:10px 14px;background:#176b43;color:#fff;text-decoration:none;font-weight:700}}
-.btn.secondary{{background:#e7edf1;color:#17212b}}
+.btn{{display:inline-flex;align-items:center;justify-content:center;border:0;border-radius:11px;padding:11px 15px;background:var(--brand);color:#fff;text-decoration:none;font-weight:750}}
+.btn.secondary{{background:#e9f0eb;color:#294b3f}}
 .muted{{color:#5f6b76}}
 .notice{{padding:12px 14px;border-radius:8px;background:#e9f6ef;margin:12px 0}}
 .notice.error{{background:#fdecea;color:#8a1c13;border-left:5px solid #b42318}}
@@ -109,24 +127,34 @@ def page(title: str, body: str) -> str:
 .stat b{{display:block;font-size:28px;margin-top:6px}}
 .table-wrap{{overflow:auto}}
 @media(max-width:800px){{.grid3{{grid-template-columns:1fr}}}}
-.topbar{{background:#101828;color:#fff;padding:10px 20px;display:flex;align-items:center;gap:12px;box-shadow:0 2px 10px rgba(0,0,0,.12)}}
+.topbar{{color:#fff;display:flex;align-items:center;gap:12px}}
 .topbar-brand{{display:flex;align-items:center;gap:12px;min-width:0}}
+.brand-mark{{display:grid;place-items:center;width:38px;height:38px;flex:0 0 38px;border-radius:11px;background:#1d637a;color:#fff;font-size:19px;font-weight:900}}
 
 .topbar strong{{font-size:18px;line-height:1.2}}
 
-@media(max-width:800px){{.topbar{{padding:8px 12px}}}}
-@media print{{}}
+.site-footer{{color:var(--muted);border-color:var(--line);background:rgba(255,255,255,.55)}}
+.admin-nav{{background:linear-gradient(110deg,#142f3e,#1d5264);border-color:#284b5c}}
+.admin-nav a.active{{background:#2b5267;color:#fff}}
+.system-card{{border-color:var(--line);border-radius:20px;box-shadow:0 8px 24px rgba(20,47,62,.05)}}
+.system-card.policia{{border-color:#bfd0d7}}
+.badge.talma{{background:#e5eff3;color:#1d637a}}
+.badge.policia{{background:#e8eef2;color:#35566a}}
+
+@media(max-width:800px){{.topbar{{padding:12px 16px}}.wrap{{padding:16px;margin:18px auto}}.card{{padding:20px}}h1{{font-size:26px}}}}
+@media print{{.brand-watermark{{display:none!important}}}}
 </style>
 </head>
-<body><div class="topbar"><div class="topbar-brand"><strong>Urpicha Restaurante</strong></div></div>
+<body><div class="brand-watermark" aria-hidden="true"></div>{'<div class="topbar"><div class="topbar-brand"><span class="brand-mark" aria-hidden="true">U</span><strong>URPICHA</strong></div></div>' if show_topbar else ''}
 {body}
 <footer class="site-footer">
+<img class="footer-logo" src="/static/urpicha-system-logo.png" alt="Urpicha System">
 <strong>Soporte del sistema</strong><br>
 Cualquier duda o sugerencia respecto al sistema, comunicarse por:<br>
-931099267 &nbsp;|&nbsp; 927314911 &nbsp;|&nbsp; sebasoa0711@gmail.com
+931099267 &nbsp;|&nbsp; 921682225 &nbsp;|&nbsp; sebasoa0711@gmail.com
 <br><span>Todos los derechos reservados · Urpicha Restaurante</span>
 </footer>
-<style>.site-footer{{text-align:center;color:#667085;padding:28px 16px;font-size:13px;line-height:1.6;border-top:1px solid #d8dfe6;margin-top:28px;background:#fff}}</style>
+<style>.site-footer{{text-align:center;color:#667085;padding:28px 16px;font-size:13px;line-height:1.6;border-top:1px solid #d8dfe6;margin-top:28px;background:#fff}}.footer-logo{{display:block;width:148px;height:112px;object-fit:contain;border:0;outline:0;box-shadow:none;margin:0 auto 8px;border-radius:0;background:transparent;clip-path:inset(3% 18% 0 0);transform:translateX(13px)}}</style>
 </body>
 </html>"""
 DATA_ROOT = Path(os.environ.get("DATA_DIR", str(ROOT / "datos"))).expanduser().resolve()
@@ -749,7 +777,7 @@ def error_handler(error):
         # Último recurso para que un fallo de plantilla nunca termine como 502 opaco.
         return Response(
             "<!doctype html><html lang='es'><meta charset='utf-8'><title>Error</title>"
-            "<body style='font-family:Arial;padding:24px'><h1>Error del panel</h1><p>"
+            "<body style='font-family:Segoe UI,system-ui,sans-serif;padding:24px'><h1>Error del panel</h1><p>"
             + str(escape(str(error)))
             + "</p><pre style='white-space:pre-wrap'>"
             + str(escape(detail))
@@ -1798,37 +1826,92 @@ def _valid_talma_session(value: str | None) -> bool:
 
 
 def _talma_page(title: str, body: str, extra: str = "") -> str:
-    query = request.query_string.decode("latin-1") if request.query_string else ""
-    suffix = f"?{query}" if query else ""
-    if title == "Personas TALMA":
-        excel_href = "/talma/usuarios/excel"
-    elif title == "Report P/U":
-        separator = "&" if query else "?"
-        excel_href = f"/talma/report-pu{suffix}{separator}formato=excel"
-    else:
-        excel_href = "/talma/excel" + suffix
+    active = (
+        "people" if title == "Personas TALMA"
+        else "consult" if title == "Report P/U"
+        else "consult" if request.path == "/talma/consultar-pedidos"
+        else "dashboard"
+    )
     return page(title, f"""
-<main class="wrap">
-<div class="actions no-print" style="justify-content:space-between;margin-bottom:16px">
-  <h1 style="margin:0">Portal TALMA</h1>
-  <span class="actions">
-  <a class="btn secondary" href="/talma/usuarios">Personas TALMA</a>
-  <a class="btn secondary" href="{excel_href}">{'Descargar Excel de personas' if title == "Personas TALMA" else 'Descargar Excel'}</a>
-  <a class="btn secondary" href="/talma/cupones{suffix}">Generar cupones</a>
-  <a class="btn secondary" href="/talma/logout">Cerrar sesión</a></span>
-</div>
+<div class="talma-layout">
+<aside class="talma-sidebar no-print">
+  <a class="talma-brand" href="/talma/" aria-label="Urpicha TALMA, ir al dashboard"><span class="talma-brand-mark">U</span><span>URPICHA<span class="talma-brand-caption">PORTAL TALMA</span></span></a>
+  <div class="talma-nav-label">MENÚ PRINCIPAL</div>
+  <nav class="talma-navigation" aria-label="Navegación de TALMA">
+    <a class="{'active' if active == 'dashboard' else ''}" href="/talma/" {'aria-current="page"' if active == 'dashboard' else ''}><span class="talma-nav-icon">⌂</span><span>Dashboard</span></a>
+    <a class="{'active' if active == 'consult' else ''}" href="/talma/consultar-pedidos" {'aria-current="page"' if active == 'consult' else ''}><span class="talma-nav-icon">⌕</span><span>Consultar pedidos</span></a>
+    <a class="{'active' if active == 'people' else ''}" href="/talma/usuarios" {'aria-current="page"' if active == 'people' else ''}><span class="talma-nav-icon">♙</span><span>Personas TALMA</span></a>
+  </nav>
+  <a class="talma-mobile-logout" href="/talma/logout"><span class="talma-nav-icon">↪</span><span>Cerrar sesión</span></a>
+  <div class="talma-sidebar-footer"><a href="/talma/logout"><span class="talma-nav-icon">↪</span><span>Cerrar sesión</span></a></div>
+</aside>
+<main class="talma-main">
+<div class="talma-content talma-page"><header class="talma-page-heading"><div><div class="talma-eyebrow">PORTAL TALMA</div><h1>{esc(title if title != 'TALMA' else 'Dashboard')}</h1></div></header>
 {body}
+</div>
 </main>
+</div>
 <style>
 .talma-filters{{padding:20px 22px}}
-.talma-filters .filter-title{{font-size:20px;font-weight:800;margin-bottom:14px;color:#17212b}}
+.talma-filters .filter-title{{font-size:20px;font-weight:800;margin-bottom:14px;color:#203849}}
 .talma-filters label{{font-size:14px}}
 .talma-filters input{{margin-top:5px}}
 .talma-filters .filter-actions{{margin-top:16px}}
 .talma-filters .filter-actions .btn,.talma-filters .filter-actions button{{white-space:nowrap}}
+.talma-layout{{--talma-ink:#172f3d;--talma-teal:#1d637a;--talma-teal-light:#2b7183;min-height:100vh;display:grid;grid-template-columns:252px minmax(0,1fr);background:transparent}}
+.talma-sidebar{{position:sticky;top:0;height:100vh;box-sizing:border-box;background:linear-gradient(180deg,#142f3e 0%,#173b4c 100%);color:#f5f8fa;padding:25px 17px 18px;display:flex;flex-direction:column;box-shadow:8px 0 24px rgba(15,39,52,.08);z-index:2}}
+.talma-brand{{display:flex;align-items:center;gap:11px;color:#fff;text-decoration:none;font-weight:850;letter-spacing:.055em;font-size:16px;padding:2px 8px 24px;border-bottom:1px solid rgba(255,255,255,.16)}}
+.talma-brand-mark{{width:36px;height:36px;border-radius:11px;background:#1d637a;color:#fff;display:grid;place-items:center;font-weight:900;font-size:18px;box-shadow:inset 0 0 0 1px rgba(255,255,255,.14)}}
+.talma-brand-caption{{display:block;font-size:10px;letter-spacing:.14em;color:#a9c0ca;font-weight:700;margin-top:3px}}
+.talma-nav-label{{font-size:10px;letter-spacing:.15em;color:#9cb3bd;font-weight:800;padding:25px 10px 9px}}
+.talma-navigation{{display:grid;gap:5px}}
+.talma-navigation a,.talma-sidebar-footer a{{min-height:43px;box-sizing:border-box;display:flex;align-items:center;gap:11px;padding:10px 11px;border-radius:10px;color:#d8e5ea;text-decoration:none;font-size:14px;font-weight:650;transition:background .16s,color .16s}}
+.talma-navigation a:hover,.talma-sidebar-footer a:hover{{background:rgba(255,255,255,.09);color:#fff}}
+.talma-navigation a.active{{background:#2b5267;color:#fff;box-shadow:inset 3px 0 #66c1cc}}
+.talma-nav-icon{{width:20px;text-align:center;font-size:17px;line-height:1;color:#b6d1da}}
+.talma-sidebar-footer{{margin-top:auto;border-top:1px solid rgba(255,255,255,.15);padding-top:13px}}
+.talma-mobile-logout{{display:none}}
+.talma-main{{min-width:0}}
+.talma-content{{max-width:1420px;margin:0 auto;padding:27px clamp(20px,3vw,44px) 48px}}
+.talma-page-heading{{display:flex;align-items:center;justify-content:space-between;margin:0 0 20px}}
+.talma-page-heading h1{{font-size:clamp(25px,2.2vw,32px);color:#203849;margin:2px 0 0}}
+.talma-eyebrow{{font-size:10px;font-weight:850;letter-spacing:.16em;color:#557282}}
+.talma-page .hero-total{{margin-top:0}}
+.talma-page .hero-total{{background:linear-gradient(120deg,#142f3e,#1d637a)!important;border-radius:22px!important;padding:clamp(22px,4vw,34px)!important;box-shadow:0 14px 32px rgba(20,47,62,.18)!important}}
+.talma-page .hero-number{{font-size:clamp(48px,7vw,68px)!important}}
+.talma-page .stat{{border-radius:16px;background:linear-gradient(145deg,#fff,#f6f9fb)}}
+.talma-page .highlight-stat b{{color:#1d637a}}
+.talma-page .talma-filters{{padding:24px 26px;border-color:#d4e0e7}}
+.talma-page .talma-filters .filter-title{{color:#203849;font-size:21px}}
+.talma-page .talma-filters input,.talma-page .talma-filters select{{width:100%;box-sizing:border-box}}
+.talma-page .filter-actions{{gap:9px}}
+.talma-page .filter-actions .btn,.talma-page .filter-actions button{{min-height:44px}}
+.talma-page .talma-summary-card,.talma-page>section.card{{padding:22px 24px}}
+.talma-page .talma-summary-wrap,.talma-page .table-wrap{{border:1px solid #dfe6eb;border-radius:12px}}
+@media(max-width:900px){{.talma-layout{{grid-template-columns:210px minmax(0,1fr)}}.talma-sidebar{{padding-inline:13px}}.talma-content{{padding-inline:20px}}}}
+@media(max-width:700px){{
+ .talma-layout{{display:flex;flex-direction:column}}
+ .talma-sidebar{{position:relative;top:auto;height:auto;padding:10px 12px 9px;box-shadow:0 5px 18px rgba(15,39,52,.14)}}
+ .talma-brand,.talma-nav-label,.talma-sidebar-footer{{display:none}}
+ .talma-mobile-logout{{display:flex;align-items:center;gap:8px;align-self:flex-end;margin-top:4px;padding:7px 10px;border-radius:8px;color:#d8e5ea;text-decoration:none;font-size:12px;font-weight:700}}
+ .talma-navigation{{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:5px;overflow:visible;padding-bottom:1px}}
+ .talma-navigation a{{min-width:0;min-height:39px;padding:8px 10px;font-size:12px;white-space:normal}}
+ .talma-navigation a.active{{box-shadow:inset 0 -2px #66c1cc}}
+ .talma-navigation .talma-nav-icon{{font-size:15px}}
+ .talma-content{{padding:17px 13px 32px}}
+ .talma-page-heading{{margin-bottom:14px}}
+ .talma-page .talma-filters{{padding:19px 18px}}
+ .talma-page .talma-summary-card,.talma-page>section.card{{padding:18px}}
+ .talma-page .filter-actions{{display:grid;grid-template-columns:repeat(2,minmax(0,1fr))}}
+ .talma-page .filter-actions>*{{width:100%;text-align:center;white-space:normal!important}}
+ .talma-page .filter-actions>button{{grid-column:1/-1}}
+ .talma-report-grid{{grid-template-columns:1fr}}
+ .talma-dashboard-heading,.talma-report-heading,.talma-orders-heading{{align-items:flex-start;flex-direction:column}}
+ .talma-order-count{{align-self:flex-start}}
+}}
 </style>
 {extra}
-""")
+""", show_topbar=False)
 
 
 def _talma_login(error: bool = False):
@@ -1851,6 +1934,7 @@ def _talma_login(error: bool = False):
 
 @app.get("/talma")
 @app.get("/talma/")
+@app.get("/talma/consultar-pedidos")
 def talma_portal():
     if not _valid_talma_session(request.cookies.get("talma_session")):
         return _talma_login()
@@ -1991,54 +2075,38 @@ def talma_portal():
     else:
         periodo_label = "Todo el historial"
 
-    body = f"""
-<div class="hero-total">
-  <div class="hero-kicker">PEDIDOS TALMA — MES ACTUAL</div>
-  <div class="hero-number">{monthly_total}</div>
-  <div class="hero-date">menús pedidos en {month_name} de {today.year}</div>
-</div>
-
-<div class="grid grid3">
-<div class="stat highlight-stat">Pedidos del mes<b>{monthly_total}</b></div>
-<div class="stat highlight-stat">Pedidos de hoy<b>{daily_total}</b></div>
-<div class="stat period-stat">Período consultado<b style="font-size:18px;line-height:1.3">{periodo_label}</b></div>
-</div>
-
-<div class="card no-print talma-filters">
-<div class="filter-title">Consultar pedidos</div>
-<form method="get" action="/talma">
-  <div class="grid grid3">
-    <div>
-      <label>Desde</label>
-      <input type="date" name="desde" value="{esc(fecha_desde)}">
+    is_consult_view = request.path == "/talma/consultar-pedidos"
+    filters_panel = f"""
+<section class="card no-print talma-filters">
+  <div class="filter-title">Filtros de consulta</div>
+  <form method="get" action="/talma/consultar-pedidos">
+    <div class="grid grid3 talma-filter-grid">
+      <div><label>Desde</label><input type="date" name="desde" value="{esc(fecha_desde)}"></div>
+      <div><label>Hasta</label><input type="date" name="hasta" value="{esc(fecha_hasta)}"></div>
+      <div><label>DNI del trabajador <span class="muted">(opcional)</span></label><input name="dni" value="{esc(dni_filter)}" maxlength="40" placeholder="Ej. 71206879"></div>
+      <div><label>Área <span class="muted">(se bloquea al ingresar DNI)</span></label>
+        <select id="talma-area-filter" name="area" {"disabled" if dni_filter else ""}>
+          <option value="">Todas las áreas</option>
+          {''.join(f'<option value="{esc(a)}" {"selected" if area_filter == a else ""}>{esc(a)}</option>' for a in SISTEMAS["talma"]["areas"])}
+        </select>
+      </div>
     </div>
-    <div>
-      <label>Hasta</label>
-      <input type="date" name="hasta" value="{esc(fecha_hasta)}">
+    <div class="actions filter-actions">
+      <button type="submit">Ver resultados</button>
+      <a class="btn secondary" href="/talma/consultar-pedidos">Limpiar filtros</a>
     </div>
-    <div>
-      <label>DNI del trabajador <span class="muted">(opcional)</span></label>
-      <input name="dni" value="{esc(dni_filter)}" maxlength="40" placeholder="Ej. 71206879">
-    </div>
-    <div>
-      <label>Área <span id="area-help" class="muted">(se bloquea al ingresar DNI)</span></label>
-      <select id="talma-area-filter" name="area" {"disabled" if dni_filter else ""}>
-        <option value="">Todas las áreas</option>
-        {''.join(f'<option value="{esc(a)}" {"selected" if area_filter == a else ""}>{esc(a)}</option>' for a in SISTEMAS["talma"]["areas"])}
-      </select>
-    </div>
+  </form>
+</section>
+<section class="card no-print talma-report-panel">
+  <div class="talma-report-heading"><div><h2>Reportes y descargas</h2><p class="muted">Las opciones usan los filtros aplicados arriba.</p></div></div>
+  <div class="talma-report-grid">
+    <a class="talma-report-link talma-summary-report" href="/talma/excel?desde={esc(fecha_desde)}&hasta={esc(fecha_hasta)}&dni={esc(dni_filter)}&area={esc(area_filter)}"><span class="talma-report-icon">▤</span><span><b>Reporte resumido</b><small>Totales por persona y período</small></span><span class="talma-report-arrow">↓</span></a>
+    <a class="talma-report-link talma-calendar-report" href="/talma/excel-calendario?desde={esc(fecha_desde)}&hasta={esc(fecha_hasta)}&dni={esc(dni_filter)}&area={esc(area_filter)}"><span class="talma-report-icon">▦</span><span><b>Excel calendario</b><small>Pedidos distribuidos por día</small></span><span class="talma-report-arrow">↓</span></a>
+    <a class="talma-report-link talma-pu-report" href="/talma/report-pu?desde={esc(fecha_desde)}&hasta={esc(fecha_hasta)}"><span class="talma-report-icon">P/U</span><span><b>Reporte P/U</b><small>Aporte personal y de empresa</small></span><span class="talma-report-arrow">›</span></a>
+    <a class="talma-report-link talma-detail-report" href="/admin/talma/excel?desde={esc(fecha_desde)}&hasta={esc(fecha_hasta)}&dni={esc(dni_filter)}&area={esc(area_filter)}"><span class="talma-report-icon">▧</span><span><b>Reporte detallado</b><small>Excel completo de pedidos</small></span><span class="talma-report-arrow">↓</span></a>
+    <a class="talma-report-link talma-coupons-report" href="/talma/cupones?desde={esc(fecha_desde)}&hasta={esc(fecha_hasta)}&dni={esc(dni_filter)}&area={esc(area_filter)}"><span class="talma-report-icon">▣</span><span><b>Cuponera</b><small>PDF listo para imprimir</small></span><span class="talma-report-arrow">↓</span></a>
   </div>
-  <div class="actions filter-actions">
-    <button type="submit">Ver resultados</button>
-    <a class="btn talma-summary-report" href="/talma/excel?desde={esc(fecha_desde)}&hasta={esc(fecha_hasta)}&dni={esc(dni_filter)}&area={esc(area_filter)}">Generar reporte resumido</a>
-    <a class="btn talma-calendar-report" href="/talma/excel-calendario?desde={esc(fecha_desde)}&hasta={esc(fecha_hasta)}&dni={esc(dni_filter)}&area={esc(area_filter)}">Excel calendario</a>
-    <a class="btn talma-pu-report" href="/talma/report-pu?desde={esc(fecha_desde)}&hasta={esc(fecha_hasta)}">Report P/U</a>
-    <a class="btn secondary" href="/admin/talma/excel?desde={esc(fecha_desde)}&hasta={esc(fecha_hasta)}&dni={esc(dni_filter)}&area={esc(area_filter)}">Generar reporte Excel detallado</a>
-    <a class="btn secondary" href="/talma/cupones?desde={esc(fecha_desde)}&hasta={esc(fecha_hasta)}&dni={esc(dni_filter)}&area={esc(area_filter)}">Generar cupones</a>
-    <a class="btn secondary" href="/talma">Limpiar filtros</a>
-  </div>
-</form>
-</div>
+</section>
 <script>
 (function(){{
   const dni = document.querySelector('input[name="dni"]');
@@ -2054,27 +2122,38 @@ def talma_portal():
   syncArea();
 }})();
 </script>
-
-<div class="card talma-summary-card">
-<h2>Pedidos por área — {periodo_label}</h2>
-<div class="area-stats">{area_cards}</div>
-<p class="muted" style="margin:10px 0 0">El conteo usa el rango de fechas seleccionado. Si eliges un área en el filtro, la tabla de pedidos queda limitada a esa área.</p>
+<section class="card talma-summary-card">
+  <h2>Pedidos por área — {periodo_label}</h2>
+  <div class="area-stats">{area_cards}</div>
+  <p class="muted" style="margin:10px 0 0">El conteo usa el rango seleccionado. La tabla de pedidos queda limitada por fecha, DNI y área.</p>
+</section>
+<section class="card talma-summary-card">
+  <h2>Resumen por área y persona — {periodo_label}</h2>
+  <div class="table-wrap talma-summary-wrap"><table class="talma-summary-table"><thead><tr><th>Área</th><th>Persona</th><th>DNI</th><th>Total pedidos</th></tr></thead><tbody>{''.join(summary) or '<tr><td colspan="4">No hay pedidos en este período.</td></tr>'}</tbody></table></div>
+</section>
+<section class="card talma-orders-card">
+  <div class="talma-orders-heading"><div><h2>Pedidos TALMA</h2><p class="muted">{periodo_label}</p></div><span class="talma-order-count">{len(rows)} resultados</span></div>
+  <div class="table-wrap"><table><thead><tr><th>Fecha</th><th>DNI</th><th>Persona</th><th>Área</th><th>Entrada</th><th>Plato de fondo</th><th>N° Almuerzo</th><th>Hora</th></tr></thead><tbody>{''.join(table_rows) or '<tr><td colspan="8">No hay pedidos en este período.</td></tr>'}</tbody></table></div>
+</section>
+"""
+    dashboard_body = f"""
+<div class="hero-total">
+  <div class="hero-kicker">PEDIDOS TALMA — MES ACTUAL</div>
+  <div class="hero-number">{monthly_total}</div>
+  <div class="hero-date">menús pedidos en {month_name} de {today.year}</div>
 </div>
-
-<div class="card talma-summary-card">
-<h2>Resumen por área y persona — {periodo_label}</h2>
-<div class="table-wrap talma-summary-wrap"><table class="talma-summary-table"><thead><tr><th>Área</th><th>Persona</th><th>DNI</th><th>Total pedidos</th></tr></thead>
-<tbody>{''.join(summary) or '<tr><td colspan="4">No hay pedidos en este período.</td></tr>'}</tbody></table></div>
-</div>
-
-<div class="card">
-<h2>Pedidos TALMA — {periodo_label}</h2>
-<div class="table-wrap"><table><thead><tr><th>Fecha</th><th>DNI</th><th>Persona</th><th>Área</th><th>Entrada</th><th>Plato de fondo</th><th>N° Almuerzo</th><th>Hora</th></tr></thead>
-<tbody>{''.join(table_rows) or '<tr><td colspan="8">No hay pedidos en este período.</td></tr>'}</tbody></table></div>
+<div class="grid grid3">
+  <div class="stat highlight-stat">Pedidos del mes<b>{monthly_total}</b></div>
+  <div class="stat highlight-stat">Pedidos de hoy<b>{daily_total}</b></div>
+  <div class="stat period-stat">Período consultado<b style="font-size:18px;line-height:1.3">{periodo_label}</b></div>
 </div>
 """
+    if is_consult_view:
+        body = dashboard_body + filters_panel
+    else:
+        body = dashboard_body + f"""<section class="card talma-dashboard-summary"><div class="talma-dashboard-heading"><div><div class="talma-eyebrow">VISTA RÁPIDA</div><h2>Resumen visual</h2></div><a class="btn talma-dashboard-cta" href="/talma/consultar-pedidos">Consultar pedidos <span aria-hidden="true">→</span></a></div><div class="area-stats">{area_cards}</div></section>"""
     extra = """<style>
-.hero-total{background:linear-gradient(135deg,#0f5132,#198754);color:white;border-radius:24px;padding:24px;text-align:center;margin-bottom:20px;box-shadow:0 14px 40px rgba(15,81,50,.20)}
+.hero-total{background:linear-gradient(135deg,#142f3e,#1d637a);color:white;border-radius:24px;padding:24px;text-align:center;margin-bottom:20px;box-shadow:0 14px 40px rgba(20,47,62,.20)}
 .hero-kicker{font-weight:800;letter-spacing:3px;font-size:14px}.hero-number{font-size:64px;font-weight:900;line-height:1;margin:7px 0}.hero-date{font-size:17px;font-weight:700}
 .highlight-stat b{font-size:34px}.period-stat b{font-size:20px;line-height:1.25;font-weight:750}.period-stat{min-height:0}
 .talma-summary-card{padding:14px 18px;margin-bottom:16px}
@@ -2082,10 +2161,31 @@ def talma_portal():
 .talma-summary-wrap{overflow-x:auto}
 .talma-summary-table{display:inline-table;width:max-content;min-width:0;table-layout:auto;font-size:14px}
 .talma-summary-table th,.talma-summary-table td{padding:4px 7px;line-height:1.2;white-space:nowrap}
-.talma-summary-table td:nth-child(3),.talma-summary-table th:nth-child(3),.talma-summary-table td:last-child,.talma-summary-table th:last-child{text-align:center}.talma-summary-report{background:#dc2626!important;border-color:#dc2626!important;color:#fff!important}.talma-summary-report:hover{background:#b91c1c!important;border-color:#b91c1c!important}.talma-calendar-report{background:#2563eb!important;border-color:#2563eb!important;color:#fff!important}.talma-calendar-report:hover{background:#1d4ed8!important;border-color:#1d4ed8!important}.talma-pu-report{background:#0f766e!important;border-color:#0f766e!important;color:#fff!important}.talma-pu-report:hover{background:#115e59!important;border-color:#115e59!important}
-.area-stats{display:grid;grid-template-columns:repeat(auto-fit,minmax(130px,1fr));gap:10px}.area-stat{border:1px solid #e4e7ec;border-radius:14px;padding:12px;text-align:center;background:#f8fafc}.area-stat span{display:block;font-weight:900;font-size:14px}.area-stat strong{display:block;font-size:34px;line-height:1.05;margin:5px 0;color:#198754}.area-stat small{color:#667085}
+.talma-summary-table td:nth-child(3),.talma-summary-table th:nth-child(3),.talma-summary-table td:last-child,.talma-summary-table th:last-child{text-align:center}
+.talma-dashboard-summary{margin-top:20px}
+.talma-dashboard-heading,.talma-report-heading,.talma-orders-heading{display:flex;align-items:center;justify-content:space-between;gap:16px;margin-bottom:15px}
+.talma-dashboard-heading h2,.talma-report-heading h2,.talma-orders-heading h2{margin:2px 0 0;color:#203849}
+.talma-report-heading p,.talma-orders-heading p{margin:4px 0 0}
+.talma-dashboard-cta{display:inline-flex;align-items:center;gap:9px;background:#1d637a!important;color:#fff!important}
+.talma-dashboard-cta:hover{background:#174e60!important}
+.talma-report-panel{margin-top:16px}
+.talma-report-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:11px}
+.talma-report-link{display:grid;grid-template-columns:40px minmax(0,1fr) 24px;align-items:center;gap:12px;min-height:68px;padding:12px 14px;border:1px solid #dce5ea;border-radius:13px;background:#f8fafb;color:#203849;text-decoration:none;transition:transform .15s,box-shadow .15s,border-color .15s}
+.talma-report-link:hover{transform:translateY(-1px);box-shadow:0 7px 17px rgba(20,47,62,.09);border-color:#9db9c5}
+.talma-report-icon{display:grid;place-items:center;width:38px;height:38px;border-radius:11px;background:#e2edf1;color:#1d637a;font-size:18px;font-weight:850}
+.talma-report-link b,.talma-report-link small{display:block}
+.talma-report-link b{font-size:14px}
+.talma-report-link small{margin-top:2px;color:#607181;font-size:12px;line-height:1.35}
+.talma-report-arrow{justify-self:end;color:#1d637a;font-size:20px;font-weight:800}
+.talma-report-link.talma-calendar-report .talma-report-icon{background:#deedf0;color:#2b7183}
+.talma-report-link.talma-pu-report .talma-report-icon{background:#e1e9ed;color:#35566a;font-size:12px}
+.talma-report-link.talma-detail-report .talma-report-icon{background:#e7eff3}
+.talma-report-link.talma-coupons-report .talma-report-icon{background:#e8efe9;color:#355d4b}
+.talma-order-count{flex:0 0 auto;padding:6px 10px;border-radius:999px;background:#e7eff3;color:#315568;font-size:12px;font-weight:800}
+.area-stats{display:grid;grid-template-columns:repeat(auto-fit,minmax(130px,1fr));gap:10px}.area-stat{border:1px solid #dfe6eb;border-radius:14px;padding:12px;text-align:center;background:#f3f7f9}.area-stat span{display:block;font-weight:900;font-size:14px}.area-stat strong{display:block;font-size:34px;line-height:1.05;margin:5px 0;color:#1d637a}.area-stat small{color:#667085}
+@media(max-width:700px){.talma-report-grid{grid-template-columns:1fr}.talma-dashboard-heading,.talma-report-heading,.talma-orders-heading{align-items:flex-start;flex-direction:column}.talma-order-count{align-self:flex-start}}
 </style>"""
-    return _talma_page("TALMA", body, extra)
+    return _talma_page("Consultar pedidos" if is_consult_view else "TALMA", body, extra)
 
 
 @app.post("/talma/login")
@@ -2273,20 +2373,20 @@ def talma_admin_users():
 .admin-page{max-width:1240px;margin:30px auto;padding:0 18px}
 .admin-head,.section-head{display:flex;justify-content:space-between;gap:20px;align-items:flex-start;margin-bottom:18px}
 .admin-head h1,.section-head h2{margin:4px 0 6px}
-.kicker{font-size:12px;font-weight:800;letter-spacing:2px;color:#006b78}
+.kicker{font-size:12px;font-weight:800;letter-spacing:2px;color:#1d637a}
 .card{background:#fff;border:1px solid #d8dfe6;border-radius:15px;padding:22px;margin-bottom:18px;box-shadow:0 5px 18px rgba(16,24,40,.05)}
 .user-form{max-width:720px}.user-form label{display:block;font-weight:700;margin:12px 0 6px}
 .user-form input{width:100%;box-sizing:border-box;padding:11px 12px;border:1px solid #cfd8dc;border-radius:9px;font:inherit}
-.user-form button{margin-top:16px;border:0;border-radius:9px;padding:11px 15px;background:#006b78;color:#fff;font-weight:700;cursor:pointer}
+.user-form button{margin-top:16px;border:0;border-radius:9px;padding:11px 15px;background:#1d637a;color:#fff;font-weight:700;cursor:pointer}
 .actions{display:flex;gap:10px;flex-wrap:wrap;align-items:center}
-.secondary{display:inline-block;padding:10px 14px;border-radius:9px;background:#eef3f5;color:#17323a;text-decoration:none;font-weight:700}
+.secondary{display:inline-block;padding:10px 14px;border-radius:9px;background:#e7eff3;color:#294b5d;text-decoration:none;font-weight:700}
 .help,.muted{font-size:12px;color:#667085;line-height:1.5}
 .notice{padding:12px 14px;border-radius:10px;margin-bottom:16px}
 .notice.success{background:#ecfdf3;color:#067647;border:1px solid #abefc6}
 .notice.error{background:#fef3f2;color:#b42318;border:1px solid #fecdca}
 .table-wrap{overflow:auto}table{width:100%;border-collapse:collapse}
 th,td{padding:10px;border-bottom:1px solid #e4e7ec;text-align:left;vertical-align:top;white-space:nowrap}
-.small-action{color:#006b78;font-weight:700;text-decoration:none}.danger-text{color:#b42318}
+.small-action{color:#1d637a;font-weight:700;text-decoration:none}.danger-text{color:#b42318}
 @media(max-width:800px){.admin-head,.section-head{flex-direction:column}}
 </style>"""
     return _talma_page("Personas TALMA", body, extra)
@@ -2820,7 +2920,7 @@ def talma_report_pu():
     body = f'''<div class="admin-page"><section class="card"><div class="section-head"><div><h1>Reporte P/U TALMA</h1><p class="help">Solo aparecen trabajadores con al menos un pedido en el rango. Cada pedido asigna el P/U configurado a la persona; la empresa paga S/ 11,00 menos ese aporte.</p></div><a class="secondary" href="/talma/report-pu?desde={esc(fecha_desde)}&hasta={esc(fecha_hasta)}&formato=excel">Descargar Excel</a></div>
 <form method="get" action="/talma/report-pu" class="report-range"><label>Desde <input type="date" name="desde" value="{esc(fecha_desde)}"></label><label>Hasta <input type="date" name="hasta" value="{esc(fecha_hasta)}"></label><button type="submit">Ver reporte</button></form>
 <div class="table-wrap"><table class="pu-table"><thead><tr><th>Persona</th>{''.join(f'<th>{day_headers[day]}</th>' for day in calendar)}<th>Total P/U</th><th>Paga empresa</th></tr></thead><tbody>{''.join(rows) or f'<tr><td colspan="{col_count}">No hay pedidos en este período.</td></tr>'}<tr class="sum-row"><th>Pedidos del día</th>{count_cells}<th>{order_count}</th><th></th></tr><tr class="sum-row"><th colspan="{len(calendar)+1}">Total aporta el personal</th><th>S/ {pu_text(employee_total)}</th><th></th></tr><tr class="sum-row"><th colspan="{len(calendar)+2}">Total empresa</th><th>S/ {pu_text(company_total)}</th></tr><tr class="sum-row invoice"><th colspan="{len(calendar)+2}">Total a facturar (S/ 11,00 × pedidos)</th><th>S/ {pu_text(invoice_total)}</th></tr></tbody></table></div></section></div>'''
-    extra = """<style>.admin-page{max-width:1500px;margin:28px auto;padding:0 18px}.card{background:#fff;border:1px solid #d8dfe6;border-radius:15px;padding:22px;margin-bottom:18px}.section-head{display:flex;justify-content:space-between;gap:16px;align-items:flex-start}.section-head h1{margin:0 0 8px}.help{color:#667085;font-size:13px;line-height:1.5}.secondary{display:inline-block;padding:10px 14px;border-radius:9px;background:#eef3f5;color:#17323a;text-decoration:none;font-weight:700}.report-range{display:flex;gap:14px;align-items:end;margin:18px 0;flex-wrap:wrap}.report-range label{display:grid;gap:6px;font-weight:700}.report-range input{padding:9px;border:1px solid #cfd8dc;border-radius:7px}.report-range button{border:0;border-radius:8px;padding:10px 14px;background:#176b43;color:#fff;font-weight:700}.table-wrap{overflow:auto}.pu-table{border-collapse:collapse;white-space:nowrap;min-width:100%}.pu-table th,.pu-table td{border:1px solid #cbd5dc;padding:7px 10px;text-align:center}.pu-table thead th{background:#176b43;color:#fff}.pu-table th:first-child,.pu-table td:first-child{text-align:left}.pu-table .sum-row{background:#fff2cc}.pu-table .invoice{background:#eaf4ef}.pu-table tbody tr:nth-child(even):not(.sum-row){background:#f7faf8}</style>"""
+    extra = """<style>.admin-page{max-width:1500px;margin:28px auto;padding:0 18px}.card{background:#fff;border:1px solid #d8dfe6;border-radius:15px;padding:22px;margin-bottom:18px}.section-head{display:flex;justify-content:space-between;gap:16px;align-items:flex-start}.section-head h1{margin:0 0 8px}.help{color:#667085;font-size:13px;line-height:1.5}.secondary{display:inline-block;padding:10px 14px;border-radius:9px;background:#e7eff3;color:#294b5d;text-decoration:none;font-weight:700}.report-range{display:flex;gap:14px;align-items:end;margin:18px 0;flex-wrap:wrap}.report-range label{display:grid;gap:6px;font-weight:700}.report-range input{padding:9px;border:1px solid #cfd8dc;border-radius:7px}.report-range button{border:0;border-radius:8px;padding:10px 14px;background:#1d637a;color:#fff;font-weight:700}.table-wrap{overflow:auto}.pu-table{border-collapse:collapse;white-space:nowrap;min-width:100%}.pu-table th,.pu-table td{border:1px solid #cbd5dc;padding:7px 10px;text-align:center}.pu-table thead th{background:#142f3e;color:#fff}.pu-table th:first-child,.pu-table td:first-child{text-align:left}.pu-table .sum-row{background:#fff2cc}.pu-table .invoice{background:#eaf4ef}.pu-table tbody tr:nth-child(even):not(.sum-row){background:#f7faf8}</style>"""
     return _talma_page("Report P/U", body, extra)
 
 
@@ -2967,8 +3067,6 @@ def talma_cupones():
     dni_filter = request.args.get("dni", "").strip()[:20]
     # Si se consulta por DNI, el área no se puede combinar con ese filtro.
     area_filter = talma_display_area(request.args.get("area", ""))[:40] if not dni_filter else ""
-    area_filter = talma_display_area(request.args.get("area", ""))[:40]
-
     def _valid_iso(value):
         try:
             datetime.strptime(value, "%Y-%m-%d")

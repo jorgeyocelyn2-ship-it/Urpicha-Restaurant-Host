@@ -7,6 +7,10 @@ RUN apt-get update \
     && apt-get install -y --no-install-recommends tesseract-ocr tesseract-ocr-spa \
     && rm -rf /var/lib/apt/lists/*
 
+# Render SSH/SCP injects the account's authorized key at runtime. Ensure the
+# Docker image has a secure SSH directory for the root runtime user.
+RUN mkdir -p /root/.ssh && chmod 700 /root/.ssh
+
 WORKDIR /opt/render/project/src
 COPY requirements.txt ./
 RUN pip install --no-cache-dir -r requirements.txt
