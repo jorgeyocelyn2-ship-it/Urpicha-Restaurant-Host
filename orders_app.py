@@ -260,9 +260,14 @@ def init_db() -> None:
                 order_date TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'abierta',
                 created_at TEXT NOT NULL, created_by TEXT NOT NULL
             );
+            CREATE TABLE IF NOT EXISTS restaurant_extras (
+                id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL UNIQUE,
+                price REAL NOT NULL DEFAULT 0, active INTEGER NOT NULL DEFAULT 1,
+                created_at TEXT NOT NULL
+            );
             CREATE TABLE IF NOT EXISTS restaurant_order_items (
                 id INTEGER PRIMARY KEY AUTOINCREMENT, order_id INTEGER NOT NULL,
-                category TEXT NOT NULL CHECK(category IN ('entrada','fondo')),
+                category TEXT NOT NULL CHECK(category IN ('entrada','fondo','extra')),
                 item_name TEXT NOT NULL, quantity INTEGER NOT NULL DEFAULT 1,
                 unit_price REAL NOT NULL DEFAULT 0, FOREIGN KEY(order_id) REFERENCES restaurant_orders(id) ON DELETE CASCADE
             );
@@ -303,6 +308,22 @@ def init_db() -> None:
         menu_columns = {row['name'] for row in conn.execute("PRAGMA table_info(menu_items)")}
         if "price" not in menu_columns:
             conn.execute("ALTER TABLE menu_items ADD COLUMN price REAL NOT NULL DEFAULT 0")
+        order_item_schema = conn.execute(
+            "SELECT sql FROM sqlite_master WHERE type='table' AND name='restaurant_order_items'"
+        ).fetchone()
+        if order_item_schema and "'extra'" not in (order_item_schema["sql"] or ""):
+            conn.execute("ALTER TABLE restaurant_order_items RENAME TO restaurant_order_items_before_extras")
+            conn.execute("""CREATE TABLE restaurant_order_items (
+                id INTEGER PRIMARY KEY AUTOINCREMENT, order_id INTEGER NOT NULL,
+                category TEXT NOT NULL CHECK(category IN ('entrada','fondo','extra')),
+                item_name TEXT NOT NULL, quantity INTEGER NOT NULL DEFAULT 1,
+                unit_price REAL NOT NULL DEFAULT 0,
+                FOREIGN KEY(order_id) REFERENCES restaurant_orders(id) ON DELETE CASCADE
+            )""")
+            conn.execute("""INSERT INTO restaurant_order_items(id,order_id,category,item_name,quantity,unit_price)
+                            SELECT id,order_id,category,item_name,quantity,unit_price
+                            FROM restaurant_order_items_before_extras""")
+            conn.execute("DROP TABLE restaurant_order_items_before_extras")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_restaurant_orders_date ON restaurant_orders(order_date,status)")
         jorge_seeded = conn.execute(
             "SELECT 1 FROM restaurant_app_settings WHERE setting_key='default_jorge_login_v1'"
@@ -1137,7 +1158,8 @@ class AppHandler(BaseHTTPRequestHandler):
             length = 0
         raw = self.rfile.read(min(length, 2_000_000)).decode("utf-8", "replace")
         parsed = parse_qs(raw, keep_blank_values=True)
-        return {k: ",".join(v) if k == "permiso" else (v[0] if v else "") for k, v in parsed.items()}
+        multi_value_fields = {"permiso", "seleccion", "cantidad"}
+        return {k: ",".join(v) if k in multi_value_fields else (v[0] if v else "") for k, v in parsed.items()}
 
     def send_html(self, content: str, status: int = 200, headers: dict | None = None) -> None:
         data = content.encode("utf-8")
@@ -2244,49 +2266,111 @@ class AppHandler(BaseHTTPRequestHandler):
 
     def restaurant_shell(self, title, body, employee, permission, extra_head=""):
         section_links = (("mesero", "/restaurante/mesa", "Mesa"), ("caja", "/restaurante/caja", "Caja"), ("cocina", "/restaurante/cocina", "Cocina"), ("resumen", "/restaurante/resumen", "Resumen"))
-        links = "".join(f'<a href="{href}">{label}</a>' for key,href,label in section_links if self.restaurant_allowed(employee,key))
-        home = "/restaurante/mesa" if permission == "mesero" else f"/restaurante/{permission}"
-        footer_link = '<a href="/admin/dashboard">Volver al panel administrador</a>' if isinstance(employee, dict) and employee.get("is_admin") else '<a href="/restaurante/logout">Cerrar sesión</a>'
-        content = f'<div class="admin-shell"><aside class="admin-sidebar"><a class="admin-brand" href="{home}"><span class="admin-brand-mark">U</span><span class="admin-brand-copy">URPICHA<small>RESTAURANTE</small></span></a><nav class="admin-tabs">{links}</nav><div class="admin-sidebar-footer">{footer_link}</div></aside><div class="admin-main">{body}</div></div>'
-        styles = '<style>.topbar{display:none}.admin-shell{min-height:100vh;display:grid;grid-template-columns:230px 1fr}.admin-sidebar{position:sticky;top:0;height:100vh;display:flex;flex-direction:column;gap:28px;padding:24px 16px;background:#142f3e}.admin-brand{color:#fff;text-decoration:none;display:flex;gap:10px}.admin-sidebar .admin-tabs{display:flex;flex-direction:column;background:none;border:0}.admin-sidebar .admin-tabs a{color:#e5eef4}.admin-sidebar-footer{margin-top:auto}.admin-sidebar-footer a{color:white}.staff-content{max-width:1200px;margin:30px auto;padding:0 20px}.food-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:14px}.food-card{background:white;border:1px solid #e6ebf0;border-radius:12px;padding:18px}.kitchen-ticket{background:#fff;border-left:6px solid #1d637a;border-radius:10px;padding:18px;margin:12px 0;font-size:20px}.kitchen-ticket h2{margin:0 0 10px}@media(max-width:760px){.admin-shell{grid-template-columns:1fr}.admin-sidebar{height:auto;position:static}.admin-sidebar .admin-tabs{display:flex;flex-direction:row;flex-wrap:wrap}}</style>'
+        is_admin = isinstance(employee, dict) and employee.get("is_admin")
+        admin_links = (
+            ("/admin/dashboard", "Dashboard"), ("/admin/personas", "Personas y consumo"),
+            ("/admin/resumen", "Resumen visual"), ("/admin/talma/", "TALMA"),
+            ("/admin/policia/", "POLICÍA"), ("/admin/personal-restaurante", "Personal restaurante"),
+        )
+        all_links = [(href, label) for _, href, label in section_links] if not is_admin else list(admin_links) + [(href, label) for _, href, label in section_links]
+        links = "".join(f'<a href="{href}">{label}</a>' for href, label in all_links if is_admin or self.restaurant_allowed(employee, next((key for key, section_href, _ in section_links if section_href == href), "")))
+        home = "/admin/dashboard" if is_admin else ("/restaurante/mesa" if permission == "mesero" else f"/restaurante/{permission}")
+        brand = "ADMINISTRACIÓN" if is_admin else "RESTAURANTE"
+        footer_link = '<a href="/admin/logout">Cerrar sesión</a>' if is_admin else '<a href="/restaurante/logout">Cerrar sesión</a>'
+        content = f'<div class="admin-shell"><aside class="admin-sidebar"><a class="admin-brand" href="{home}"><span class="admin-brand-mark">U</span><span class="admin-brand-copy">URPICHA<small>{brand}</small></span></a><nav class="admin-tabs">{links}</nav><div class="admin-sidebar-footer">{footer_link}</div></aside><div class="admin-main">{body}</div></div>'
+        styles = '<style>.topbar{display:none}.admin-shell{min-height:100vh;display:grid;grid-template-columns:256px minmax(0,1fr)}.admin-sidebar{position:sticky;top:0;height:100vh;overflow-y:auto;display:flex;flex-direction:column;gap:20px;padding:24px 16px;background:#142f3e}.admin-brand{color:#fff;text-decoration:none;display:flex;gap:10px;flex:0 0 auto}.admin-sidebar .admin-tabs{display:flex;flex-direction:column;background:none;border:0;flex:0 0 auto}.admin-sidebar .admin-tabs a{color:#e5eef4}.admin-sidebar-footer{margin-top:auto;padding-top:12px}.admin-sidebar-footer a{color:white}.staff-content{max-width:1200px;margin:30px auto;padding:0 20px}.food-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:14px}.food-card{background:white;border:1px solid #e6ebf0;border-radius:12px;padding:18px}.order-line{display:grid;grid-template-columns:minmax(0,1fr) 130px auto;gap:10px;align-items:end;margin:10px 0}.order-line select,.order-line input{width:100%;box-sizing:border-box}.kitchen-ticket{background:#fff;border-left:6px solid #1d637a;border-radius:10px;padding:18px;margin:12px 0;font-size:20px}.kitchen-ticket h2{margin:0 0 10px}@media(max-width:760px){.admin-shell{grid-template-columns:1fr}.admin-sidebar{height:auto;position:static}.admin-sidebar .admin-tabs{display:flex;flex-direction:row;flex-wrap:wrap}.order-line{grid-template-columns:1fr 90px auto}}</style>'
         self.send_html(page(title, content, styles + extra_head))
 
     def waiter_page(self, employee, query):
-        today = today_iso(); menu = get_public_menu(today)
+        today = today_iso()
+        menu = get_public_menu(today)
         with db() as conn:
             tables = conn.execute("SELECT * FROM restaurant_tables WHERE active=1 ORDER BY CAST(table_number AS INTEGER),table_number").fetchall()
+            extras = conn.execute("SELECT * FROM restaurant_extras WHERE active=1 ORDER BY name COLLATE NOCASE").fetchall()
         options = "".join(f'<option>{esc(t["table_number"])}</option>' for t in tables)
         if not options: options = '<option value="">No hay mesas activas</option>'
-        picks = "".join(f'<label class="food-card"><h3>{"Entrada" if cat=="entrada" else "Segundo"}</h3>{esc(item["name"])}<br><input type="number" min="0" max="30" name="{cat}|{esc(item["name"])}" value="0"></label>' for cat in ("entrada","fondo") for item in menu[cat])
-        notice = '<div class="notice">Comanda enviada a cocina.</div>' if query.get("ok") else ""
-        body = f'<main class="staff-content"><div class="admin-titlebar"><div><h1>Mesero</h1><p class="muted">Menú del día · {esc(fecha_con_dia(today))}</p></div></div>{notice}<form method="post" action="/restaurante/mesero" class="card"><label>Mesa</label><select name="mesa" required>{options}</select><h2>Pedido</h2><div class="food-grid">{picks}</div><button>Enviar comanda</button></form></main>'
+        item_options = "".join(
+            f'<option value="menu|{item["id"]}">{esc(item["name"])} · {"Entrada" if category == "entrada" else "Segundo"}</option>'
+            for category in ("entrada", "fondo") for item in menu[category]
+        )
+        if extras:
+            item_options += '<optgroup label="Extras">' + "".join(
+                f'<option value="extra|{item["id"]}">{esc(item["name"])} · Extra</option>' for item in extras
+            ) + "</optgroup>"
+        if not item_options: item_options = '<option value="">No hay platos o extras disponibles</option>'
+        notice = '<div class="notice ok">Comanda enviada a cocina.</div>' if query.get("ok") else ""
+        if query.get("error"):
+            notice = f'<div class="notice error">{esc(query["error"])}</div>'
+        first_line = f'<div class="order-line"><div><label>Plato del menú o extra</label><select name="seleccion" required>{item_options}</select></div><div><label>Cantidad</label><input name="cantidad" type="number" min="1" max="30" value="1" required></div><button type="button" class="btn small secondary remove-line">Quitar</button></div>'
+        body = f'''<main class="staff-content"><div class="admin-titlebar"><div><h1>Mesa</h1><p class="muted">Elige el plato y cuántas unidades van para cada mesa · {esc(fecha_con_dia(today))}</p></div></div>{notice}
+<form method="post" action="/restaurante/mesa" class="card"><label>Mesa</label><select name="mesa" required>{options}</select><h2>Platos y extras</h2><div id="order-lines">{first_line}</div><div class="actions"><button type="button" id="add-order-line" class="btn secondary">Añadir otro plato o extra</button><button type="submit">Enviar comanda</button></div></form></main>
+<script>
+(()=>{{const list=document.getElementById('order-lines');const add=document.getElementById('add-order-line');
+add.addEventListener('click',()=>{{const row=list.querySelector('.order-line').cloneNode(true);row.querySelector('select').selectedIndex=0;row.querySelector('input').value=1;list.appendChild(row);}});
+list.addEventListener('click',event=>{{if(!event.target.classList.contains('remove-line'))return;const rows=list.querySelectorAll('.order-line');if(rows.length>1)event.target.closest('.order-line').remove();else{{rows[0].querySelector('select').selectedIndex=0;rows[0].querySelector('input').value=1;}}}});
+}})();
+</script>'''
         self.restaurant_shell("Mesa", body, employee, "mesero")
 
     def save_restaurant_order(self, employee):
-        form = self.read_form(); table = form.get("mesa", "").strip(); menu = get_public_menu(today_iso()); allowed = { (c,item["name"]) for c in ("entrada","fondo") for item in menu[c] }
-        items=[]
-        for key,value in form.items():
-            if "|" not in key: continue
-            category,name=key.split("|",1)
-            if (category,name) not in allowed: continue
-            try: qty=max(0,min(30,int(value)))
-            except ValueError: qty=0
-            if qty: items.append((category,name,qty))
+        form = self.read_form()
+        table = form.get("mesa", "").strip()
+        selections = [value for value in form.get("seleccion", "").split(",") if value]
+        quantities = [value for value in form.get("cantidad", "").split(",") if value]
+        if not selections or len(selections) != len(quantities) or len(selections) > 30:
+            self.redirect(f"/restaurante/mesa?{urlencode({'error':'Elige al menos un plato y una cantidad válida.'})}")
+            return
         with db() as conn:
             active=conn.execute("SELECT 1 FROM restaurant_tables WHERE table_number=? AND active=1",(table,)).fetchone()
-            if not active or not items: self.redirect("/restaurante/mesero"); return
+            if not active:
+                self.redirect(f"/restaurante/mesa?{urlencode({'error':'Selecciona una mesa activa.'})}")
+                return
+            items=[]
+            for selection, raw_quantity in zip(selections, quantities):
+                try:
+                    source, raw_id = selection.split("|", 1)
+                    item_id = int(raw_id)
+                    quantity = int(raw_quantity)
+                except (ValueError, TypeError):
+                    self.redirect(f"/restaurante/mesa?{urlencode({'error':'Hay una selección o cantidad inválida.'})}")
+                    return
+                if not 1 <= quantity <= 30:
+                    self.redirect(f"/restaurante/mesa?{urlencode({'error':'La cantidad debe estar entre 1 y 30.'})}")
+                    return
+                if source == "menu":
+                    item = conn.execute("SELECT category,name,price FROM menu_items WHERE id=? AND menu_date=? AND active=1", (item_id,today_iso())).fetchone()
+                    if not item:
+                        self.redirect(f"/restaurante/mesa?{urlencode({'error':'Ese plato ya no está en el menú de hoy.'})}")
+                        return
+                    items.append((item["category"], item["name"], quantity, float(item["price"] or 0)))
+                elif source == "extra":
+                    item = conn.execute("SELECT name,price FROM restaurant_extras WHERE id=? AND active=1", (item_id,)).fetchone()
+                    if not item:
+                        self.redirect(f"/restaurante/mesa?{urlencode({'error':'Ese extra ya no está disponible.'})}")
+                        return
+                    items.append(("extra", item["name"], quantity, float(item["price"] or 0)))
+                else:
+                    self.redirect(f"/restaurante/mesa?{urlencode({'error':'La selección no pertenece al menú.'})}")
+                    return
             cursor=conn.execute("INSERT INTO restaurant_orders(table_number,order_date,created_at,created_by) VALUES(?,?,?,?)",(table,today_iso(),now_iso(),employee["display_name"]))
-            for cat,name,qty in items:
-                row=conn.execute("SELECT price FROM menu_items WHERE menu_date=? AND category=? AND name=? AND active=1",(today_iso(),cat,name)).fetchone()
-                conn.execute("INSERT INTO restaurant_order_items(order_id,category,item_name,quantity,unit_price) VALUES(?,?,?,?,?)",(cursor.lastrowid,cat,name,qty,float(row["price"] or 0) if row else 0))
-        self.redirect("/restaurante/mesero?ok=1")
+            for category,name,quantity,price in items:
+                conn.execute("INSERT INTO restaurant_order_items(order_id,category,item_name,quantity,unit_price) VALUES(?,?,?,?,?)",(cursor.lastrowid,category,name,quantity,price))
+        self.redirect("/restaurante/mesa?ok=1")
 
     def cashier_page(self, employee, query):
         date_value = today_iso(); menu=get_public_menu(date_value)
-        inputs="".join(f'<div class="actions"><label style="flex:1">{esc(r["name"])}</label><input name="precio|{r["id"]}" type="number" min="0" step="0.10" value="{float(r["price"] or 0):.2f}" required></div>' for cat in ("entrada","fondo") for r in menu[cat])
-        with db() as conn: orders=conn.execute("SELECT id,table_number,created_at,status,(SELECT COALESCE(SUM(quantity*unit_price),0) FROM restaurant_order_items i WHERE i.order_id=o.id) total FROM restaurant_orders o WHERE order_date=? ORDER BY id DESC",(date_value,)).fetchall()
+        with db() as conn:
+            extras = conn.execute("SELECT * FROM restaurant_extras WHERE active=1 ORDER BY name COLLATE NOCASE").fetchall()
+            orders=conn.execute("SELECT id,table_number,created_at,status,(SELECT COALESCE(SUM(quantity*unit_price),0) FROM restaurant_order_items i WHERE i.order_id=o.id) total FROM restaurant_orders o WHERE order_date=? ORDER BY id DESC",(date_value,)).fetchall()
+        inputs="".join(f'<div class="actions"><label style="flex:1">{esc(r["name"])}</label><input aria-label="Precio de {esc(r["name"])}" name="precio|{r["id"]}" type="number" min="0" step="0.10" value="{float(r["price"] or 0):.2f}" required></div>' for cat in ("entrada","fondo") for r in menu[cat])
+        extra_inputs="".join(f'<div class="actions"><label style="flex:1">{esc(r["name"])}</label><input aria-label="Precio de {esc(r["name"])}" name="extra_price|{r["id"]}" type="number" min="0" step="0.10" value="{float(r["price"] or 0):.2f}" required></div>' for r in extras) or '<p class="muted">Aún no hay extras. Agrega opciones como gaseosas o postres.</p>'
         rows="".join(f'<tr><td>Mesa {esc(o["table_number"])}</td><td>{esc(o["created_at"][11:16])}</td><td>S/ {float(o["total"]):.2f}</td><td>{esc(o["status"])}</td></tr>' for o in orders) or '<tr><td colspan="4">Sin comandas.</td></tr>'
-        body=f'<main class="staff-content"><h1>Caja</h1>{"<div class=notice>Precios actualizados.</div>" if query.get("ok") else ""}<section class="card"><h2>Precios del menú de hoy</h2><form method="post" action="/restaurante/caja">{inputs}<button>Guardar precios</button></form></section><section class="card"><h2>Comandas y totales</h2><div class="table-wrap"><table><thead><tr><th>Mesa</th><th>Hora</th><th>Total</th><th>Estado</th></tr></thead><tbody>{rows}</tbody></table></div></section></main>'
+        notice = '<div class="notice ok">Precios y extras guardados.</div>' if query.get("ok") else ""
+        if query.get("error"): notice = f'<div class="notice error">{esc(query["error"])}</div>'
+        body=f'''<main class="staff-content"><h1>Caja</h1>{notice}
+<section class="card"><h2>Precios del menú de hoy</h2><form method="post" action="/restaurante/caja"><h3>Platos</h3>{inputs}<h3>Extras disponibles</h3>{extra_inputs}<button>Guardar precios</button></form></section>
+<section class="card"><h2>Añadir extra para las mesas</h2><p class="muted">Ejemplo: Coca-Cola, agua, postre u otro adicional.</p><form method="post" action="/restaurante/caja" class="actions"><div><label>Nombre del extra</label><input name="extra_nombre" maxlength="80" required placeholder="Coca-Cola"></div><div><label>Precio (S/)</label><input name="extra_precio" type="number" min="0" step="0.10" required placeholder="5.00"></div><button>Añadir extra</button></form></section>
+<section class="card"><h2>Comandas y totales</h2><div class="table-wrap"><table><thead><tr><th>Mesa</th><th>Hora</th><th>Total</th><th>Estado</th></tr></thead><tbody>{rows}</tbody></table></div></section></main>'''
         self.restaurant_shell("Caja",body,employee,"caja")
 
     def save_restaurant_prices(self, employee):
@@ -2298,12 +2382,36 @@ class AppHandler(BaseHTTPRequestHandler):
                 except ValueError: continue
                 if price<0 or price>10000: continue
                 conn.execute("UPDATE menu_items SET price=? WHERE id=? AND menu_date=?",(price,ident,today_iso()))
+            for key,value in form.items():
+                if not key.startswith("extra_price|"): continue
+                try: ident=int(key.split("|",1)[1]); price=round(float(value),2)
+                except ValueError: continue
+                if price<0 or price>10000: continue
+                conn.execute("UPDATE restaurant_extras SET price=? WHERE id=? AND active=1",(price,ident))
+            extra_name = form.get("extra_nombre", "").strip()
+            if extra_name:
+                try: extra_price=round(float(form.get("extra_precio", "")),2)
+                except ValueError:
+                    self.redirect(f"/restaurante/caja?{urlencode({'error':'Ingresa un precio válido para el extra.'})}")
+                    return
+                if not 0 <= extra_price <= 10000:
+                    self.redirect(f"/restaurante/caja?{urlencode({'error':'El precio del extra debe estar entre S/ 0 y S/ 10 000.'})}")
+                    return
+                existing = conn.execute("SELECT id FROM restaurant_extras WHERE lower(name)=lower(?)", (extra_name,)).fetchone()
+                if existing:
+                    conn.execute("UPDATE restaurant_extras SET price=?,active=1 WHERE id=?", (extra_price, existing["id"]))
+                else:
+                    conn.execute("INSERT INTO restaurant_extras(name,price,created_at) VALUES(?,?,?)", (extra_name,extra_price,now_iso()))
             conn.execute("UPDATE restaurant_order_items SET unit_price=COALESCE((SELECT price FROM menu_items WHERE menu_items.menu_date=? AND menu_items.category=restaurant_order_items.category AND menu_items.name=restaurant_order_items.item_name),unit_price) WHERE order_id IN (SELECT id FROM restaurant_orders WHERE status='abierta' AND order_date=?)",(today_iso(),today_iso()))
+            conn.execute("""UPDATE restaurant_order_items SET unit_price=COALESCE(
+                (SELECT price FROM restaurant_extras WHERE restaurant_extras.name=restaurant_order_items.item_name AND active=1),unit_price)
+                WHERE category='extra' AND order_id IN
+                (SELECT id FROM restaurant_orders WHERE status='abierta' AND order_date=?)""",(today_iso(),))
         self.redirect("/restaurante/caja?ok=1")
 
     def kitchen_page(self, employee, query):
         with db() as conn:
-            orders=conn.execute("SELECT o.id,o.table_number,i.category,i.item_name,i.quantity FROM restaurant_orders o JOIN restaurant_order_items i ON i.order_id=o.id WHERE o.order_date=? AND o.status='abierta' ORDER BY o.id,i.category,i.id",(today_iso(),)).fetchall()
+            orders=conn.execute("SELECT o.id,o.table_number,i.category,i.item_name,i.quantity FROM restaurant_orders o JOIN restaurant_order_items i ON i.order_id=o.id WHERE o.order_date=? AND o.status='abierta' AND i.category IN ('entrada','fondo') ORDER BY o.id,i.category,i.id",(today_iso(),)).fetchall()
         grouped={}
         for r in orders: grouped.setdefault(r["id"],{"mesa":r["table_number"],"entrada":[],"fondo":[]})[r["category"]].append(f'{r["quantity"]} × {esc(r["item_name"])}')
         tickets="".join(f'<article class="kitchen-ticket"><h2>Mesa {esc(o["mesa"])}</h2><div>Entradas: {", ".join(o["entrada"]) or "—"}</div><div>Segundos: {", ".join(o["fondo"]) or "—"}</div><form method="post" action="/restaurante/cocina"><input type="hidden" name="id" value="{oid}"><button>Marcar listo</button></form></article>' for oid,o in grouped.items()) or '<div class="card">No hay comandas pendientes.</div>'
@@ -2332,7 +2440,7 @@ class AppHandler(BaseHTTPRequestHandler):
             ).fetchone()[0]
         status_counts = {row["status"]: int(row["qty"]) for row in status}
         item_rows = "".join(
-            f'<tr><td>{"Entrada" if row["category"] == "entrada" else "Segundo"}</td><td>{esc(row["item_name"])}</td><td>{int(row["qty"])}</td><td>S/ {float(row["total"] or 0):.2f}</td></tr>'
+            f'<tr><td>{"Entrada" if row["category"] == "entrada" else "Extra" if row["category"] == "extra" else "Segundo"}</td><td>{esc(row["item_name"])}</td><td>{int(row["qty"])}</td><td>S/ {float(row["total"] or 0):.2f}</td></tr>'
             for row in items
         ) or '<tr><td colspan="4">Aún no hay comandas.</td></tr>'
         body = f'''<main class="staff-content"><h1>Resumen del día</h1><p class="muted">{esc(fecha_con_dia(today))}</p>
