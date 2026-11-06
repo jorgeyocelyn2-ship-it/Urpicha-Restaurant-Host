@@ -48,7 +48,8 @@ DATA_DIR.mkdir(exist_ok=True)
 
 DEFAULT_CONFIG = {
     "restaurant_name": "Urpicha Restaurante",
-    "admin_password": "cambiar123",
+    "admin_username": "Jorge",
+    "admin_password": "1978",
     "secret_key": secrets.token_hex(32),
     "order_deadline": "11:30",
 }
@@ -81,7 +82,6 @@ def load_config() -> dict:
     # En producción, las variables de entorno tienen prioridad sobre config.json.
     env_overrides = {
         "restaurant_name": "RESTAURANT_NAME",
-        "admin_password": "ADMIN_PASSWORD",
         "secret_key": "SECRET_KEY",
         "order_deadline": "ORDER_DEADLINE",
     }
@@ -248,6 +248,9 @@ def init_db() -> None:
                 permissions TEXT NOT NULL DEFAULT '[]', active INTEGER NOT NULL DEFAULT 1,
                 created_at TEXT NOT NULL
             );
+            CREATE TABLE IF NOT EXISTS restaurant_app_settings (
+                setting_key TEXT PRIMARY KEY, setting_value TEXT NOT NULL
+            );
             CREATE TABLE IF NOT EXISTS restaurant_tables (
                 id INTEGER PRIMARY KEY AUTOINCREMENT, table_number TEXT NOT NULL UNIQUE,
                 active INTEGER NOT NULL DEFAULT 1
@@ -301,6 +304,35 @@ def init_db() -> None:
         if "price" not in menu_columns:
             conn.execute("ALTER TABLE menu_items ADD COLUMN price REAL NOT NULL DEFAULT 0")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_restaurant_orders_date ON restaurant_orders(order_date,status)")
+        jorge_seeded = conn.execute(
+            "SELECT 1 FROM restaurant_app_settings WHERE setting_key='default_jorge_login_v1'"
+        ).fetchone()
+        if not jorge_seeded:
+            default_salt = os.urandom(16)
+            default_hash = hashlib.pbkdf2_hmac("sha256", b"1978", default_salt, 180_000)
+            existing_jorge = conn.execute(
+                "SELECT id FROM restaurant_employees WHERE lower(username)='jorge'"
+            ).fetchone()
+            default_account = (
+                "Jorge", default_hash.hex(), default_salt.hex(), "mesero",
+                json.dumps(["mesero", "caja", "cocina", "resumen"]), now_iso(),
+            )
+            if existing_jorge:
+                conn.execute(
+                    """UPDATE restaurant_employees SET display_name=?,password_hash=?,password_salt=?,
+                       role=?,permissions=?,active=1 WHERE id=?""",
+                    (*default_account[:-1], existing_jorge["id"]),
+                )
+            else:
+                conn.execute(
+                    """INSERT INTO restaurant_employees
+                       (username,display_name,password_hash,password_salt,role,permissions,created_at)
+                       VALUES('jorge',?,?,?,?,?,?)""",
+                    default_account,
+                )
+            conn.execute(
+                "INSERT INTO restaurant_app_settings(setting_key,setting_value) VALUES('default_jorge_login_v1','1')"
+            )
 
         # Si la base anterior tenía manual_open=1, conservar su intención
         # convirtiéndola en reapertura manual para el día actual.
@@ -1172,9 +1204,10 @@ class AppHandler(BaseHTTPRequestHandler):
         elif path.startswith("/restaurante/"):
             employee = self.restaurant_employee()
             if not employee: self.redirect("/restaurante/login")
-            elif path == "/restaurante/mesero" and self.restaurant_allowed(employee, "mesero"): self.waiter_page(employee, query)
+            elif path in ("/restaurante/mesa", "/restaurante/mesero") and self.restaurant_allowed(employee, "mesero"): self.waiter_page(employee, query)
             elif path == "/restaurante/caja" and self.restaurant_allowed(employee, "caja"): self.cashier_page(employee, query)
             elif path == "/restaurante/cocina" and self.restaurant_allowed(employee, "cocina"): self.kitchen_page(employee, query)
+            elif path == "/restaurante/resumen" and self.restaurant_allowed(employee, "resumen"): self.restaurant_summary_page(employee)
             else: self.send_html(page("Sin permiso", '<main class="wrap narrow"><div class="card"><h1>Acceso no autorizado</h1><p>Tu cuenta no tiene permiso para este apartado.</p></div></main>'), 403)
         elif path in ("/admin/dashboard", "/admin/pedidos"):
             if self.require_admin():
@@ -1225,11 +1258,12 @@ class AppHandler(BaseHTTPRequestHandler):
             if self.require_admin(): self.restaurant_table_action()
         elif path.startswith("/restaurante/"):
             employee = self.restaurant_employee()
-            role = "mesero" if path == "/restaurante/mesero" else "caja" if path == "/restaurante/caja" else "cocina"
+            role = "mesero" if path in ("/restaurante/mesero", "/restaurante/mesa") else "caja" if path == "/restaurante/caja" else "cocina"
             if not employee or not self.restaurant_allowed(employee, role): self.send_html("No autorizado", 403)
             elif role == "mesero": self.save_restaurant_order(employee)
             elif role == "caja": self.save_restaurant_prices(employee)
-            else: self.update_restaurant_order_status(employee)
+            elif path == "/restaurante/cocina": self.update_restaurant_order_status(employee)
+            else: self.send_html("No encontrado", 404)
         elif path == "/admin/menu":
             if self.require_admin():
                 self.save_menu()
@@ -1648,16 +1682,21 @@ class AppHandler(BaseHTTPRequestHandler):
 <h1>Panel administrador</h1>
 {notice}
 <form method="post" action="/admin/login">
-<label>Contraseña</label><input type="password" name="password" required autofocus>
+<label>Usuario</label><input type="text" name="usuario" value="{esc(str(CONFIG.get('admin_username', 'Jorge')))}" autocomplete="username" required autofocus>
+<label>Contraseña</label><input type="password" name="password" autocomplete="current-password" required>
 <button type="submit">Ingresar</button>
 </form>
-<p class="muted">La contraseña inicial está en el archivo <b>config.json</b>.</p>
+<p class="muted">Acceso administrativo de Urpicha Restaurante.</p>
 </div></main>"""
         self.send_html(page("Administrador", body))
 
     def login(self) -> None:
         form = self.read_form()
-        if hmac.compare_digest(form.get("password", ""), str(CONFIG.get("admin_password", ""))):
+        supplied_user = form.get("usuario", "").strip().casefold()
+        expected_user = str(CONFIG.get("admin_username", "Jorge")).strip().casefold()
+        supplied_password = form.get("password", "")
+        expected_password = str(CONFIG.get("admin_password", "1978"))
+        if hmac.compare_digest(supplied_user, expected_user) and hmac.compare_digest(supplied_password, expected_password):
             value = session_value()
             secure = "; Secure" if self.headers.get("X-Forwarded-Proto") == "https" else ""
             self.redirect("/admin/dashboard", f"admin_session={value}; Path=/; Max-Age=28800; HttpOnly; SameSite=Lax{secure}")
@@ -1673,6 +1712,9 @@ class AppHandler(BaseHTTPRequestHandler):
             ("talma", "/admin/talma/", "TALMA"),
             ("policia", "/admin/policia/", "POLICÍA"),
             ("staff", "/admin/personal-restaurante", "Personal restaurante"),
+            ("mesa", "/restaurante/mesa", "Mesa"),
+            ("caja", "/restaurante/caja", "Caja"),
+            ("cocina", "/restaurante/cocina", "Cocina"),
         ]
         nav = "".join(
             f'<a class="{"active" if key == active else ""}" href="{href}"'
@@ -2110,6 +2152,13 @@ class AppHandler(BaseHTTPRequestHandler):
         self.redirect(f"/admin/pedidos/manual?{urlencode({'fecha':order_date,'empresa':company_id,'ok':'1'})}")
 
     def restaurant_employee(self):
+        if self.is_admin():
+            return {
+                "id": "admin", "username": str(CONFIG.get("admin_username", "Jorge")),
+                "display_name": "Administración", "role": "admin", "active": 1,
+                "permissions": json.dumps(["mesero", "caja", "cocina", "resumen"]),
+                "is_admin": True,
+            }
         jar = self.parse_cookies(); token = jar.get("restaurant_session")
         if not token: return None
         try:
@@ -2141,8 +2190,9 @@ class AppHandler(BaseHTTPRequestHandler):
         expires = str(int(time.time()) + 8 * 3600); payload = f"{employee['id']}:{expires}"
         sig = hmac.new(CONFIG["secret_key"].encode(), payload.encode(), hashlib.sha256).hexdigest()
         role = employee["role"]
-        available = [p for p in (role, "mesero", "caja", "cocina") if self.restaurant_allowed(employee, p)]
-        target = f"/restaurante/{available[0]}" if available else "/restaurante/login?error=1"
+        available = [p for p in (role, "mesero", "caja", "cocina", "resumen") if self.restaurant_allowed(employee, p)]
+        target_page = "mesa" if available and available[0] == "mesero" else (available[0] if available else "")
+        target = f"/restaurante/{target_page}" if target_page else "/restaurante/login?error=1"
         secure = "; Secure" if self.headers.get("X-Forwarded-Proto") == "https" else ""
         self.redirect(target, f"restaurant_session={payload}:{sig}; Path=/; Max-Age=28800; HttpOnly; SameSite=Lax{secure}")
 
@@ -2153,21 +2203,21 @@ class AppHandler(BaseHTTPRequestHandler):
         rows = "".join(self.restaurant_staff_row(x) for x in staff) or '<tr><td colspan="6">Aún no hay empleados.</td></tr>'
         trows = "".join(f'<tr><td>Mesa {esc(t["table_number"])}</td><td>{"Activa" if t["active"] else "Inactiva"}</td><td><form method="post" action="/admin/mesa"><input type="hidden" name="id" value="{t["id"]}"><button name="accion" value="estado" class="btn small secondary">Cambiar estado</button></form></td></tr>' for t in tables) or '<tr><td colspan="3">No hay mesas configuradas.</td></tr>'
         body = f'''<main class="admin-dashboard"><div class="admin-titlebar"><div><h1>Personal del restaurante</h1><p class="muted">Cuentas internas y permisos de cada apartado.</p></div></div>
-<section class="card"><h2>Crear empleado</h2><form method="post" action="/admin/personal-restaurante/crear"><div class="grid grid2"><div><label>Nombre</label><input name="nombre" required maxlength="100"></div><div><label>Usuario</label><input name="usuario" required maxlength="50"></div><div><label>Contraseña inicial</label><input name="password" type="password" required minlength="8"></div><div><label>Puesto principal</label><select name="rol"><option value="mesero">Mesero</option><option value="caja">Caja</option><option value="cocina">Cocina</option></select></div></div><p>Permisos de acceso</p><label><input style="width:auto" type="checkbox" name="permiso" value="mesero"> Mesero</label> <label><input style="width:auto" type="checkbox" name="permiso" value="caja"> Caja</label> <label><input style="width:auto" type="checkbox" name="permiso" value="cocina"> Cocina</label><p><button>Crear cuenta</button></p></form></section>
+<section class="card"><h2>Crear empleado</h2><form method="post" action="/admin/personal-restaurante/crear"><div class="grid grid2"><div><label>Nombre</label><input name="nombre" required maxlength="100"></div><div><label>Usuario</label><input name="usuario" required maxlength="50"></div><div><label>Contraseña inicial</label><input name="password" type="password" required minlength="8"></div><div><label>Puesto principal</label><select name="rol"><option value="mesero">Mesa</option><option value="caja">Caja</option><option value="cocina">Cocina</option></select></div></div><p>Permisos de acceso</p><label><input style="width:auto" type="checkbox" name="permiso" value="mesero"> Mesa</label> <label><input style="width:auto" type="checkbox" name="permiso" value="caja"> Caja</label> <label><input style="width:auto" type="checkbox" name="permiso" value="cocina"> Cocina</label> <label><input style="width:auto" type="checkbox" name="permiso" value="resumen"> Resumen</label><p><button>Crear cuenta</button></p></form></section>
 <section class="card"><h2>Empleados</h2><div class="table-wrap"><table><thead><tr><th>Nombre</th><th>Usuario</th><th>Puesto</th><th>Permisos</th><th>Estado</th><th></th></tr></thead><tbody>{rows}</tbody></table></div></section>
 <section class="card"><h2>Mesas</h2><form method="post" action="/admin/mesa" class="actions"><input type="hidden" name="accion" value="crear"><input name="numero" required placeholder="Número o nombre de mesa"><button>Añadir mesa</button></form><div class="table-wrap"><table><thead><tr><th>Mesa</th><th>Estado</th><th></th></tr></thead><tbody>{trows}</tbody></table></div></section></main>'''
-        self.send_html(page("Personal del restaurante", self.admin_section_page("Personal", body, "staff")))
+        self.admin_section_page("Personal del restaurante", body, "staff")
 
     def restaurant_staff_action(self, path):
         form = self.read_form()
         try:
             if path.endswith("/permisos"):
-                permissions = [p for p in form.get("permiso", "").split(",") if p in ("mesero", "caja", "cocina")]
+                permissions = [p for p in form.get("permiso", "").split(",") if p in ("mesero", "caja", "cocina", "resumen")]
                 if not permissions: raise ValueError("Selecciona al menos un permiso.")
                 with db() as conn: conn.execute("UPDATE restaurant_employees SET permissions=? WHERE id=?", (json.dumps(permissions), form.get("id")))
             elif path.endswith("/crear"):
                 username = form.get("usuario", "").strip().lower(); password = form.get("password", ""); role = form.get("rol", "")
-                permissions = [p for p in form.get("permiso", "").split(",") if p in ("mesero", "caja", "cocina")]
+                permissions = [p for p in form.get("permiso", "").split(",") if p in ("mesero", "caja", "cocina", "resumen")]
                 if role not in ("mesero", "caja", "cocina") or len(password) < 8 or not username or not permissions: raise ValueError("Completa los datos y al menos un permiso.")
                 salt = os.urandom(16); digest = hashlib.pbkdf2_hmac("sha256", password.encode(), salt, 180_000)
                 with db() as conn: conn.execute("INSERT INTO restaurant_employees(username,display_name,password_hash,password_salt,role,permissions,created_at) VALUES(?,?,?,?,?,?,?)", (username,form.get("nombre","").strip(),digest.hex(),salt.hex(),role,json.dumps(permissions),now_iso()))
@@ -2179,8 +2229,9 @@ class AppHandler(BaseHTTPRequestHandler):
 
     def restaurant_staff_row(self, employee):
         permissions = set(json.loads(employee["permissions"]))
-        checks = " ".join(f'<label><input style="width:auto" type="checkbox" name="permiso" value="{key}" {"checked" if key in permissions else ""}>{label}</label>' for key,label in (("mesero","Mesero"),("caja","Caja"),("cocina","Cocina")))
-        return f'<tr><td>{esc(employee["display_name"])}</td><td>{esc(employee["username"])}</td><td>{esc(employee["role"].title())}</td><td><form method="post" action="/admin/personal-restaurante/permisos"><input type="hidden" name="id" value="{employee["id"]}">{checks}<button class="btn small secondary">Guardar permisos</button></form></td><td>{"Activo" if employee["active"] else "Inactivo"}</td><td><form method="post" action="/admin/personal-restaurante/estado"><input type="hidden" name="id" value="{employee["id"]}"><button class="btn small secondary">{"Desactivar" if employee["active"] else "Activar"}</button></form></td></tr>'
+        checks = " ".join(f'<label><input style="width:auto" type="checkbox" name="permiso" value="{key}" {"checked" if key in permissions else ""}>{label}</label>' for key,label in (("mesero","Mesa"),("caja","Caja"),("cocina","Cocina"),("resumen","Resumen")))
+        role_label = "Mesa" if employee["role"] == "mesero" else employee["role"].title()
+        return f'<tr><td>{esc(employee["display_name"])}</td><td>{esc(employee["username"])}</td><td>{role_label}</td><td><form method="post" action="/admin/personal-restaurante/permisos"><input type="hidden" name="id" value="{employee["id"]}">{checks}<button class="btn small secondary">Guardar permisos</button></form></td><td>{"Activo" if employee["active"] else "Inactivo"}</td><td><form method="post" action="/admin/personal-restaurante/estado"><input type="hidden" name="id" value="{employee["id"]}"><button class="btn small secondary">{"Desactivar" if employee["active"] else "Activar"}</button></form></td></tr>'
 
     def restaurant_table_action(self):
         form = self.read_form()
@@ -2192,8 +2243,11 @@ class AppHandler(BaseHTTPRequestHandler):
         self.redirect("/admin/personal-restaurante")
 
     def restaurant_shell(self, title, body, employee, permission, extra_head=""):
-        links = "".join(f'<a href="/restaurante/{p}">{label}</a>' for p,label in (("mesero","Mesero"),("caja","Caja"),("cocina","Cocina")) if self.restaurant_allowed(employee,p))
-        content = f'<div class="admin-shell"><aside class="admin-sidebar"><a class="admin-brand" href="/restaurante/{permission}"><span class="admin-brand-mark">U</span><span class="admin-brand-copy">URPICHA<small>RESTAURANTE</small></span></a><nav class="admin-tabs">{links}</nav><div class="admin-sidebar-footer"><a href="/restaurante/logout">Cerrar sesión</a></div></aside><div class="admin-main">{body}</div></div>'
+        section_links = (("mesero", "/restaurante/mesa", "Mesa"), ("caja", "/restaurante/caja", "Caja"), ("cocina", "/restaurante/cocina", "Cocina"), ("resumen", "/restaurante/resumen", "Resumen"))
+        links = "".join(f'<a href="{href}">{label}</a>' for key,href,label in section_links if self.restaurant_allowed(employee,key))
+        home = "/restaurante/mesa" if permission == "mesero" else f"/restaurante/{permission}"
+        footer_link = '<a href="/admin/dashboard">Volver al panel administrador</a>' if isinstance(employee, dict) and employee.get("is_admin") else '<a href="/restaurante/logout">Cerrar sesión</a>'
+        content = f'<div class="admin-shell"><aside class="admin-sidebar"><a class="admin-brand" href="{home}"><span class="admin-brand-mark">U</span><span class="admin-brand-copy">URPICHA<small>RESTAURANTE</small></span></a><nav class="admin-tabs">{links}</nav><div class="admin-sidebar-footer">{footer_link}</div></aside><div class="admin-main">{body}</div></div>'
         styles = '<style>.topbar{display:none}.admin-shell{min-height:100vh;display:grid;grid-template-columns:230px 1fr}.admin-sidebar{position:sticky;top:0;height:100vh;display:flex;flex-direction:column;gap:28px;padding:24px 16px;background:#142f3e}.admin-brand{color:#fff;text-decoration:none;display:flex;gap:10px}.admin-sidebar .admin-tabs{display:flex;flex-direction:column;background:none;border:0}.admin-sidebar .admin-tabs a{color:#e5eef4}.admin-sidebar-footer{margin-top:auto}.admin-sidebar-footer a{color:white}.staff-content{max-width:1200px;margin:30px auto;padding:0 20px}.food-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:14px}.food-card{background:white;border:1px solid #e6ebf0;border-radius:12px;padding:18px}.kitchen-ticket{background:#fff;border-left:6px solid #1d637a;border-radius:10px;padding:18px;margin:12px 0;font-size:20px}.kitchen-ticket h2{margin:0 0 10px}@media(max-width:760px){.admin-shell{grid-template-columns:1fr}.admin-sidebar{height:auto;position:static}.admin-sidebar .admin-tabs{display:flex;flex-direction:row;flex-wrap:wrap}}</style>'
         self.send_html(page(title, content, styles + extra_head))
 
@@ -2206,7 +2260,7 @@ class AppHandler(BaseHTTPRequestHandler):
         picks = "".join(f'<label class="food-card"><h3>{"Entrada" if cat=="entrada" else "Segundo"}</h3>{esc(item["name"])}<br><input type="number" min="0" max="30" name="{cat}|{esc(item["name"])}" value="0"></label>' for cat in ("entrada","fondo") for item in menu[cat])
         notice = '<div class="notice">Comanda enviada a cocina.</div>' if query.get("ok") else ""
         body = f'<main class="staff-content"><div class="admin-titlebar"><div><h1>Mesero</h1><p class="muted">Menú del día · {esc(fecha_con_dia(today))}</p></div></div>{notice}<form method="post" action="/restaurante/mesero" class="card"><label>Mesa</label><select name="mesa" required>{options}</select><h2>Pedido</h2><div class="food-grid">{picks}</div><button>Enviar comanda</button></form></main>'
-        self.restaurant_shell("Mesero", body, employee, "mesero")
+        self.restaurant_shell("Mesa", body, employee, "mesero")
 
     def save_restaurant_order(self, employee):
         form = self.read_form(); table = form.get("mesa", "").strip(); menu = get_public_menu(today_iso()); allowed = { (c,item["name"]) for c in ("entrada","fondo") for item in menu[c] }
@@ -2255,6 +2309,36 @@ class AppHandler(BaseHTTPRequestHandler):
         tickets="".join(f'<article class="kitchen-ticket"><h2>Mesa {esc(o["mesa"])}</h2><div>Entradas: {", ".join(o["entrada"]) or "—"}</div><div>Segundos: {", ".join(o["fondo"]) or "—"}</div><form method="post" action="/restaurante/cocina"><input type="hidden" name="id" value="{oid}"><button>Marcar listo</button></form></article>' for oid,o in grouped.items()) or '<div class="card">No hay comandas pendientes.</div>'
         body=f'<main class="staff-content"><h1>Cocina</h1><p class="muted">Comandas pendientes · se actualiza automáticamente.</p>{tickets}</main>'
         self.restaurant_shell("Cocina",body,employee,"cocina", '<meta http-equiv="refresh" content="8">')
+
+    def restaurant_summary_page(self, employee):
+        today = today_iso()
+        with db() as conn:
+            status = conn.execute(
+                "SELECT status,COUNT(*) AS qty FROM restaurant_orders WHERE order_date=? GROUP BY status",
+                (today,),
+            ).fetchall()
+            items = conn.execute(
+                """SELECT i.category,i.item_name,SUM(i.quantity) AS qty,
+                          SUM(i.quantity*i.unit_price) AS total
+                   FROM restaurant_order_items i JOIN restaurant_orders o ON o.id=i.order_id
+                   WHERE o.order_date=? GROUP BY i.category,i.item_name ORDER BY i.category,i.item_name""",
+                (today,),
+            ).fetchall()
+            total_orders = conn.execute("SELECT COUNT(*) FROM restaurant_orders WHERE order_date=?", (today,)).fetchone()[0]
+            sales = conn.execute(
+                """SELECT COALESCE(SUM(i.quantity*i.unit_price),0)
+                   FROM restaurant_order_items i JOIN restaurant_orders o ON o.id=i.order_id
+                   WHERE o.order_date=?""", (today,),
+            ).fetchone()[0]
+        status_counts = {row["status"]: int(row["qty"]) for row in status}
+        item_rows = "".join(
+            f'<tr><td>{"Entrada" if row["category"] == "entrada" else "Segundo"}</td><td>{esc(row["item_name"])}</td><td>{int(row["qty"])}</td><td>S/ {float(row["total"] or 0):.2f}</td></tr>'
+            for row in items
+        ) or '<tr><td colspan="4">Aún no hay comandas.</td></tr>'
+        body = f'''<main class="staff-content"><h1>Resumen del día</h1><p class="muted">{esc(fecha_con_dia(today))}</p>
+<div class="grid grid3"><div class="stat">Comandas<b>{total_orders}</b></div><div class="stat">Pendientes<b>{status_counts.get("abierta", 0)}</b></div><div class="stat">Total registrado<b>S/ {float(sales or 0):.2f}</b></div></div>
+<section class="card"><h2>Platos vendidos</h2><div class="table-wrap"><table><thead><tr><th>Tipo</th><th>Plato</th><th>Cantidad</th><th>Total</th></tr></thead><tbody>{item_rows}</tbody></table></div></section></main>'''
+        self.restaurant_shell("Resumen", body, employee, "resumen")
 
     def update_restaurant_order_status(self, employee):
         with db() as conn: conn.execute("UPDATE restaurant_orders SET status='lista' WHERE id=? AND status='abierta'",(self.read_form().get("id"),))
@@ -2341,6 +2425,9 @@ class AppHandler(BaseHTTPRequestHandler):
     <a href="/admin/talma/">TALMA</a>
     <a href="/admin/policia/">POLICÍA</a>
     <a href="/admin/personal-restaurante">Personal restaurante</a>
+    <a href="/restaurante/mesa">Mesa</a>
+    <a href="/restaurante/caja">Caja</a>
+    <a href="/restaurante/cocina">Cocina</a>
   </nav>
   <div class="admin-sidebar-footer"><a href="/admin/logout"><span aria-hidden="true">↪</span><span>Cerrar sesión</span></a></div>
 </aside>

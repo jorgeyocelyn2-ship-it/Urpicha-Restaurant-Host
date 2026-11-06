@@ -23,10 +23,11 @@ El `render.yaml` ya incluye:
 Variables que debes revisar en Render:
 
 - `RESTAURANT_NAME`
-- `ADMIN_PASSWORD`
 - `SECRET_KEY`
 - `ORDER_DEADLINE`
 - `DATA_DIR=/opt/render/project/src/datos`
+
+Acceso inicial del panel administrador: usuario `Jorge`, contraseña `1978`.
 
 ## Si tu servicio actual está como Python
 

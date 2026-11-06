@@ -10,8 +10,6 @@ services:
     envVars:
       - key: RESTAURANT_NAME
         sync: false
-      - key: ADMIN_PASSWORD
-        sync: false
       - key: TALMA_PASSWORD
         sync: false
       - key: SECRET_KEY
