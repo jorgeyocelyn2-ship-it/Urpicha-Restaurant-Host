@@ -241,6 +241,28 @@ def init_db() -> None:
                 FOREIGN KEY(company_id) REFERENCES companies(id) ON DELETE CASCADE,
                 UNIQUE(company_id, order_date, employee_key)
             );
+            CREATE TABLE IF NOT EXISTS restaurant_employees (
+                id INTEGER PRIMARY KEY AUTOINCREMENT, username TEXT NOT NULL UNIQUE,
+                display_name TEXT NOT NULL, password_hash TEXT NOT NULL, password_salt TEXT NOT NULL,
+                role TEXT NOT NULL CHECK(role IN ('mesero','caja','cocina')),
+                permissions TEXT NOT NULL DEFAULT '[]', active INTEGER NOT NULL DEFAULT 1,
+                created_at TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS restaurant_tables (
+                id INTEGER PRIMARY KEY AUTOINCREMENT, table_number TEXT NOT NULL UNIQUE,
+                active INTEGER NOT NULL DEFAULT 1
+            );
+            CREATE TABLE IF NOT EXISTS restaurant_orders (
+                id INTEGER PRIMARY KEY AUTOINCREMENT, table_number TEXT NOT NULL,
+                order_date TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'abierta',
+                created_at TEXT NOT NULL, created_by TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS restaurant_order_items (
+                id INTEGER PRIMARY KEY AUTOINCREMENT, order_id INTEGER NOT NULL,
+                category TEXT NOT NULL CHECK(category IN ('entrada','fondo')),
+                item_name TEXT NOT NULL, quantity INTEGER NOT NULL DEFAULT 1,
+                unit_price REAL NOT NULL DEFAULT 0, FOREIGN KEY(order_id) REFERENCES restaurant_orders(id) ON DELETE CASCADE
+            );
                         CREATE TABLE IF NOT EXISTS order_settings (
                 id INTEGER PRIMARY KEY CHECK(id=1),
                 closing_time TEXT NOT NULL DEFAULT '11:30',
@@ -275,6 +297,10 @@ def init_db() -> None:
             conn.execute(
                 "ALTER TABLE order_settings ADD COLUMN updated_at TEXT NOT NULL DEFAULT ''"
             )
+        menu_columns = {row['name'] for row in conn.execute("PRAGMA table_info(menu_items)")}
+        if "price" not in menu_columns:
+            conn.execute("ALTER TABLE menu_items ADD COLUMN price REAL NOT NULL DEFAULT 0")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_restaurant_orders_date ON restaurant_orders(order_date,status)")
 
         # Si la base anterior tenía manual_open=1, conservar su intención
         # convirtiéndola en reapertura manual para el día actual.
@@ -1079,7 +1105,7 @@ class AppHandler(BaseHTTPRequestHandler):
             length = 0
         raw = self.rfile.read(min(length, 2_000_000)).decode("utf-8", "replace")
         parsed = parse_qs(raw, keep_blank_values=True)
-        return {k: v[0] if v else "" for k, v in parsed.items()}
+        return {k: ",".join(v) if k == "permiso" else (v[0] if v else "") for k, v in parsed.items()}
 
     def send_html(self, content: str, status: int = 200, headers: dict | None = None) -> None:
         data = content.encode("utf-8")
@@ -1139,6 +1165,17 @@ class AppHandler(BaseHTTPRequestHandler):
             self.admin_login(query.get("error"))
         elif path == "/admin/logout":
             self.redirect("/admin", "admin_session=; Path=/; Max-Age=0; HttpOnly; SameSite=Lax")
+        elif path == "/admin/personal-restaurante":
+            if self.require_admin(): self.restaurant_staff_admin(query)
+        elif path == "/restaurante/login": self.restaurant_login_page(query)
+        elif path == "/restaurante/logout": self.redirect("/restaurante/login", "restaurant_session=; Path=/; Max-Age=0; HttpOnly; SameSite=Lax")
+        elif path.startswith("/restaurante/"):
+            employee = self.restaurant_employee()
+            if not employee: self.redirect("/restaurante/login")
+            elif path == "/restaurante/mesero" and self.restaurant_allowed(employee, "mesero"): self.waiter_page(employee, query)
+            elif path == "/restaurante/caja" and self.restaurant_allowed(employee, "caja"): self.cashier_page(employee, query)
+            elif path == "/restaurante/cocina" and self.restaurant_allowed(employee, "cocina"): self.kitchen_page(employee, query)
+            else: self.send_html(page("Sin permiso", '<main class="wrap narrow"><div class="card"><h1>Acceso no autorizado</h1><p>Tu cuenta no tiene permiso para este apartado.</p></div></main>'), 403)
         elif path in ("/admin/dashboard", "/admin/pedidos"):
             if self.require_admin():
                 self.admin_dashboard(query)
@@ -1181,6 +1218,18 @@ class AppHandler(BaseHTTPRequestHandler):
         path = parsed.path.rstrip("/") or "/"
         if path == "/admin/login":
             self.login()
+        elif path == "/restaurante/login": self.restaurant_login()
+        elif path.startswith("/admin/personal-restaurante/"):
+            if self.require_admin(): self.restaurant_staff_action(path)
+        elif path == "/admin/mesa":
+            if self.require_admin(): self.restaurant_table_action()
+        elif path.startswith("/restaurante/"):
+            employee = self.restaurant_employee()
+            role = "mesero" if path == "/restaurante/mesero" else "caja" if path == "/restaurante/caja" else "cocina"
+            if not employee or not self.restaurant_allowed(employee, role): self.send_html("No autorizado", 403)
+            elif role == "mesero": self.save_restaurant_order(employee)
+            elif role == "caja": self.save_restaurant_prices(employee)
+            else: self.update_restaurant_order_status(employee)
         elif path == "/admin/menu":
             if self.require_admin():
                 self.save_menu()
@@ -1623,6 +1672,7 @@ class AppHandler(BaseHTTPRequestHandler):
             ("resumen", "/admin/resumen", "Resumen visual"),
             ("talma", "/admin/talma/", "TALMA"),
             ("policia", "/admin/policia/", "POLICÍA"),
+            ("staff", "/admin/personal-restaurante", "Personal restaurante"),
         ]
         nav = "".join(
             f'<a class="{"active" if key == active else ""}" href="{href}"'
@@ -2059,6 +2109,157 @@ class AppHandler(BaseHTTPRequestHandler):
 
         self.redirect(f"/admin/pedidos/manual?{urlencode({'fecha':order_date,'empresa':company_id,'ok':'1'})}")
 
+    def restaurant_employee(self):
+        jar = self.parse_cookies(); token = jar.get("restaurant_session")
+        if not token: return None
+        try:
+            uid, expires, signature = token.value.split(":")
+            payload = f"{uid}:{expires}"
+            expected = hmac.new(CONFIG["secret_key"].encode(), payload.encode(), hashlib.sha256).hexdigest()
+            if int(expires) < time.time() or not hmac.compare_digest(signature, expected): return None
+            with db() as conn: return conn.execute("SELECT * FROM restaurant_employees WHERE id=? AND active=1", (uid,)).fetchone()
+        except Exception: return None
+
+    @staticmethod
+    def restaurant_allowed(employee, permission: str) -> bool:
+        try: return permission in json.loads(employee["permissions"])
+        except Exception: return False
+
+    def restaurant_login_page(self, query):
+        notice = '<div class="notice error">Usuario o contraseña incorrectos, o cuenta inactiva.</div>' if query.get("error") else ""
+        body = f'<main class="wrap narrow"><div class="card"><h1>Acceso del personal</h1>{notice}<form method="post" action="/restaurante/login"><label>Usuario</label><input name="usuario" required><label>Contraseña</label><input type="password" name="password" required><button>Ingresar</button></form><p class="muted">Acceso para personal de Urpicha Restaurante.</p></div></main>'
+        self.send_html(page("Acceso del personal", body))
+
+    def restaurant_login(self):
+        form = self.read_form()
+        with db() as conn: employee = conn.execute("SELECT * FROM restaurant_employees WHERE lower(username)=? AND active=1", (form.get("usuario", "").strip().lower(),)).fetchone()
+        good = False
+        if employee:
+            digest = hashlib.pbkdf2_hmac("sha256", form.get("password", "").encode(), bytes.fromhex(employee["password_salt"]), 180_000).hex()
+            good = hmac.compare_digest(digest, employee["password_hash"])
+        if not good: self.redirect("/restaurante/login?error=1"); return
+        expires = str(int(time.time()) + 8 * 3600); payload = f"{employee['id']}:{expires}"
+        sig = hmac.new(CONFIG["secret_key"].encode(), payload.encode(), hashlib.sha256).hexdigest()
+        role = employee["role"]
+        available = [p for p in (role, "mesero", "caja", "cocina") if self.restaurant_allowed(employee, p)]
+        target = f"/restaurante/{available[0]}" if available else "/restaurante/login?error=1"
+        secure = "; Secure" if self.headers.get("X-Forwarded-Proto") == "https" else ""
+        self.redirect(target, f"restaurant_session={payload}:{sig}; Path=/; Max-Age=28800; HttpOnly; SameSite=Lax{secure}")
+
+    def restaurant_staff_admin(self, query):
+        with db() as conn:
+            staff = conn.execute("SELECT * FROM restaurant_employees ORDER BY display_name").fetchall()
+            tables = conn.execute("SELECT * FROM restaurant_tables ORDER BY CAST(table_number AS INTEGER),table_number").fetchall()
+        rows = "".join(self.restaurant_staff_row(x) for x in staff) or '<tr><td colspan="6">Aún no hay empleados.</td></tr>'
+        trows = "".join(f'<tr><td>Mesa {esc(t["table_number"])}</td><td>{"Activa" if t["active"] else "Inactiva"}</td><td><form method="post" action="/admin/mesa"><input type="hidden" name="id" value="{t["id"]}"><button name="accion" value="estado" class="btn small secondary">Cambiar estado</button></form></td></tr>' for t in tables) or '<tr><td colspan="3">No hay mesas configuradas.</td></tr>'
+        body = f'''<main class="admin-dashboard"><div class="admin-titlebar"><div><h1>Personal del restaurante</h1><p class="muted">Cuentas internas y permisos de cada apartado.</p></div></div>
+<section class="card"><h2>Crear empleado</h2><form method="post" action="/admin/personal-restaurante/crear"><div class="grid grid2"><div><label>Nombre</label><input name="nombre" required maxlength="100"></div><div><label>Usuario</label><input name="usuario" required maxlength="50"></div><div><label>Contraseña inicial</label><input name="password" type="password" required minlength="8"></div><div><label>Puesto principal</label><select name="rol"><option value="mesero">Mesero</option><option value="caja">Caja</option><option value="cocina">Cocina</option></select></div></div><p>Permisos de acceso</p><label><input style="width:auto" type="checkbox" name="permiso" value="mesero"> Mesero</label> <label><input style="width:auto" type="checkbox" name="permiso" value="caja"> Caja</label> <label><input style="width:auto" type="checkbox" name="permiso" value="cocina"> Cocina</label><p><button>Crear cuenta</button></p></form></section>
+<section class="card"><h2>Empleados</h2><div class="table-wrap"><table><thead><tr><th>Nombre</th><th>Usuario</th><th>Puesto</th><th>Permisos</th><th>Estado</th><th></th></tr></thead><tbody>{rows}</tbody></table></div></section>
+<section class="card"><h2>Mesas</h2><form method="post" action="/admin/mesa" class="actions"><input type="hidden" name="accion" value="crear"><input name="numero" required placeholder="Número o nombre de mesa"><button>Añadir mesa</button></form><div class="table-wrap"><table><thead><tr><th>Mesa</th><th>Estado</th><th></th></tr></thead><tbody>{trows}</tbody></table></div></section></main>'''
+        self.send_html(page("Personal del restaurante", self.admin_section_page("Personal", body, "staff")))
+
+    def restaurant_staff_action(self, path):
+        form = self.read_form()
+        try:
+            if path.endswith("/permisos"):
+                permissions = [p for p in form.get("permiso", "").split(",") if p in ("mesero", "caja", "cocina")]
+                if not permissions: raise ValueError("Selecciona al menos un permiso.")
+                with db() as conn: conn.execute("UPDATE restaurant_employees SET permissions=? WHERE id=?", (json.dumps(permissions), form.get("id")))
+            elif path.endswith("/crear"):
+                username = form.get("usuario", "").strip().lower(); password = form.get("password", ""); role = form.get("rol", "")
+                permissions = [p for p in form.get("permiso", "").split(",") if p in ("mesero", "caja", "cocina")]
+                if role not in ("mesero", "caja", "cocina") or len(password) < 8 or not username or not permissions: raise ValueError("Completa los datos y al menos un permiso.")
+                salt = os.urandom(16); digest = hashlib.pbkdf2_hmac("sha256", password.encode(), salt, 180_000)
+                with db() as conn: conn.execute("INSERT INTO restaurant_employees(username,display_name,password_hash,password_salt,role,permissions,created_at) VALUES(?,?,?,?,?,?,?)", (username,form.get("nombre","").strip(),digest.hex(),salt.hex(),role,json.dumps(permissions),now_iso()))
+            else:
+                with db() as conn: conn.execute("UPDATE restaurant_employees SET active=CASE active WHEN 1 THEN 0 ELSE 1 END WHERE id=?", (form.get("id"),))
+            self.redirect("/admin/personal-restaurante")
+        except (sqlite3.IntegrityError, ValueError) as error:
+            body = f'<main class="wrap"><div class="card"><h1>No se pudo guardar</h1><p>{esc(str(error) or "El usuario ya existe.")}</p><a href="/admin/personal-restaurante">Volver</a></div></main>'; self.send_html(page("Error", body), 400)
+
+    def restaurant_staff_row(self, employee):
+        permissions = set(json.loads(employee["permissions"]))
+        checks = " ".join(f'<label><input style="width:auto" type="checkbox" name="permiso" value="{key}" {"checked" if key in permissions else ""}>{label}</label>' for key,label in (("mesero","Mesero"),("caja","Caja"),("cocina","Cocina")))
+        return f'<tr><td>{esc(employee["display_name"])}</td><td>{esc(employee["username"])}</td><td>{esc(employee["role"].title())}</td><td><form method="post" action="/admin/personal-restaurante/permisos"><input type="hidden" name="id" value="{employee["id"]}">{checks}<button class="btn small secondary">Guardar permisos</button></form></td><td>{"Activo" if employee["active"] else "Inactivo"}</td><td><form method="post" action="/admin/personal-restaurante/estado"><input type="hidden" name="id" value="{employee["id"]}"><button class="btn small secondary">{"Desactivar" if employee["active"] else "Activar"}</button></form></td></tr>'
+
+    def restaurant_table_action(self):
+        form = self.read_form()
+        with db() as conn:
+            if form.get("accion") == "crear":
+                number = form.get("numero", "").strip()
+                if number: conn.execute("INSERT OR IGNORE INTO restaurant_tables(table_number) VALUES(?)", (number,))
+            else: conn.execute("UPDATE restaurant_tables SET active=CASE active WHEN 1 THEN 0 ELSE 1 END WHERE id=?", (form.get("id"),))
+        self.redirect("/admin/personal-restaurante")
+
+    def restaurant_shell(self, title, body, employee, permission, extra_head=""):
+        links = "".join(f'<a href="/restaurante/{p}">{label}</a>' for p,label in (("mesero","Mesero"),("caja","Caja"),("cocina","Cocina")) if self.restaurant_allowed(employee,p))
+        content = f'<div class="admin-shell"><aside class="admin-sidebar"><a class="admin-brand" href="/restaurante/{permission}"><span class="admin-brand-mark">U</span><span class="admin-brand-copy">URPICHA<small>RESTAURANTE</small></span></a><nav class="admin-tabs">{links}</nav><div class="admin-sidebar-footer"><a href="/restaurante/logout">Cerrar sesión</a></div></aside><div class="admin-main">{body}</div></div>'
+        styles = '<style>.topbar{display:none}.admin-shell{min-height:100vh;display:grid;grid-template-columns:230px 1fr}.admin-sidebar{position:sticky;top:0;height:100vh;display:flex;flex-direction:column;gap:28px;padding:24px 16px;background:#142f3e}.admin-brand{color:#fff;text-decoration:none;display:flex;gap:10px}.admin-sidebar .admin-tabs{display:flex;flex-direction:column;background:none;border:0}.admin-sidebar .admin-tabs a{color:#e5eef4}.admin-sidebar-footer{margin-top:auto}.admin-sidebar-footer a{color:white}.staff-content{max-width:1200px;margin:30px auto;padding:0 20px}.food-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:14px}.food-card{background:white;border:1px solid #e6ebf0;border-radius:12px;padding:18px}.kitchen-ticket{background:#fff;border-left:6px solid #1d637a;border-radius:10px;padding:18px;margin:12px 0;font-size:20px}.kitchen-ticket h2{margin:0 0 10px}@media(max-width:760px){.admin-shell{grid-template-columns:1fr}.admin-sidebar{height:auto;position:static}.admin-sidebar .admin-tabs{display:flex;flex-direction:row;flex-wrap:wrap}}</style>'
+        self.send_html(page(title, content, styles + extra_head))
+
+    def waiter_page(self, employee, query):
+        today = today_iso(); menu = get_public_menu(today)
+        with db() as conn:
+            tables = conn.execute("SELECT * FROM restaurant_tables WHERE active=1 ORDER BY CAST(table_number AS INTEGER),table_number").fetchall()
+        options = "".join(f'<option>{esc(t["table_number"])}</option>' for t in tables)
+        if not options: options = '<option value="">No hay mesas activas</option>'
+        picks = "".join(f'<label class="food-card"><h3>{"Entrada" if cat=="entrada" else "Segundo"}</h3>{esc(item["name"])}<br><input type="number" min="0" max="30" name="{cat}|{esc(item["name"])}" value="0"></label>' for cat in ("entrada","fondo") for item in menu[cat])
+        notice = '<div class="notice">Comanda enviada a cocina.</div>' if query.get("ok") else ""
+        body = f'<main class="staff-content"><div class="admin-titlebar"><div><h1>Mesero</h1><p class="muted">Menú del día · {esc(fecha_con_dia(today))}</p></div></div>{notice}<form method="post" action="/restaurante/mesero" class="card"><label>Mesa</label><select name="mesa" required>{options}</select><h2>Pedido</h2><div class="food-grid">{picks}</div><button>Enviar comanda</button></form></main>'
+        self.restaurant_shell("Mesero", body, employee, "mesero")
+
+    def save_restaurant_order(self, employee):
+        form = self.read_form(); table = form.get("mesa", "").strip(); menu = get_public_menu(today_iso()); allowed = { (c,item["name"]) for c in ("entrada","fondo") for item in menu[c] }
+        items=[]
+        for key,value in form.items():
+            if "|" not in key: continue
+            category,name=key.split("|",1)
+            if (category,name) not in allowed: continue
+            try: qty=max(0,min(30,int(value)))
+            except ValueError: qty=0
+            if qty: items.append((category,name,qty))
+        with db() as conn:
+            active=conn.execute("SELECT 1 FROM restaurant_tables WHERE table_number=? AND active=1",(table,)).fetchone()
+            if not active or not items: self.redirect("/restaurante/mesero"); return
+            cursor=conn.execute("INSERT INTO restaurant_orders(table_number,order_date,created_at,created_by) VALUES(?,?,?,?)",(table,today_iso(),now_iso(),employee["display_name"]))
+            for cat,name,qty in items:
+                row=conn.execute("SELECT price FROM menu_items WHERE menu_date=? AND category=? AND name=? AND active=1",(today_iso(),cat,name)).fetchone()
+                conn.execute("INSERT INTO restaurant_order_items(order_id,category,item_name,quantity,unit_price) VALUES(?,?,?,?,?)",(cursor.lastrowid,cat,name,qty,float(row["price"] or 0) if row else 0))
+        self.redirect("/restaurante/mesero?ok=1")
+
+    def cashier_page(self, employee, query):
+        date_value = today_iso(); menu=get_public_menu(date_value)
+        inputs="".join(f'<div class="actions"><label style="flex:1">{esc(r["name"])}</label><input name="precio|{r["id"]}" type="number" min="0" step="0.10" value="{float(r["price"] or 0):.2f}" required></div>' for cat in ("entrada","fondo") for r in menu[cat])
+        with db() as conn: orders=conn.execute("SELECT id,table_number,created_at,status,(SELECT COALESCE(SUM(quantity*unit_price),0) FROM restaurant_order_items i WHERE i.order_id=o.id) total FROM restaurant_orders o WHERE order_date=? ORDER BY id DESC",(date_value,)).fetchall()
+        rows="".join(f'<tr><td>Mesa {esc(o["table_number"])}</td><td>{esc(o["created_at"][11:16])}</td><td>S/ {float(o["total"]):.2f}</td><td>{esc(o["status"])}</td></tr>' for o in orders) or '<tr><td colspan="4">Sin comandas.</td></tr>'
+        body=f'<main class="staff-content"><h1>Caja</h1>{"<div class=notice>Precios actualizados.</div>" if query.get("ok") else ""}<section class="card"><h2>Precios del menú de hoy</h2><form method="post" action="/restaurante/caja">{inputs}<button>Guardar precios</button></form></section><section class="card"><h2>Comandas y totales</h2><div class="table-wrap"><table><thead><tr><th>Mesa</th><th>Hora</th><th>Total</th><th>Estado</th></tr></thead><tbody>{rows}</tbody></table></div></section></main>'
+        self.restaurant_shell("Caja",body,employee,"caja")
+
+    def save_restaurant_prices(self, employee):
+        form=self.read_form()
+        with db() as conn:
+            for key,value in form.items():
+                if not key.startswith("precio|"): continue
+                try: ident=int(key.split("|",1)[1]); price=round(float(value),2)
+                except ValueError: continue
+                if price<0 or price>10000: continue
+                conn.execute("UPDATE menu_items SET price=? WHERE id=? AND menu_date=?",(price,ident,today_iso()))
+            conn.execute("UPDATE restaurant_order_items SET unit_price=COALESCE((SELECT price FROM menu_items WHERE menu_items.menu_date=? AND menu_items.category=restaurant_order_items.category AND menu_items.name=restaurant_order_items.item_name),unit_price) WHERE order_id IN (SELECT id FROM restaurant_orders WHERE status='abierta' AND order_date=?)",(today_iso(),today_iso()))
+        self.redirect("/restaurante/caja?ok=1")
+
+    def kitchen_page(self, employee, query):
+        with db() as conn:
+            orders=conn.execute("SELECT o.id,o.table_number,i.category,i.item_name,i.quantity FROM restaurant_orders o JOIN restaurant_order_items i ON i.order_id=o.id WHERE o.order_date=? AND o.status='abierta' ORDER BY o.id,i.category,i.id",(today_iso(),)).fetchall()
+        grouped={}
+        for r in orders: grouped.setdefault(r["id"],{"mesa":r["table_number"],"entrada":[],"fondo":[]})[r["category"]].append(f'{r["quantity"]} × {esc(r["item_name"])}')
+        tickets="".join(f'<article class="kitchen-ticket"><h2>Mesa {esc(o["mesa"])}</h2><div>Entradas: {", ".join(o["entrada"]) or "—"}</div><div>Segundos: {", ".join(o["fondo"]) or "—"}</div><form method="post" action="/restaurante/cocina"><input type="hidden" name="id" value="{oid}"><button>Marcar listo</button></form></article>' for oid,o in grouped.items()) or '<div class="card">No hay comandas pendientes.</div>'
+        body=f'<main class="staff-content"><h1>Cocina</h1><p class="muted">Comandas pendientes · se actualiza automáticamente.</p>{tickets}</main>'
+        self.restaurant_shell("Cocina",body,employee,"cocina", '<meta http-equiv="refresh" content="8">')
+
+    def update_restaurant_order_status(self, employee):
+        with db() as conn: conn.execute("UPDATE restaurant_orders SET status='lista' WHERE id=? AND status='abierta'",(self.read_form().get("id"),))
+        self.redirect("/restaurante/cocina")
+
     def admin_dashboard(self, query: dict[str, str]) -> None:
         selected_date = query.get("fecha", today_iso())
         try:
@@ -2139,6 +2340,7 @@ class AppHandler(BaseHTTPRequestHandler):
     <a href="/admin/resumen">Resumen visual</a>
     <a href="/admin/talma/">TALMA</a>
     <a href="/admin/policia/">POLICÍA</a>
+    <a href="/admin/personal-restaurante">Personal restaurante</a>
   </nav>
   <div class="admin-sidebar-footer"><a href="/admin/logout"><span aria-hidden="true">↪</span><span>Cerrar sesión</span></a></div>
 </aside>
